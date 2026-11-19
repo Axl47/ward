@@ -30,7 +30,8 @@ export type UpResult =
 export interface Routes {
   "POST /up": { body: { worktree: string }; result: UpResult };
   "POST /stop": { body: { id: string }; result: { stopped: boolean } };
-  "POST /rm": { body: { id: string }; result: { removed: boolean } };
+  /** Moves the ward's data to the trash, or deletes it now with `now`. */
+  "POST /rm": { body: { id: string; now?: boolean }; result: { removed: boolean } };
   "POST /port": { body: { id: string; port: number }; result: { host: number } };
   "POST /gc": { body: Record<string, never>; result: { actions: string[] } };
   "GET /ls": { body: Record<string, never>; result: WardInfo[] };
@@ -58,6 +59,8 @@ export function call<R extends Route>(route: R, body: Routes[R]["body"]): Promis
       });
     });
     req.on("error", reject);
+    // Generous: `up` may wait up to 60s for a ward to become ready.
+    req.setTimeout(70_000, () => req.destroy(new WardError("wardd did not answer within 70s")));
     req.end(method === "GET" ? undefined : JSON.stringify(body));
   });
 }

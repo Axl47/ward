@@ -67,14 +67,16 @@ export const NO_THREAD_GRACE_MS = 30 * 60_000;
 
 /**
  * Whether the reconciler should stop a running ward. lastActivity is when the
- * ward last started or ran a command (ms). With threads: once all are idle and
- * the latest went idle after that activity, so opening a settled thread's
- * terminal isn't undone. Without: after NO_THREAD_GRACE_MS unused.
+ * ward last started or ran a command (ms). With threads, once all are idle:
+ * right away if the latest went idle after that activity, else (someone used a
+ * settled thread's worktree) after NO_THREAD_GRACE_MS unused. Without threads:
+ * after NO_THREAD_GRACE_MS unused.
  */
 export function shouldStop(threads: readonly ThreadState[], lastActivity: number, now: number): boolean {
-  if (threads.length === 0) return now - lastActivity > NO_THREAD_GRACE_MS;
+  const unused = now - lastActivity > NO_THREAD_GRACE_MS;
+  if (threads.length === 0) return unused;
   const idle = threads.map((t) => (t.idleSince === undefined ? Number.NaN : Date.parse(t.idleSince)));
-  return !idle.some(Number.isNaN) && Math.max(...idle) > lastActivity;
+  return !idle.some(Number.isNaN) && (Math.max(...idle) > lastActivity || unused);
 }
 
 export function isSettled(thread: Pick<ShellThread, "settledOverride" | "settledAt" | "unsettledAt">): boolean {

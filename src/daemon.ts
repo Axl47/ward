@@ -6,7 +6,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, s
 import { createServer as createHttpServer, request as httpRequest, type IncomingMessage, type ServerResponse } from "node:http";
 import { createServer, type Server, type Socket } from "node:net";
 import { userInfo } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { promisify } from "node:util";
 import type { PortInfo, Route, Routes, UpResult, WardInfo } from "./api.ts";
 import type { BrokerReply, BrokerRequest } from "./broker.ts";
@@ -34,6 +34,14 @@ const READY_TIMEOUT_MS = 60_000;
 const CONNECT_TIMEOUT_MS = 10_000;
 const TRASH_DAYS = 7;
 
+/** When to run one container's healthcheck, from its configuration. */
+interface HealthSchedule {
+  readonly intervalMs: number;
+  readonly timeoutMs: number;
+  lastRun: number;
+  running: boolean;
+}
+
 /** A running ward's in-memory plumbing. */
 interface LiveWard {
   readonly broker: ChildProcess;
@@ -47,8 +55,8 @@ interface LiveWard {
   scanTimer: NodeJS.Timeout | undefined;
   /** Ports the ward's running containers publish, refreshed every other scan. */
   containerPorts: ReadonlySet<number>;
-  /** Container id → when wardd last ran its healthcheck (ms). */
-  readonly healthChecked: Map<string, number>;
+  /** Container id → its healthcheck schedule, "pending" while wardd reads it. */
+  readonly health: Map<string, HealthSchedule | "pending">;
   scanCount: number;
   nextReq: number;
 }
@@ -137,10 +145,8 @@ function writeEnvFile(record: WardRecord): void {
   lines.push(`PATH=${shellQuote(shims)}:"$PATH"`);
   mkdirSync(rt, { recursive: true });
   writeFileSync(join(rt, "env"), lines.join("\n") + "\n");
-  // Which worktree owns this id, checked by bin/ward before joining and by restoreFromTrash.
+  // Which worktree owns this id; bin/ward checks it before joining.
   writeFileSync(join(rt, "root"), record.worktree);
-  mkdirSync(wardStateDir(record.id), { recursive: true });
-  writeFileSync(join(wardStateDir(record.id), "root"), record.worktree);
 }
 
 function info(record: WardRecord): WardInfo {
@@ -232,12 +238,14 @@ function rm(id: string, { trash = false } = {}): Promise<boolean> {
   return serialized(id, async () => {
     await systemctl("stop", unitName(id)).catch(() => undefined);
     detach(id);
-    if (trash && existsSync(wardStateDir(id))) {
-      await purge(`trash/${id}`);
-      mkdirSync(dirname(wardTrashDir(id)), { recursive: true });
-      renameSync(wardStateDir(id), wardTrashDir(id));
+    const worktree = wards.get(id)?.worktree;
+    if (trash && worktree !== undefined && existsSync(wardStateDir(id))) {
+      const dest = wardTrashDir(id, worktree);
+      await purge(`trash/${basename(dest)}`);
+      mkdirSync(dirname(dest), { recursive: true });
+      renameSync(wardStateDir(id), dest);
       const now = new Date();
-      utimesSync(wardTrashDir(id), now, now); // the trash clock starts now
+      utimesSync(dest, now, now); // the trash clock starts now
     }
     await purge(`wards/${id}`, `runtime/${id}`);
     const existed = wards.delete(id);
@@ -248,14 +256,10 @@ function rm(id: string, { trash = false } = {}): Promise<boolean> {
 }
 
 function restoreFromTrash(id: string, root: string): void {
-  if (!existsSync(wardTrashDir(id)) || existsSync(wardStateDir(id))) return;
-  let owner = "";
-  try {
-    owner = readFileSync(join(wardTrashDir(id), "root"), "utf8");
-  } catch {}
-  if (owner !== root) return; // another folder's data under the same id
+  const trashed = wardTrashDir(id, root);
+  if (!existsSync(trashed) || existsSync(wardStateDir(id))) return;
   mkdirSync(dirname(wardStateDir(id)), { recursive: true });
-  renameSync(wardTrashDir(id), wardStateDir(id));
+  renameSync(trashed, wardStateDir(id));
   log(`ward ${id}: restored its data from the trash`);
 }
 
@@ -294,7 +298,7 @@ function attach(record: WardRecord): void {
     pending: new Map(),
     scanTimer: undefined,
     containerPorts: new Set(),
-    healthChecked: new Map(),
+    health: new Map(),
     scanCount: 0,
     nextReq: 1,
   };
@@ -372,16 +376,19 @@ interface PodmanContainer {
   }> | null;
 }
 
-const HEALTHY_RECHECK_MS = 30_000;
-
-function podmanRequest(id: string, path: string, onBody?: (body: string) => void): Promise<void> {
+/** GET a path on the ward's Podman API; onBody gets the body of a 200 reply. Never rejects. */
+function podmanRequest(id: string, path: string, onBody?: (body: string) => void, timeoutMs = 2000): Promise<void> {
   return new Promise((resolve) => {
-    const req = httpRequest({ socketPath: join(wardRuntimeDir(id), "podman/podman.sock"), path, timeout: 2000 }, (res) => {
+    const req = httpRequest({ socketPath: join(wardRuntimeDir(id), "podman/podman.sock"), path, timeout: timeoutMs }, (res) => {
       let data = "";
       res.setEncoding("utf8");
       res.on("data", (chunk: string) => (data += chunk));
       res.on("end", () => {
-        onBody?.(data);
+        try {
+          if (res.statusCode === 200) onBody?.(data);
+        } catch (error) {
+          log(`ward ${id}: unexpected Podman reply for ${path}: ${String(error)}`);
+        }
         resolve();
       });
     });
@@ -391,31 +398,44 @@ function podmanRequest(id: string, path: string, onBody?: (body: string) => void
   });
 }
 
+const DEFAULT_HEALTH_MS = 30_000; // Podman's default interval and timeout
+const nsToMs = (ns: unknown) => (typeof ns === "number" && ns > 0 ? ns / 1e6 : DEFAULT_HEALTH_MS);
+
 /**
  * Podman schedules healthchecks with systemd timers, which a ward doesn't have, so
- * wardd runs them: every refresh while a container is starting or unhealthy, then
- * every HEALTHY_RECHECK_MS. Compose's `depends_on: service_healthy` relies on this.
+ * wardd runs them at each container's configured interval, one at a time per
+ * container. Compose's `depends_on: service_healthy` relies on this.
  */
 function runHealthchecks(id: string, ward: LiveWard, containers: readonly PodmanContainer[]): void {
   const now = Date.now();
+  const present = new Set(containers.map((c) => c.Id));
+  for (const container of ward.health.keys()) if (!present.has(container)) ward.health.delete(container);
   for (const c of containers) {
-    const health = c.Status;
-    if (health !== "starting" && health !== "healthy" && health !== "unhealthy") continue;
-    if (health === "healthy" && now - (ward.healthChecked.get(c.Id) ?? 0) < HEALTHY_RECHECK_MS) continue;
-    ward.healthChecked.set(c.Id, now);
-    void podmanRequest(id, `/v4.0.0/libpod/containers/${c.Id}/healthcheck`);
+    if (c.Status !== "starting" && c.Status !== "healthy" && c.Status !== "unhealthy") continue;
+    const schedule = ward.health.get(c.Id);
+    if (schedule === undefined) {
+      ward.health.set(c.Id, "pending");
+      void podmanRequest(id, `/v4.0.0/libpod/containers/${c.Id}/json`, (body) => {
+        const config = (JSON.parse(body) as { Config?: { Healthcheck?: { Interval?: unknown; Timeout?: unknown } } }).Config;
+        const check = config?.Healthcheck;
+        ward.health.set(c.Id, { intervalMs: nsToMs(check?.Interval), timeoutMs: nsToMs(check?.Timeout), lastRun: 0, running: false });
+      }).then(() => ward.health.get(c.Id) === "pending" && ward.health.delete(c.Id)); // retry next time
+      continue;
+    }
+    if (schedule === "pending" || schedule.running || now - schedule.lastRun < schedule.intervalMs) continue;
+    schedule.running = true;
+    schedule.lastRun = now;
+    void podmanRequest(id, `/v4.0.0/libpod/containers/${c.Id}/healthcheck`, undefined, schedule.timeoutMs + 5000).then(
+      () => (schedule.running = false),
+    );
   }
 }
 
 /** Ask the ward's Podman which TCP ports its running containers publish on loopback or all addresses, and run due healthchecks. */
 function refreshContainerPorts(id: string, ward: LiveWard): Promise<void> {
   return podmanRequest(id, "/v4.0.0/libpod/containers/json", (data) => {
-    let containers: PodmanContainer[];
-    try {
-      containers = JSON.parse(data) as PodmanContainer[];
-    } catch {
-      return;
-    }
+    const containers = JSON.parse(data) as PodmanContainer[];
+    if (!Array.isArray(containers)) return;
     ward.containerPorts = new Set(
       containers.flatMap((c) =>
         (c.Ports ?? [])
@@ -571,7 +591,7 @@ const requireRecord = (id: string) => {
 const handlers: Handlers = {
   "POST /up": ({ worktree }) => up(worktree).finally(watchWorktreeParents),
   "POST /stop": async ({ id }) => ({ stopped: await stop(requireRecord(id).id) }),
-  "POST /rm": async ({ id }) => ({ removed: await rm(requireRecord(id).id) }),
+  "POST /rm": async ({ id, now }) => ({ removed: await rm(requireRecord(id).id, { trash: !now }) }),
   "POST /port": async ({ id, port }) => {
     if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error(`bad port ${port}`);
     requireRecord(id);

@@ -35,3 +35,10 @@ test("shouldStop waits for every thread, and for idleness newer than the ward's 
   assert.equal(shouldStop([], at(t1), at(t1) + NO_THREAD_GRACE_MS - 1), false);
   assert.equal(shouldStop([], at(t1), at(t1) + NO_THREAD_GRACE_MS + 1), true);
 });
+
+test("shouldStop stops a settled worktree that was used after settling once it sits unused", () => {
+  const at = (iso: string) => Date.parse(iso);
+  const settled = [{ threadId: "t", worktree: "/w", idleSince: t1 }];
+  assert.equal(shouldStop(settled, at(t2), at(t2) + NO_THREAD_GRACE_MS - 1), false);
+  assert.equal(shouldStop(settled, at(t2), at(t2) + NO_THREAD_GRACE_MS + 1), true);
+});

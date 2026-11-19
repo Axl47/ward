@@ -1,6 +1,7 @@
 // The `ward` CLI, except `ward exec` (bin/ward handles that in shell).
 import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { connect } from "node:net";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import { parseArgs } from "node:util";
@@ -13,7 +14,7 @@ const USAGE = `usage: ward <command>
   exec [--worktree DIR] -- CMD...   run CMD in the worktree's ward
   up [--worktree DIR]               start the worktree's ward
   stop [ID|--worktree DIR]          stop a ward, keeping its data
-  rm [ID|--worktree DIR]            remove a ward and all its data
+  rm [ID|--worktree DIR] [--now]    remove a ward; its data stays in the trash for 7 days (--now: delete it)
   ls [--json]                       list wards
   ports [--json]                    this ward's port mappings (ward port → host port)
   port PORT                         host port for a ward port, mapping it if needed
@@ -30,6 +31,7 @@ const { positionals, values } = parseArgs({
     worktree: { type: "string" },
     json: { type: "boolean" },
     quiet: { type: "boolean" },
+    now: { type: "boolean" },
   },
 });
 const [command, ...args] = positionals;
@@ -45,12 +47,24 @@ function currentId(explicit?: string): string {
   return location.id;
 }
 
+/** Start wardd if its socket is missing or stale (left behind by a crash). */
 async function ensureDaemon(): Promise<void> {
-  if (existsSync(CONTROL_SOCKET)) return;
-  spawnSync("systemctl", ["--user", "start", "wardd.service"], { stdio: "inherit" });
-  for (let i = 0; i < 100 && !existsSync(CONTROL_SOCKET); i++) await new Promise((r) => setTimeout(r, 50));
-  if (!existsSync(CONTROL_SOCKET)) throw new WardError("wardd is not running; run `ward install` or `systemctl --user start wardd`");
+  if (existsSync(CONTROL_SOCKET) && (await reachable())) return;
+  spawnSync("systemctl", ["--user", "reset-failed", "wardd.service"], { stdio: "ignore" });
+  spawnSync("systemctl", ["--user", "restart", "wardd.service"], { stdio: "inherit" });
+  for (let i = 0; i < 100; i++) {
+    if (existsSync(CONTROL_SOCKET) && (await reachable())) return;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  throw new WardError("wardd is not running; see `journalctl --user -u wardd`");
 }
+
+const reachable = () =>
+  new Promise<boolean>((resolve) => {
+    const socket = connect(CONTROL_SOCKET);
+    socket.once("connect", () => (socket.end(), resolve(true)));
+    socket.once("error", () => resolve(false));
+  });
 
 function printPorts(ward: WardInfo): void {
   if (ward.ports.length === 0) return console.log("no ports yet");
@@ -113,8 +127,9 @@ async function main(): Promise<void> {
     case "rm": {
       await ensureDaemon();
       const id = currentId(args[0]);
-      const result = command === "stop" ? await call("POST /stop", { id }) : await call("POST /rm", { id });
-      console.log(`${id}: ${"stopped" in result ? (result.stopped ? "stopped" : "was not running") : "removed"}`);
+      const now = values.now === true;
+      const result = command === "stop" ? await call("POST /stop", { id }) : await call("POST /rm", { id, now });
+      console.log(`${id}: ${"stopped" in result ? (result.stopped ? "stopped" : "was not running") : now ? "removed" : "removed (data in the trash for 7 days)"}`);
       return;
     }
     case "ls": {

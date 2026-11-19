@@ -1,5 +1,6 @@
 // Paths and worktree → ward resolution. libexec/ward-lib.sh mirrors these rules
 // for the shell hot path; keep the two in sync.
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { homedir, userInfo } from "node:os";
 import { basename, dirname, join, resolve, sep } from "node:path";
@@ -49,6 +50,7 @@ export const isEnabled = (repo: string) => existsSync(enabledMarker(repo));
 
 export const wardRuntimeDir = (id: string) => join(RUNTIME_DIR, id);
 export const wardStateDir = (id: string) => join(STATE_DIR, "wards", id);
-/** Where a removed worktree's ward data waits before it is purged. */
-export const wardTrashDir = (id: string) => join(STATE_DIR, "trash", id);
+/** Where a removed ward's data waits before it is purged, keyed by worktree so colliding ids can't clash. */
+export const wardTrashDir = (id: string, worktree: string) =>
+  join(STATE_DIR, "trash", `${id}.${createHash("sha256").update(worktree).digest("hex").slice(0, 8)}`);
 export const unitName = (id: string) => `ward@${id}.service`;
