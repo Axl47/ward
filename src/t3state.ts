@@ -67,7 +67,7 @@ export const NO_THREAD_GRACE_MS = 30 * 60_000;
 
 /**
  * Whether the reconciler should stop a running ward. lastActivity is when the
- * ward last started or ran a command (ms). With threads, once all are idle:
+ * ward last started, ran a command, or got terminal input (ms). With threads, once all are idle:
  * right away if the latest went idle after that activity, else (someone used a
  * settled thread's worktree) after NO_THREAD_GRACE_MS unused. Without threads:
  * after NO_THREAD_GRACE_MS unused.

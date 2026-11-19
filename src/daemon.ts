@@ -277,6 +277,8 @@ function rm(id: string, { trash = false, worktree }: { trash?: boolean; worktree
       const now = new Date();
       utimesSync(wardStateDir(id), now, now); // the trash clock starts now, even if wardd dies mid-move
       renameSync(wardStateDir(id), dest);
+    } else if (!trash && recorded !== undefined) {
+      await purge(`trash/${basename(wardTrashDir(id, recorded))}`); // a copy left by a crash mid-trash
     }
     await purge(`wards/${id}`, `runtime/${id}`);
     const existed = wards.delete(id);
