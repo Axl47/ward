@@ -53,4 +53,5 @@ export const wardStateDir = (id: string) => join(STATE_DIR, "wards", id);
 /** Where a removed ward's data waits before it is purged, keyed by worktree so colliding ids can't clash. */
 export const wardTrashDir = (id: string, worktree: string) =>
   join(STATE_DIR, "trash", `${id}.${createHash("sha256").update(worktree).digest("hex").slice(0, 8)}`);
-export const unitName = (id: string) => `ward@${id}.service`;
+/** Unit template wards run under; WARD_UNIT names another, to run a second Ward beside the installed one. */
+export const unitName = (id: string) => `${env.WARD_UNIT ?? "ward"}@${id}.service`;
