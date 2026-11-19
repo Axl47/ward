@@ -194,7 +194,9 @@ async function main(): Promise<void> {
       return;
     }
     case "images": {
-      const result = spawnSync(join(WARD_HOME, "libexec/ward-images"), args, { stdio: "inherit" });
+      // Podman's own flags (-q, --quiet, ...) pass through untouched, so not parseArgs' view.
+      const raw = process.argv.slice(2);
+      const result = spawnSync(join(WARD_HOME, "libexec/ward-images"), raw.slice(raw.indexOf("images") + 1), { stdio: "inherit" });
       process.exitCode = result.status ?? 1;
       return;
     }
