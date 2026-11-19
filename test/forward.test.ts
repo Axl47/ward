@@ -3,12 +3,12 @@ import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { connect, createServer, type AddressInfo, type Server, type Socket } from "node:net";
 import { after, test } from "node:test";
-import type { BrokerReply, BrokerRequest } from "../src/broker.ts";
+import type { BrokerReply, BrokerRequest } from "../src/api.ts";
 import { splice } from "../src/splice.ts";
 
 // The mapped-port path as wardd runs it, minus the namespace: a host listener asks
 // the broker to dial a port, receives the socket over IPC and splices the two.
-const broker = spawn(process.execPath, ["--disable-warning=ExperimentalWarning", new URL("../src/broker.ts", import.meta.url).pathname], {
+const broker = spawn(process.execPath, [new URL("../src/broker.js", import.meta.url).pathname], {
   stdio: ["ignore", "inherit", "inherit", "ipc"],
 });
 const servers: Server[] = [];

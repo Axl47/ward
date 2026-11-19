@@ -8,8 +8,7 @@ import { createServer, type Server, type Socket } from "node:net";
 import { userInfo } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { promisify } from "node:util";
-import type { PortInfo, Route, Routes, UpResult, WardInfo } from "./api.ts";
-import type { BrokerReply, BrokerRequest } from "./broker.ts";
+import type { BrokerReply, BrokerRequest, PortInfo, Route, Routes, UpResult, WardInfo } from "./api.ts";
 import {
   CONTROL_SOCKET,
   HOST_PORTS,
@@ -319,7 +318,7 @@ function attach(record: WardRecord): void {
   const broker = spawn(
     "nsenter",
     ["-U", "-n", "-t", String(pid), "--setuid", String(uid), "--setgid", String(gid), "--",
-      process.execPath, "--disable-warning=ExperimentalWarning", join(WARD_HOME, "src/broker.ts")],
+      process.execPath, join(WARD_HOME, "src/broker.js")],
     { stdio: ["ignore", "inherit", "inherit", "ipc"] },
   );
   if (broker.pid === undefined) return;
