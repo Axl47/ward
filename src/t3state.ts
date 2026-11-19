@@ -17,7 +17,7 @@ export interface ThreadState {
   readonly idleSince: string | undefined;
 }
 
-interface ShellThread {
+export interface ShellThread {
   readonly id: string;
   readonly worktreePath?: string | null;
   readonly archivedAt?: string | null;
@@ -46,18 +46,20 @@ export async function threadsByWorktree(): Promise<Map<string, ThreadState[]>> {
   const { threads } = (await res.json()) as { threads: readonly ShellThread[] };
   const byWorktree = new Map<string, ThreadState[]>();
   for (const thread of threads) {
-    if (!thread.worktreePath) continue;
-    const state: ThreadState = {
-      threadId: thread.id,
-      worktree: thread.worktreePath,
-      idleSince: [thread.deletedAt, thread.archivedAt, isSettled(thread) ? (thread.settledAt ?? undefined) : undefined]
-        .filter((t): t is string => Boolean(t))
-        .sort()
-        .at(-1),
-    };
-    byWorktree.set(state.worktree, [...(byWorktree.get(state.worktree) ?? []), state]);
+    const state = threadState(thread);
+    if (state !== undefined) byWorktree.set(state.worktree, [...(byWorktree.get(state.worktree) ?? []), state]);
   }
   return byWorktree;
+}
+
+/** A thread's worktree and idle time, or undefined when it has no worktree. */
+export function threadState(thread: ShellThread): ThreadState | undefined {
+  if (!thread.worktreePath) return undefined;
+  const idleSince = [thread.deletedAt, thread.archivedAt, isSettled(thread) ? thread.settledAt : undefined]
+    .filter((t): t is string => Boolean(t))
+    .sort()
+    .at(-1);
+  return { threadId: thread.id, worktree: thread.worktreePath, idleSince };
 }
 
 export function isSettled(thread: Pick<ShellThread, "settledOverride" | "settledAt" | "unsettledAt">): boolean {

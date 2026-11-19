@@ -20,6 +20,7 @@ import {
   wardRuntimeDir,
   wardStateDir,
 } from "./paths.ts";
+import { listeningPorts } from "./procnet.ts";
 import { freeSlot, loadRegistry, saveRegistry, slotPorts, type WardRecord } from "./registry.ts";
 import { threadsByWorktree, type ThreadState } from "./t3state.ts";
 
@@ -240,14 +241,8 @@ function scan(id: string): void {
     } catch {
       return; // broker gone; its exit handler detaches the ward
     }
-    for (const line of text.split("\n").slice(1)) {
-      const fields = line.trim().split(/\s+/);
-      if (fields[3] !== "0A" || fields[1] === undefined) continue; // 0A = LISTEN
-      const [hexAddr, hexPort] = fields[1].split(":") as [string, string];
-      const port = parseInt(hexPort, 16);
-      const hosts = dialAddresses(hexAddr);
-      if (HOST_PORTS.has(port) || hosts === undefined) continue;
-      found.set(port, [...new Set([...(found.get(port) ?? []), ...hosts])]);
+    for (const [port, hosts] of listeningPorts(text)) {
+      if (!HOST_PORTS.has(port)) found.set(port, [...new Set([...(found.get(port) ?? []), ...hosts])]);
     }
   }
   for (const port of ward.containerPorts) if (!found.has(port)) found.set(port, ["127.0.0.1"]);
@@ -291,23 +286,6 @@ function refreshContainerPorts(id: string, ward: LiveWard): Promise<void> {
     req.on("timeout", () => req.destroy());
     req.end();
   });
-}
-
-/**
- * Where to connect for a socket bound to this /proc/net address, or undefined
- * when it is bound to a specific non-loopback address (such as Podman's DNS on
- * a container bridge), which is internal to the ward.
- */
-export function dialAddresses(hex: string): string[] | undefined {
-  if (hex.length === 8) {
-    if (hex === "00000000") return ["127.0.0.1"];
-    const bytes = hex.match(/../g)!.map((b) => parseInt(b, 16)).reverse();
-    return bytes[0] === 127 ? [bytes.join(".")] : undefined;
-  }
-  if (/^0+$/.test(hex)) return ["::1", "127.0.0.1"];
-  if (hex === "00000000000000000000000001000000") return ["::1"];
-  if (hex.startsWith("0000000000000000FFFF0000")) return dialAddresses(hex.slice(24));
-  return undefined;
 }
 
 /** Make sure a host listener exists for a ward port; returns its host port. */
