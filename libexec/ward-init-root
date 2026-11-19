@@ -40,6 +40,9 @@ events_logger = "file"
 runtime = "crun"
 [network]
 network_config_dir = "$st/net"
+# Port 53 in the ward is pasta's DNS forward; containers' DNS moves aside
+# (netavark redirects their port-53 queries to it).
+dns_bind_port = 1153
 CONF
 cat > "$st/storage.conf" <<CONF
 [storage]

@@ -47,6 +47,8 @@ interface LiveWard {
   scanTimer: NodeJS.Timeout | undefined;
   /** Ports the ward's running containers publish, refreshed every other scan. */
   containerPorts: ReadonlySet<number>;
+  /** Container id → when wardd last ran its healthcheck (ms). */
+  readonly healthChecked: Map<string, number>;
   scanCount: number;
   nextReq: number;
 }
@@ -120,6 +122,10 @@ function writeEnvFile(record: WardRecord): void {
     DOCKER_HOST: podman,
     CONTAINER_HOST: podman,
     TMPDIR: join(wardStateDir(record.id), "tmp"),
+    // BuildKit wants a builder container with its own cgroup, which a ward can't give;
+    // the classic builder runs in the ward's Podman.
+    DOCKER_BUILDKIT: "0",
+    COMPOSE_BAKE: "false",
   };
   const sdk = process.env.ANDROID_HOME;
   if (sdk && existsSync(join(sdk, "platform-tools/adb"))) {
@@ -131,6 +137,10 @@ function writeEnvFile(record: WardRecord): void {
   lines.push(`PATH=${shellQuote(shims)}:"$PATH"`);
   mkdirSync(rt, { recursive: true });
   writeFileSync(join(rt, "env"), lines.join("\n") + "\n");
+  // Which worktree owns this id, checked by bin/ward before joining and by restoreFromTrash.
+  writeFileSync(join(rt, "root"), record.worktree);
+  mkdirSync(wardStateDir(record.id), { recursive: true });
+  writeFileSync(join(wardStateDir(record.id), "root"), record.worktree);
 }
 
 function info(record: WardRecord): WardInfo {
@@ -154,7 +164,7 @@ async function up(worktree: string): Promise<UpResult> {
     if (record !== undefined && record.worktree !== location.root)
       throw new Error(`ward id ${location.id} already belongs to ${record.worktree}; rename one of the folders`);
     if (record === undefined) {
-      restoreFromTrash(location.id);
+      restoreFromTrash(location.id, location.root);
       record = { id: location.id, repo: location.repo, worktree: location.root, slot: claimSlot(), ports: {}, createdAt: new Date().toISOString() };
       wards.set(record.id, record);
       saveRegistry(wards);
@@ -204,7 +214,7 @@ function claimSlot(): number {
   const slot = freeSlot(wards);
   if (slot !== undefined) return slot;
   const victim = [...wards.values()]
-    .filter((w) => w.slot > 0 && !isReady(w.id))
+    .filter((w) => w.slot > 0 && !isReady(w.id) && !locks.has(w.id))
     .sort((a, b) => lastActivity(a.id) - lastActivity(b.id))[0];
   if (victim === undefined) throw new Error(`all ${MAX_SLOTS} ward slots are held by running wards; stop some with \`ward stop\``);
   wards.set(victim.id, { ...victim, slot: 0, ports: {} });
@@ -237,8 +247,13 @@ function rm(id: string, { trash = false } = {}): Promise<boolean> {
   });
 }
 
-function restoreFromTrash(id: string): void {
+function restoreFromTrash(id: string, root: string): void {
   if (!existsSync(wardTrashDir(id)) || existsSync(wardStateDir(id))) return;
+  let owner = "";
+  try {
+    owner = readFileSync(join(wardTrashDir(id), "root"), "utf8");
+  } catch {}
+  if (owner !== root) return; // another folder's data under the same id
   mkdirSync(dirname(wardStateDir(id)), { recursive: true });
   renameSync(wardTrashDir(id), wardStateDir(id));
   log(`ward ${id}: restored its data from the trash`);
@@ -279,6 +294,7 @@ function attach(record: WardRecord): void {
     pending: new Map(),
     scanTimer: undefined,
     containerPorts: new Set(),
+    healthChecked: new Map(),
     scanCount: 0,
     nextReq: 1,
   };
@@ -343,37 +359,71 @@ function scan(id: string): void {
   if (ward.scanCount++ % 2 === 0) void refreshContainerPorts(id, ward);
 }
 
+/** One entry of Podman's own container list (not the Docker-compatible one, which omits health). */
 interface PodmanContainer {
-  readonly Ports?: ReadonlyArray<{ readonly IP?: string; readonly PublicPort?: number; readonly Type?: string }> | null;
+  readonly Id: string;
+  /** Health: "starting", "healthy" or "unhealthy"; empty without a healthcheck. */
+  readonly Status?: string;
+  readonly Ports?: ReadonlyArray<{
+    readonly host_ip?: string;
+    readonly host_port?: number;
+    readonly range?: number;
+    readonly protocol?: string;
+  }> | null;
 }
 
-/** Ask the ward's Podman which TCP ports its running containers publish on loopback or all addresses. */
-function refreshContainerPorts(id: string, ward: LiveWard): Promise<void> {
+const HEALTHY_RECHECK_MS = 30_000;
+
+function podmanRequest(id: string, path: string, onBody?: (body: string) => void): Promise<void> {
   return new Promise((resolve) => {
-    const req = httpRequest(
-      { socketPath: join(wardRuntimeDir(id), "podman/podman.sock"), path: "/v4.0.0/containers/json", timeout: 2000 },
-      (res) => {
-        let data = "";
-        res.setEncoding("utf8");
-        res.on("data", (chunk: string) => (data += chunk));
-        res.on("end", () => {
-          try {
-            const containers = JSON.parse(data) as PodmanContainer[];
-            ward.containerPorts = new Set(
-              containers.flatMap((c) =>
-                (c.Ports ?? [])
-                  .filter((p) => p.Type === "tcp" && p.PublicPort !== undefined && ["", "0.0.0.0", "127.0.0.1", "::"].includes(p.IP ?? ""))
-                  .map((p) => p.PublicPort!),
-              ),
-            );
-          } catch {}
-          resolve();
-        });
-      },
-    );
+    const req = httpRequest({ socketPath: join(wardRuntimeDir(id), "podman/podman.sock"), path, timeout: 2000 }, (res) => {
+      let data = "";
+      res.setEncoding("utf8");
+      res.on("data", (chunk: string) => (data += chunk));
+      res.on("end", () => {
+        onBody?.(data);
+        resolve();
+      });
+    });
     req.on("error", () => resolve());
     req.on("timeout", () => req.destroy());
     req.end();
+  });
+}
+
+/**
+ * Podman schedules healthchecks with systemd timers, which a ward doesn't have, so
+ * wardd runs them: every refresh while a container is starting or unhealthy, then
+ * every HEALTHY_RECHECK_MS. Compose's `depends_on: service_healthy` relies on this.
+ */
+function runHealthchecks(id: string, ward: LiveWard, containers: readonly PodmanContainer[]): void {
+  const now = Date.now();
+  for (const c of containers) {
+    const health = c.Status;
+    if (health !== "starting" && health !== "healthy" && health !== "unhealthy") continue;
+    if (health === "healthy" && now - (ward.healthChecked.get(c.Id) ?? 0) < HEALTHY_RECHECK_MS) continue;
+    ward.healthChecked.set(c.Id, now);
+    void podmanRequest(id, `/v4.0.0/libpod/containers/${c.Id}/healthcheck`);
+  }
+}
+
+/** Ask the ward's Podman which TCP ports its running containers publish on loopback or all addresses, and run due healthchecks. */
+function refreshContainerPorts(id: string, ward: LiveWard): Promise<void> {
+  return podmanRequest(id, "/v4.0.0/libpod/containers/json", (data) => {
+    let containers: PodmanContainer[];
+    try {
+      containers = JSON.parse(data) as PodmanContainer[];
+    } catch {
+      return;
+    }
+    ward.containerPorts = new Set(
+      containers.flatMap((c) =>
+        (c.Ports ?? [])
+          .filter((p) => p.protocol === "tcp" && p.host_port !== undefined && ["", "0.0.0.0", "127.0.0.1", "::"].includes(p.host_ip ?? ""))
+          .flatMap((p) => Array.from({ length: p.range ?? 1 }, (_, i) => p.host_port! + i)),
+      ),
+    );
+    runHealthchecks(id, ward, containers);
   });
 }
 

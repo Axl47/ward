@@ -31,7 +31,9 @@ export interface WardLocation {
   readonly root: string;
 }
 
-const sanitize = (segment: string) => segment.replace(/[^A-Za-z0-9_-]/g, "_");
+/** Byte-wise, like ward-lib.sh's `tr`, so both sides agree on non-ASCII names. */
+const sanitize = (segment: string) =>
+  [...Buffer.from(segment, "utf8")].map((b) => (/[A-Za-z0-9_-]/.test(String.fromCharCode(b)) ? String.fromCharCode(b) : "_")).join("");
 
 /** The ward for a folder inside a T3 worktree, or undefined for any other folder. */
 export function locate(dir: string): WardLocation | undefined {

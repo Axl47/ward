@@ -5,7 +5,7 @@
 # ward-mapped user namespace.
 set -eu
 . "$(dirname -- "$(readlink -f -- "$0")")/ward-lib.sh"
-paths=
+n=$#
 for target in "$@"; do
   name=${target#*/}
   case "$name" in ''|*[!A-Za-z0-9._-]*|.|..) echo "ward-purge: bad target $target" >&2; exit 2 ;; esac
@@ -14,8 +14,9 @@ for target in "$@"; do
     runtime/*) path=$WARD_RUNTIME/$name ;;
     *) echo "ward-purge: bad target $target" >&2; exit 2 ;;
   esac
-  [ -e "$path" ] && paths="$paths $path"
+  if [ -e "$path" ]; then set -- "$@" "$path"; fi
 done
-[ -n "$paths" ] || exit 0
-# shellcheck disable=SC2046,SC2086 # names are checked above, so splitting is safe
-unshare $(ward_map_args) --setuid 0 --setgid 0 -- rm -rf -- $paths
+shift "$n"   # keep only the existing paths
+[ $# -gt 0 ] || exit 0
+# shellcheck disable=SC2046 # word splitting of the map flags is intended
+unshare $(ward_map_args) --setuid 0 --setgid 0 -- rm -rf -- "$@"

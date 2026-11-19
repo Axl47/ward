@@ -103,6 +103,7 @@ async function main(): Promise<void> {
       const result = await call("POST /up", { worktree: flag("worktree") ?? process.cwd() });
       if (!result.enabled) {
         if (!values.quiet) console.log(result.reason);
+        process.exitCode = 3; // bin/ward runs the command unwarded on 3
         return;
       }
       if (!values.quiet) console.log(`${result.ward.id} is up (slot ${result.ward.slot})`);

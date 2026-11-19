@@ -31,10 +31,13 @@ ward_exec() {
   fi
   rt=$WARD_RUNTIME/$WARD_ID
   pid=$(cat "$rt/pid" 2>/dev/null || true)
-  if [ ! -e "$rt/ready" ] || [ -z "$pid" ] || [ ! -e "/proc/$pid" ]; then
-    "$0" up --worktree "$WARD_ROOT" --quiet >&2 || { echo "ward: could not start ward $WARD_ID" >&2; exit 1; }
-    # wardd can decline (it resolved the folder differently); run unwarded then.
-    pid=$(cat "$rt/pid" 2>/dev/null) || exec "$@"
+  # The root check keeps two folders whose names sanitize alike out of one ward.
+  if [ ! -e "$rt/ready" ] || [ -z "$pid" ] || [ ! -e "/proc/$pid" ] || [ "$(cat "$rt/root" 2>/dev/null)" != "$WARD_ROOT" ]; then
+    rc=0
+    "$0" up --worktree "$WARD_ROOT" --quiet >&2 || rc=$?
+    [ $rc = 3 ] && exec "$@"   # wardd says this folder isn't warded
+    [ $rc = 0 ] || { echo "ward: could not start ward $WARD_ID" >&2; exit 1; }
+    pid=$(cat "$rt/pid")
   fi
   # Join the ward's cgroup so stopping the ward kills everything started here.
   echo $$ > "$(cat "$rt/cgroup")/cgroup.procs" || { echo "ward: could not join the cgroup of ward $WARD_ID" >&2; exit 1; }
