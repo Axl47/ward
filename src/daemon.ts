@@ -348,9 +348,9 @@ function attach(record: WardRecord): void {
   broker.on("message", (reply: BrokerReply, socket: unknown) => {
     if (reply.t === "ready") {
       if (ward.scanTimer !== undefined) return;
-      ward.scanTimer = setInterval(() => scan(record.id), 1000);
+      ward.scanTimer = setInterval(() => void scan(record.id), 1000);
       watchContainers(record.id, ward);
-      return scan(record.id);
+      return void scan(record.id);
     }
     const upstream = socket instanceof Object && "pipe" in socket ? (socket as Socket) : undefined;
     const callback = ward.pending.get(reply.req);
@@ -388,17 +388,18 @@ function detach(id: string): void {
  * Find the ward's ports: TCP sockets listening on its loopback or wildcard
  * addresses (from the broker's view of /proc/net), plus ports its containers
  * publish (Podman forwards those with firewall rules, not listening sockets).
+ * Resolves once newly found ports have host listeners.
  */
-function scan(id: string): void {
+function scan(id: string): Promise<unknown> {
   const ward = live.get(id);
-  if (ward === undefined) return;
+  if (ward === undefined) return Promise.resolve();
   const found = new Map<number, string[]>();
   for (const file of ["tcp", "tcp6"] as const) {
     let text: string;
     try {
       text = readFileSync(`/proc/${ward.brokerPid}/net/${file}`, "utf8");
     } catch {
-      return; // broker gone; its exit handler detaches the ward
+      return Promise.resolve(); // broker gone; its exit handler detaches the ward
     }
     for (const [port, hosts] of listeningPorts(text)) {
       if (!ward.hostPorts.has(port)) found.set(port, [...new Set([...(found.get(port) ?? []), ...hosts])]);
@@ -413,10 +414,12 @@ function scan(id: string): void {
     server.close();
     ward.listeners.delete(port);
   }
+  const mapping: Promise<unknown>[] = [];
   for (const [port, hosts] of found) {
     ward.listening.set(port, hosts);
-    if (!ward.listeners.has(port)) void ensureListener(id, port).catch((e: unknown) => log(`ward ${id}: port ${port}: ${String(e)}`));
+    if (!ward.listeners.has(port)) mapping.push(ensureListener(id, port).catch((e: unknown) => log(`ward ${id}: port ${port}: ${String(e)}`)));
   }
+  return Promise.all(mapping);
 }
 
 /** One entry of Podman's own container list (not the Docker-compatible one, which omits health). */
@@ -509,7 +512,7 @@ function refreshContainers(id: string, ward: LiveWard): void {
       ),
     );
     trackHealthchecks(id, ward, containers);
-    scan(id);
+    void scan(id);
   }).then(() => {
     ward.refreshing = false;
     if (ward.refreshAgain) {
@@ -704,7 +707,10 @@ const handlers: Handlers = {
     return { host: await ensureListener(id, port) };
   },
   "POST /gc": async () => ({ actions: await runReconcile() }),
-  "GET /ls": async () => [...wards.values()].map(info).sort((a, b) => a.slot - b.slot),
+  "GET /ls": async () => {
+    await Promise.all([...live.keys()].map(scan)); // what listens now, not at the last scan
+    return [...wards.values()].map(info).sort((a, b) => a.slot - b.slot);
+  },
 };
 
 function readBody(req: IncomingMessage): Promise<unknown> {
