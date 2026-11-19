@@ -11,13 +11,18 @@ rt=$WARD_RUNTIME/$id
 st=$WARD_STATE/wards/$id
 
 # 1. Network namespace, held open by a sleep whose pid is the ward's join point.
-unshare --net -- sh -c 'ip link set lo up && exec sleep infinity' &
+# It is made from a throwaway namespace whose tcp_child_ehash_entries gives it a
+# TCP hash table of its own: otherwise every read of its /proc/net/tcp, which
+# wardd scans each second, walks the host's whole table (3.4 ms against 0.1 ms).
+unshare --net -- sh -c '
+  echo 4096 > /proc/sys/net/ipv4/tcp_child_ehash_entries 2>/dev/null || true
+  exec unshare --net -- sh -c "ip link set lo up && exec sleep infinity"' &
 ns=$!
 for _ in $(seq 100); do
-  [ "$(readlink /proc/$ns/ns/net)" != "$(readlink /proc/self/ns/net)" ] && break
+  [ "$(cat /proc/$ns/comm 2>/dev/null)" = sleep ] && break
   sleep 0.02
 done
-[ "$(readlink /proc/$ns/ns/net)" != "$(readlink /proc/self/ns/net)" ] || { echo "ward: network namespace did not start" >&2; exit 1; }
+[ "$(cat /proc/$ns/comm 2>/dev/null)" = sleep ] || { echo "ward: network namespace did not start" >&2; exit 1; }
 
 # 2. Internet via pasta. No inbound forwarding: wardd maps ports itself, so the
 # ward's ports never appear on the host under their own numbers. Outbound, the
