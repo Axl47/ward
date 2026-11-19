@@ -37,21 +37,26 @@ const { positionals, values } = parseArgs({
 const [command, ...args] = positionals;
 const flag = (name: "worktree") => (typeof values[name] === "string" ? (values[name] as string) : undefined);
 
-/** The ward this command is about: explicit id, --worktree, $WARD_ID, or the current folder. */
-function currentId(explicit?: string): string {
-  if (explicit) return explicit;
+/**
+ * The ward this command is about: explicit id, --worktree, $WARD_ID, or the
+ * current folder. worktree is set when it was found by path.
+ */
+function target(explicit?: string): { id: string; worktree?: string } {
+  if (explicit) return { id: explicit };
   const worktree = flag("worktree");
-  if (worktree === undefined && process.env.WARD_ID) return process.env.WARD_ID;
+  if (worktree === undefined && process.env.WARD_ID) return { id: process.env.WARD_ID };
   const location = locate(worktree ?? process.cwd());
   if (location === undefined) throw new WardError("not inside a T3 worktree; pass a ward id or --worktree");
-  return location.id;
+  return { id: location.id, worktree: location.root };
 }
+const currentId = () => target().id;
 
 /** Start wardd if its socket is missing or stale (left behind by a crash). */
 async function ensureDaemon(): Promise<void> {
   if (existsSync(CONTROL_SOCKET) && (await reachable())) return;
   spawnSync("systemctl", ["--user", "reset-failed", "wardd.service"], { stdio: "ignore" });
-  spawnSync("systemctl", ["--user", "restart", "wardd.service"], { stdio: "inherit" });
+  // start, not restart: a concurrent caller may already have started it and be mid-request.
+  spawnSync("systemctl", ["--user", "start", "wardd.service"], { stdio: "inherit" });
   for (let i = 0; i < 100; i++) {
     if (existsSync(CONTROL_SOCKET) && (await reachable())) return;
     await new Promise((r) => setTimeout(r, 50));
@@ -126,9 +131,10 @@ async function main(): Promise<void> {
     case "stop":
     case "rm": {
       await ensureDaemon();
-      const id = currentId(args[0]);
+      const ward = target(args[0]);
+      const id = ward.id;
       const now = values.now === true;
-      const result = command === "stop" ? await call("POST /stop", { id }) : await call("POST /rm", { id, now });
+      const result = command === "stop" ? await call("POST /stop", ward) : await call("POST /rm", { ...ward, now });
       console.log(`${id}: ${"stopped" in result ? (result.stopped ? "stopped" : "was not running") : now ? "removed" : "removed (data in the trash for 7 days)"}`);
       return;
     }

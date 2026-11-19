@@ -29,9 +29,10 @@ export type UpResult =
 
 export interface Routes {
   "POST /up": { body: { worktree: string }; result: UpResult };
-  "POST /stop": { body: { id: string }; result: { stopped: boolean } };
+  /** With worktree, acts only if the ward is that worktree's. */
+  "POST /stop": { body: { id: string; worktree?: string }; result: { stopped: boolean } };
   /** Moves the ward's data to the trash, or deletes it now with `now`. */
-  "POST /rm": { body: { id: string; now?: boolean }; result: { removed: boolean } };
+  "POST /rm": { body: { id: string; worktree?: string; now?: boolean }; result: { removed: boolean } };
   "POST /port": { body: { id: string; port: number }; result: { host: number } };
   "POST /gc": { body: Record<string, never>; result: { actions: string[] } };
   "GET /ls": { body: Record<string, never>; result: WardInfo[] };

@@ -2,7 +2,7 @@
 // maps each port a ward listens on to a host port in the ward's slot, and runs
 // the reconciler that stops or removes wards when T3 is done with them.
 import { execFile, spawn, type ChildProcess } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, watch, writeFileSync, type FSWatcher } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, watch, writeFileSync, type FSWatcher } from "node:fs";
 import { createServer as createHttpServer, request as httpRequest, type IncomingMessage, type ServerResponse } from "node:http";
 import { createServer, type Server, type Socket } from "node:net";
 import { userInfo } from "node:os";
@@ -94,7 +94,11 @@ function readPid(id: string): number | undefined {
 
 const shellQuote = (value: string) => `'${value.replaceAll("'", `'\\''`)}'`;
 
-/** When the ward last started or ran a command (ms since epoch), from files that outlive wardd restarts. */
+/**
+ * When the ward last started, ran a command, or got typing in one of its
+ * terminals (ms since epoch). Commands typed into a terminal bypass `ward exec`,
+ * so a terminal's last input time (its pty's atime, as `w` uses) counts too.
+ */
 function lastActivity(id: string): number {
   const times = ["ready", "last-exec"].map((file) => {
     try {
@@ -103,7 +107,23 @@ function lastActivity(id: string): number {
       return 0;
     }
   });
-  return Math.max(...times);
+  return Math.max(...times, ...terminalInputTimes(id));
+}
+
+function terminalInputTimes(id: string): number[] {
+  try {
+    const procs = readFileSync(join(readFileSync(join(wardRuntimeDir(id), "cgroup"), "utf8").trim(), "cgroup.procs"), "utf8");
+    const ptys = new Set(procs.split("\n").filter(Boolean).map((pid) => {
+      try {
+        return readlinkSync(`/proc/${pid}/fd/0`);
+      } catch {
+        return "";
+      }
+    }));
+    return [...ptys].filter((pty) => pty.startsWith("/dev/pts/")).map((pty) => statSync(pty).atimeMs);
+  } catch {
+    return [];
+  }
 }
 
 /**
@@ -169,8 +189,9 @@ async function up(worktree: string): Promise<UpResult> {
     let record = wards.get(location.id);
     if (record !== undefined && record.worktree !== location.root)
       throw new Error(`ward id ${location.id} already belongs to ${record.worktree}; rename one of the folders`);
+    // Also when the record exists: wardd may have died between trashing and forgetting it.
+    restoreFromTrash(location.id, location.root);
     if (record === undefined) {
-      restoreFromTrash(location.id, location.root);
       record = { id: location.id, repo: location.repo, worktree: location.root, slot: claimSlot(), ports: {}, createdAt: new Date().toISOString() };
       wards.set(record.id, record);
       saveRegistry(wards);
@@ -393,6 +414,7 @@ function podmanRequest(id: string, path: string, onBody?: (body: string) => void
       });
     });
     req.on("error", () => resolve());
+    req.on("close", () => resolve()); // also when Podman hangs up mid-reply
     req.on("timeout", () => req.destroy());
     req.end();
   });
@@ -582,16 +604,18 @@ function runReconcile(): Promise<string[]> {
 
 type Handlers = { [R in Route]: (body: Routes[R]["body"]) => Promise<Routes[R]["result"]> };
 
-const requireRecord = (id: string) => {
+/** The ward with this id; with worktree, only if it is that worktree's (ids of similar folder names can collide). */
+const requireRecord = (id: string, worktree?: string) => {
   const record = wards.get(id);
-  if (record === undefined) throw new Error(`no ward ${id}`);
+  if (record === undefined || (worktree !== undefined && record.worktree !== worktree))
+    throw new Error(`no ward for ${worktree ?? id}`);
   return record;
 };
 
 const handlers: Handlers = {
   "POST /up": ({ worktree }) => up(worktree).finally(watchWorktreeParents),
-  "POST /stop": async ({ id }) => ({ stopped: await stop(requireRecord(id).id) }),
-  "POST /rm": async ({ id, now }) => ({ removed: await rm(requireRecord(id).id, { trash: !now }) }),
+  "POST /stop": async ({ id, worktree }) => ({ stopped: await stop(requireRecord(id, worktree).id) }),
+  "POST /rm": async ({ id, worktree, now }) => ({ removed: await rm(requireRecord(id, worktree).id, { trash: !now }) }),
   "POST /port": async ({ id, port }) => {
     if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error(`bad port ${port}`);
     requireRecord(id);
