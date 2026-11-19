@@ -224,7 +224,6 @@ async function up(worktree: string): Promise<UpResult> {
     if (starting) writeHostPorts(record);
     writeEnvFile(record);
     if (starting) {
-      rmSync(join(wardRuntimeDir(record.id), "init.log"), { force: true }); // no previous start's errors
       await systemctl("start", unitName(record.id));
       await waitReady(record.id);
       log(`started ward ${record.id}`);
