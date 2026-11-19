@@ -67,14 +67,14 @@ function install(): void {
       .replaceAll("@NODE@", process.execPath);
     writeFileSync(join(unitDir, unit), text);
   }
-  for (const bin of ["ward", "ward-prefix"]) {
+  for (const bin of ["ward", "ward-prefix", "ward-bash-env"]) {
     rmSync(join(binDir, bin), { force: true });
     symlinkSync(join(WARD_HOME, "bin", bin), join(binDir, bin));
   }
   execFileSync("systemctl", ["--user", "daemon-reload"]);
   execFileSync("systemctl", ["--user", "enable", "--now", "wardd.service"]);
   execFileSync("systemctl", ["--user", "restart", "wardd.service"]);
-  console.log(`installed units in ${unitDir} and ward, ward-prefix in ${binDir}`);
+  console.log(`installed units in ${unitDir} and ward, ward-prefix, ward-bash-env in ${binDir}`);
 }
 
 function repoArg(): string {

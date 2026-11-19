@@ -1,0 +1,13 @@
+# BASH_ENV hook for agents that run each command as `bash -c CMD` (Codex).
+# Set BASH_ENV to this file in the agent's environment. bash sources it before
+# running CMD; when the folder is inside an enabled ward, the command re-runs
+# there instead. Elsewhere, inside a ward (WARD_ID set) and for scripts it
+# does nothing.
+if [ -z "${WARD_ID:-}" ] && [ -n "${BASH_EXECUTION_STRING:-}" ]; then
+  __ward_bin=$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")
+  __ward_dir=$(pwd -P)
+  if (. "$__ward_bin/../libexec/ward-lib.sh" && ward_resolve "$__ward_dir" && ward_enabled "$WARD_REPO"); then
+    exec "$__ward_bin/ward" exec --worktree "$__ward_dir" -- /usr/bin/env bash -c "$BASH_EXECUTION_STRING"
+  fi
+  unset __ward_bin __ward_dir
+fi
