@@ -6,6 +6,7 @@ import { basename, join } from "node:path";
 import { parseArgs } from "node:util";
 import { call, WardError, type WardInfo } from "./api.ts";
 import { CONTROL_SOCKET, enabledMarker, locate, WARD_HOME, wardRuntimeDir } from "./paths.ts";
+import { T3_TOKEN_FILE } from "./t3state.ts";
 
 const USAGE = `usage: ward <command>
 
@@ -70,6 +71,14 @@ function install(): void {
   for (const bin of ["ward", "ward-prefix", "ward-bash-env"]) {
     rmSync(join(binDir, bin), { force: true });
     symlinkSync(join(WARD_HOME, "bin", bin), join(binDir, bin));
+  }
+  if (!existsSync(T3_TOKEN_FILE)) {
+    // Read-only token for the reconciler's view of T3 thread state.
+    const token = spawnSync("t3", ["auth", "session", "issue", "--scope", "orchestration:read", "--ttl", "365d", "--label", "ward", "--token-only"], { encoding: "utf8" });
+    if (token.status === 0 && token.stdout.trim()) {
+      mkdirSync(join(T3_TOKEN_FILE, ".."), { recursive: true });
+      writeFileSync(T3_TOKEN_FILE, token.stdout.trim() + "\n", { mode: 0o600 });
+    } else console.warn("ward: could not issue a T3 token; wards will not stop when threads settle");
   }
   execFileSync("systemctl", ["--user", "daemon-reload"]);
   execFileSync("systemctl", ["--user", "enable", "--now", "wardd.service"]);

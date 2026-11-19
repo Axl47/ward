@@ -21,7 +21,7 @@ import {
   wardStateDir,
 } from "./paths.ts";
 import { freeSlot, loadRegistry, saveRegistry, slotPorts, type WardRecord } from "./registry.ts";
-import { threadsByWorktree } from "./t3state.ts";
+import { threadsByWorktree, type ThreadState } from "./t3state.ts";
 
 const run = promisify(execFile);
 const { uid, gid } = userInfo();
@@ -49,6 +49,10 @@ interface LiveWard {
 const wards = loadRegistry();
 const live = new Map<string, LiveWard>();
 const locks = new Map<string, Promise<unknown>>();
+/** Threads by worktree from the last reconcile, for attributing wards to threads. */
+let lastThreads: Map<string, ThreadState[]> | undefined;
+/** When wardd last saw each ward start (ISO time), for the reconciler. */
+const startedAtById = new Map<string, string>();
 const log = (message: string) => console.log(message);
 
 /** Run fn after any earlier operation on the same ward has settled. */
@@ -98,7 +102,8 @@ function info(record: WardRecord): WardInfo {
   const ports: PortInfo[] = Object.entries(record.ports)
     .map(([wardPort, host]) => ({ ward: Number(wardPort), host, listening: ward?.listening.has(Number(wardPort)) ?? false }))
     .sort((a, b) => a.ward - b.ward);
-  return { id: record.id, repo: record.repo, worktree: record.worktree, slot: record.slot, running: isReady(record.id), ports };
+  const threadIds = (lastThreads?.get(record.worktree) ?? []).map((t) => t.threadId);
+  return { id: record.id, repo: record.repo, worktree: record.worktree, threadIds, slot: record.slot, running: isReady(record.id), ports };
 }
 
 // ── Lifecycle ────────────────────────────────────────────────────────────────
@@ -118,11 +123,13 @@ async function up(worktree: string): Promise<UpResult> {
     }
     writeEnvFile(record);
     if (!isReady(record.id)) {
+      startedAtById.set(record.id, new Date().toISOString());
       await systemctl("start", unitName(record.id));
       await waitReady(record.id);
       log(`started ward ${record.id}`);
     }
     if (!live.has(record.id)) attach(record);
+    if (!lastThreads?.has(record.worktree)) void runReconcile(); // learn which threads use it
     return { enabled: true, ward: info(record) };
   });
 }
@@ -371,14 +378,18 @@ function forward(id: string, wardPort: number, client: Socket): void {
 
 // ── Reconciler ───────────────────────────────────────────────────────────────
 
-/** Stop wards whose threads are all idle; remove wards whose worktree or threads are gone. */
+/**
+ * Remove wards whose worktree is gone (the only path that deletes data) and stop
+ * wards whose threads all went idle (settled, archived or deleted) after the
+ * ward last started, so reopening a settled thread's terminal isn't undone.
+ */
 async function reconcile(): Promise<string[]> {
   const actions: string[] = [];
-  let threads: ReturnType<typeof threadsByWorktree>;
+  let threads: Map<string, ThreadState[]> | undefined;
   try {
-    threads = threadsByWorktree();
+    threads = lastThreads = await threadsByWorktree();
   } catch (error) {
-    log(`reconcile: cannot read T3 state: ${String(error)}`);
+    log(`reconcile: cannot read T3 thread state: ${error instanceof Error ? error.message : String(error)}`);
   }
   for (const record of [...wards.values()]) {
     if (!existsSync(record.worktree)) {
@@ -387,13 +398,12 @@ async function reconcile(): Promise<string[]> {
       continue;
     }
     const states = threads?.get(record.worktree) ?? [];
-    if (states.length === 0) continue; // not a thread's worktree (or T3 state unreadable): leave it alone
-    if (states.every((t) => t.deleted)) {
-      await rm(record.id);
-      actions.push(`removed ${record.id}: its threads were deleted`);
-    } else if (isReady(record.id) && states.every((t) => t.deleted || t.idle)) {
+    const startedAt = startedAtById.get(record.id);
+    // No thread uses this worktree (or T3 is unreachable): leave the ward alone.
+    if (states.length === 0 || startedAt === undefined || !isReady(record.id)) continue;
+    if (states.every((t) => t.idleSince !== undefined && t.idleSince > startedAt)) {
       await stop(record.id);
-      actions.push(`stopped ${record.id}: its threads are settled or archived`);
+      actions.push(`stopped ${record.id}: its threads are settled, archived or deleted`);
     }
   }
   return actions;
@@ -486,7 +496,11 @@ function main(): void {
   rmSync(CONTROL_SOCKET, { force: true });
   const server = createHttpServer((req, res) => void handle(req, res));
   server.listen(CONTROL_SOCKET, () => log(`wardd listening on ${CONTROL_SOCKET}`));
-  for (const record of wards.values()) if (isReady(record.id)) attach(record);
+  for (const record of wards.values()) {
+    if (!isReady(record.id)) continue;
+    startedAtById.set(record.id, new Date().toISOString());
+    attach(record);
+  }
   watchWorktreeParents();
   void runReconcile();
   setInterval(() => void runReconcile(), RECONCILE_MS);

@@ -16,6 +16,8 @@ export interface WardInfo {
   readonly id: string;
   readonly repo: string;
   readonly worktree: string;
+  /** T3 threads whose worktree this is, as of the last reconcile. */
+  readonly threadIds: readonly string[];
   readonly slot: number;
   readonly running: boolean;
   readonly ports: readonly PortInfo[];

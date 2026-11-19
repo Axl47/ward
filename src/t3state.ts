@@ -1,62 +1,67 @@
-// Read-only view of T3's thread state, used by the reconciler to decide when a
-// ward should stop (its threads settled or archived) or go away (threads deleted).
-import { existsSync } from "node:fs";
-import { DatabaseSync } from "node:sqlite";
-import { T3_STATE_DB } from "./paths.ts";
+// T3's thread state, read from the server's orchestration API with a read-only
+// token. The reconciler uses it to stop a ward once no thread needs it.
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { CONFIG_DIR, T3_HOME } from "./paths.ts";
+
+/** Issued by `ward install`: `t3 auth session issue --scope orchestration:read`. */
+export const T3_TOKEN_FILE = join(CONFIG_DIR, "t3-token");
 
 export interface ThreadState {
   readonly threadId: string;
   readonly worktree: string;
-  /** Deleted threads never come back. */
-  readonly deleted: boolean;
-  /** Settled or archived: no agent work is expected until someone reopens it. */
-  readonly idle: boolean;
+  /**
+   * When the thread was settled, archived or deleted (no agent work is expected
+   * until someone reopens it), or undefined while it is active.
+   */
+  readonly idleSince: string | undefined;
 }
 
-interface Row {
-  readonly thread_id: string;
-  readonly archived_at: string | null;
-  readonly deleted_at: string | null;
-  readonly worktree: string;
-  readonly settled_override: string | null;
-  readonly settled_at: string | null;
-  readonly unsettled_at: string | null;
+interface ShellThread {
+  readonly id: string;
+  readonly worktreePath?: string | null;
+  readonly archivedAt?: string | null;
+  readonly deletedAt?: string | null;
+  readonly settledOverride?: string | null;
+  readonly settledAt?: string | null;
+  readonly unsettledAt?: string | null;
 }
 
-/** Threads grouped by worktree path, or undefined when T3's database is missing. */
-export function threadsByWorktree(dbPath = T3_STATE_DB): Map<string, ThreadState[]> | undefined {
-  if (!existsSync(dbPath)) return undefined;
-  const db = new DatabaseSync(dbPath, { readOnly: true });
+function t3Origin(): string {
   try {
-    const rows = db
-      .prepare(
-        `select thread_id, archived_at, deleted_at,
-                json_extract(payload_json, '$.worktreePath') as worktree,
-                json_extract(payload_json, '$.settledOverride') as settled_override,
-                json_extract(payload_json, '$.settledAt') as settled_at,
-                json_extract(payload_json, '$.unsettledAt') as unsettled_at
-           from orchestration_v2_projection_threads
-          where json_extract(payload_json, '$.worktreePath') is not null`,
-      )
-      .all() as unknown as Row[];
-    const byWorktree = new Map<string, ThreadState[]>();
-    for (const row of rows) {
-      const state: ThreadState = {
-        threadId: row.thread_id,
-        worktree: row.worktree,
-        deleted: row.deleted_at !== null,
-        idle: row.archived_at !== null || isSettled(row),
-      };
-      byWorktree.set(row.worktree, [...(byWorktree.get(row.worktree) ?? []), state]);
-    }
-    return byWorktree;
-  } finally {
-    db.close();
-  }
+    const runtime = JSON.parse(readFileSync(join(T3_HOME, "userdata/server-runtime.json"), "utf8")) as { origin?: string };
+    if (runtime.origin) return runtime.origin;
+  } catch {}
+  return "http://127.0.0.1:3773";
 }
 
-function isSettled(row: Row): boolean {
-  if (row.settled_override === "settled") return true;
-  if (row.settled_override === "active" || row.settled_at === null) return false;
-  return row.unsettled_at === null || row.settled_at > row.unsettled_at;
+/** Threads grouped by worktree path. Throws when T3 is unreachable or the token is missing or rejected. */
+export async function threadsByWorktree(): Promise<Map<string, ThreadState[]>> {
+  const token = readFileSync(T3_TOKEN_FILE, "utf8").trim();
+  const res = await fetch(`${t3Origin()}/api/orchestration/shell`, {
+    headers: { authorization: `Bearer ${token}`, "x-t3-orchestration-protocol": "2", accept: "application/json" },
+    signal: AbortSignal.timeout(10_000),
+  });
+  if (!res.ok) throw new Error(`T3 answered HTTP ${res.status}${res.status === 401 ? " (token expired or revoked; rerun `ward install`)" : ""}`);
+  const { threads } = (await res.json()) as { threads: readonly ShellThread[] };
+  const byWorktree = new Map<string, ThreadState[]>();
+  for (const thread of threads) {
+    if (!thread.worktreePath) continue;
+    const state: ThreadState = {
+      threadId: thread.id,
+      worktree: thread.worktreePath,
+      idleSince: [thread.deletedAt, thread.archivedAt, isSettled(thread) ? (thread.settledAt ?? undefined) : undefined]
+        .filter((t): t is string => Boolean(t))
+        .sort()
+        .at(-1),
+    };
+    byWorktree.set(state.worktree, [...(byWorktree.get(state.worktree) ?? []), state]);
+  }
+  return byWorktree;
+}
+
+export function isSettled(thread: Pick<ShellThread, "settledOverride" | "settledAt" | "unsettledAt">): boolean {
+  if (thread.settledOverride === "settled") return Boolean(thread.settledAt);
+  if (thread.settledOverride === "active" || !thread.settledAt) return false;
+  return !thread.unsettledAt || thread.settledAt > thread.unsettledAt;
 }
