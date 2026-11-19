@@ -208,8 +208,8 @@ async function up(worktree: string): Promise<UpResult> {
       saveRegistry(wards);
       log(`ward ${record.id} got slot ${record.slot}`);
     }
-    writeEnvFile(record);
     if (!isReady(record.id)) {
+      writeEnvFile(record); // only on start: pasta keeps the host ports it started with
       await systemctl("start", unitName(record.id));
       await waitReady(record.id);
       log(`started ward ${record.id}`);
@@ -391,7 +391,7 @@ function detach(id: string): void {
  */
 function scan(id: string): Promise<unknown> {
   const ward = live.get(id);
-  if (ward === undefined) return Promise.resolve();
+  if (ward?.scanTimer === undefined) return Promise.resolve(); // broker not in the ward yet
   const found = new Map<number, string[]>();
   for (const file of ["tcp", "tcp6"] as const) {
     let text: string;
@@ -469,21 +469,29 @@ const CONTAINER_CHANGES = new Set(["start", "died", "remove"]);
  */
 function watchContainers(id: string, ward: LiveWard): void {
   if (live.get(id) !== ward) return;
-  refreshContainers(id, ward);
   const filters = encodeURIComponent(JSON.stringify({ type: ["container"] }));
-  const req = httpRequest({ socketPath: join(wardRuntimeDir(id), "podman/podman.sock"), path: `/v4.0.0/libpod/events?stream=true&filters=${filters}` }, (res) => {
+  // Replays the last moments too, so a container that starts around the first list isn't missed.
+  const since = Math.floor(Date.now() / 1000) - 1;
+  const req = httpRequest({ socketPath: join(wardRuntimeDir(id), "podman/podman.sock"), path: `/v4.0.0/libpod/events?stream=true&since=${since}&filters=${filters}` }, (res) => {
+    refreshContainers(id, ward);
     let pending = "";
     res.setEncoding("utf8");
     res.on("data", (chunk: string) => {
       const lines = (pending + chunk).split("\n");
       pending = lines.pop() ?? "";
-      const changed = lines.some((line) => {
+      const changed = lines.filter((line) => {
         try {
-          return CONTAINER_CHANGES.has((JSON.parse(line) as { Action?: string }).Action ?? "");
+          const event = JSON.parse(line) as { Action?: string; Actor?: { ID?: string } };
+          // A restarted container keeps its id; its first check is due at once, not an interval later.
+          if (event.Action === "start" && event.Actor?.ID !== undefined) {
+            ward.health.get(event.Actor.ID)?.();
+            ward.health.delete(event.Actor.ID);
+          }
+          return CONTAINER_CHANGES.has(event.Action ?? "");
         } catch {
           return line.trim() !== "";
         }
-      });
+      }).length > 0;
       if (changed) refreshContainers(id, ward);
     });
   });
@@ -581,7 +589,7 @@ async function ensureListener(id: string, wardPort: number): Promise<number> {
     if (!ok) continue;
     if (live.get(id) !== ward || ward.listeners.has(wardPort)) {
       server.close(); // lost a race with detach or another ensureListener
-      return ward.listeners.has(wardPort) ? record.ports[String(wardPort)]! : hostPort;
+      return ward.listeners.has(wardPort) ? (wards.get(id) ?? record).ports[String(wardPort)]! : hostPort;
     }
     ward.listeners.set(wardPort, server);
     if (known !== hostPort) {
