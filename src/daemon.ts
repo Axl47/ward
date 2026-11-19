@@ -3,7 +3,7 @@
 // the reconciler that stops or removes wards when T3 is done with them.
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, watch, writeFileSync, type FSWatcher } from "node:fs";
-import { createServer as createHttpServer, request as httpRequest, type IncomingMessage, type ServerResponse } from "node:http";
+import { createServer as createHttpServer, request as httpRequest, type ClientRequest, type IncomingMessage, type ServerResponse } from "node:http";
 import { createServer, type Server, type Socket } from "node:net";
 import { userInfo } from "node:os";
 import { basename, dirname, join } from "node:path";
@@ -37,14 +37,6 @@ const READY_TIMEOUT_MS = 60_000;
 const CONNECT_TIMEOUT_MS = 10_000;
 const TRASH_DAYS = 7;
 
-/** When to run one container's healthcheck, from its configuration. */
-interface HealthSchedule {
-  readonly intervalMs: number;
-  readonly timeoutMs: number;
-  lastRun: number;
-  running: boolean;
-}
-
 /** A running ward's in-memory plumbing. */
 interface LiveWard {
   readonly broker: ChildProcess;
@@ -56,11 +48,15 @@ interface LiveWard {
   readonly pending: Map<number, (reply: BrokerReply, socket: Socket | undefined) => void>;
   /** Set once the broker reports it is inside the ward; scanning earlier would read the host's sockets. */
   scanTimer: NodeJS.Timeout | undefined;
-  /** Ports the ward's running containers publish, refreshed every other scan. */
+  /** Ports the ward's running containers publish, refreshed on each container event. */
   containerPorts: ReadonlySet<number>;
-  /** Container id → its healthcheck schedule, "pending" while wardd reads it. */
-  readonly health: Map<string, HealthSchedule | "pending">;
-  scanCount: number;
+  /** Container id → stops the loop running its healthcheck. */
+  readonly health: Map<string, () => void>;
+  /** The ward's Podman event stream, while connected. */
+  events: ClientRequest | undefined;
+  /** A container list request is in flight; another is wanted after it. */
+  refreshing: boolean;
+  refreshAgain: boolean;
   nextReq: number;
   /** Host ports pasta forwards into the ward; they listen inside it but aren't the ward's own. */
   readonly hostPorts: ReadonlySet<number>;
@@ -342,14 +338,18 @@ function attach(record: WardRecord): void {
     scanTimer: undefined,
     containerPorts: new Set(),
     health: new Map(),
-    scanCount: 0,
+    events: undefined,
+    refreshing: false,
+    refreshAgain: false,
     nextReq: 1,
     hostPorts: new Set([53, ...readHostPorts(record.id)]),
   };
   live.set(record.id, ward);
   broker.on("message", (reply: BrokerReply, socket: unknown) => {
     if (reply.t === "ready") {
-      ward.scanTimer ??= setInterval(() => scan(record.id), 1000);
+      if (ward.scanTimer !== undefined) return;
+      ward.scanTimer = setInterval(() => scan(record.id), 1000);
+      watchContainers(record.id, ward);
       return scan(record.id);
     }
     const upstream = socket instanceof Object && "pipe" in socket ? (socket as Socket) : undefined;
@@ -377,6 +377,8 @@ function detach(id: string): void {
   if (ward === undefined) return;
   live.delete(id);
   clearInterval(ward.scanTimer);
+  ward.events?.destroy();
+  for (const stopHealthcheck of ward.health.values()) stopHealthcheck();
   for (const server of ward.listeners.values()) server.close();
   for (const callback of ward.pending.values()) callback({ t: "failed", req: 0, message: "ward stopped" }, undefined);
   ward.broker.kill();
@@ -415,7 +417,6 @@ function scan(id: string): void {
     ward.listening.set(port, hosts);
     if (!ward.listeners.has(port)) void ensureListener(id, port).catch((e: unknown) => log(`ward ${id}: port ${port}: ${String(e)}`));
   }
-  if (ward.scanCount++ % 2 === 0) void refreshContainerPorts(id, ward);
 }
 
 /** One entry of Podman's own container list (not the Docker-compatible one, which omits health). */
@@ -456,42 +457,50 @@ function podmanRequest(id: string, path: string, onBody?: (body: string) => void
 
 const DEFAULT_HEALTH_MS = 30_000; // Podman's default interval and timeout
 const nsToMs = (ns: unknown) => (typeof ns === "number" && ns > 0 ? ns / 1e6 : DEFAULT_HEALTH_MS);
+/** Container events that can change what is running, what it publishes, or what needs a healthcheck. */
+const CONTAINER_CHANGES = new Set(["start", "died", "remove"]);
 
 /**
- * Podman schedules healthchecks with systemd timers, which a ward doesn't have, so
- * wardd runs them at each container's configured interval, one at a time per
- * container. Compose's `depends_on: service_healthy` relies on this.
+ * Follow the ward's Podman events and refresh the container list on each change,
+ * so nothing polls Podman while its containers stay as they are. Reconnects
+ * (and refreshes, to catch what it missed) while the ward is live.
  */
-function runHealthchecks(id: string, ward: LiveWard, containers: readonly PodmanContainer[]): void {
-  const now = Date.now();
-  const present = new Set(containers.map((c) => c.Id));
-  for (const container of ward.health.keys()) if (!present.has(container)) ward.health.delete(container);
-  for (const c of containers) {
-    if (c.Status !== "starting" && c.Status !== "healthy" && c.Status !== "unhealthy") continue;
-    const schedule = ward.health.get(c.Id);
-    if (schedule === undefined) {
-      ward.health.set(c.Id, "pending");
-      void podmanRequest(id, `/v4.0.0/libpod/containers/${c.Id}/json`, (body) => {
-        const config = (JSON.parse(body) as { Config?: { Healthcheck?: { Interval?: unknown; Timeout?: unknown } } }).Config;
-        const check = config?.Healthcheck;
-        ward.health.set(c.Id, { intervalMs: nsToMs(check?.Interval), timeoutMs: nsToMs(check?.Timeout), lastRun: 0, running: false });
-      }).then(() => ward.health.get(c.Id) === "pending" && ward.health.delete(c.Id)); // retry next time
-      continue;
-    }
-    if (schedule === "pending" || schedule.running || now - schedule.lastRun < schedule.intervalMs) continue;
-    schedule.running = true;
-    schedule.lastRun = now;
-    void podmanRequest(id, `/v4.0.0/libpod/containers/${c.Id}/healthcheck`, undefined, schedule.timeoutMs + 5000).then(
-      () => (schedule.running = false),
-    );
-  }
+function watchContainers(id: string, ward: LiveWard): void {
+  if (live.get(id) !== ward) return;
+  refreshContainers(id, ward);
+  const filters = encodeURIComponent(JSON.stringify({ type: ["container"] }));
+  const req = httpRequest({ socketPath: join(wardRuntimeDir(id), "podman/podman.sock"), path: `/v4.0.0/libpod/events?stream=true&filters=${filters}` }, (res) => {
+    let pending = "";
+    res.setEncoding("utf8");
+    res.on("data", (chunk: string) => {
+      const lines = (pending + chunk).split("\n");
+      pending = lines.pop() ?? "";
+      const changed = lines.some((line) => {
+        try {
+          return CONTAINER_CHANGES.has((JSON.parse(line) as { Action?: string }).Action ?? "");
+        } catch {
+          return line.trim() !== "";
+        }
+      });
+      if (changed) refreshContainers(id, ward);
+    });
+  });
+  req.on("error", () => undefined); // "close" follows and reconnects
+  req.on("close", () => {
+    if (ward.events === req) ward.events = undefined;
+    setTimeout(() => watchContainers(id, ward), 1000);
+  });
+  ward.events = req;
+  req.end();
 }
 
-/** Ask the ward's Podman which TCP ports its running containers publish on loopback or all addresses, and run due healthchecks. */
-function refreshContainerPorts(id: string, ward: LiveWard): Promise<void> {
-  return podmanRequest(id, "/v4.0.0/libpod/containers/json", (data) => {
+/** Re-read the ward's containers: published ports and healthchecks. Coalesces overlapping calls. */
+function refreshContainers(id: string, ward: LiveWard): void {
+  if (ward.refreshing) return void (ward.refreshAgain = true);
+  ward.refreshing = true;
+  void podmanRequest(id, "/v4.0.0/libpod/containers/json", (data) => {
     const containers = JSON.parse(data) as PodmanContainer[];
-    if (!Array.isArray(containers)) return;
+    if (!Array.isArray(containers) || live.get(id) !== ward) return;
     ward.containerPorts = new Set(
       containers.flatMap((c) =>
         (c.Ports ?? [])
@@ -499,8 +508,55 @@ function refreshContainerPorts(id: string, ward: LiveWard): Promise<void> {
           .flatMap((p) => Array.from({ length: p.range ?? 1 }, (_, i) => p.host_port! + i)),
       ),
     );
-    runHealthchecks(id, ward, containers);
+    trackHealthchecks(id, ward, containers);
+    scan(id);
+  }).then(() => {
+    ward.refreshing = false;
+    if (ward.refreshAgain) {
+      ward.refreshAgain = false;
+      refreshContainers(id, ward);
+    }
   });
+}
+
+/**
+ * Podman schedules healthchecks with systemd timers, which a ward doesn't have, so
+ * wardd runs each container's check in a loop of its own: the first right away,
+ * then each its configured interval after the previous one finished, as Docker
+ * does. Compose's `depends_on: service_healthy` and `up --wait` rely on this.
+ */
+function trackHealthchecks(id: string, ward: LiveWard, containers: readonly PodmanContainer[]): void {
+  const checked = new Set(containers.filter((c) => c.Status === "starting" || c.Status === "healthy" || c.Status === "unhealthy").map((c) => c.Id));
+  for (const [container, stopHealthcheck] of ward.health) {
+    if (checked.has(container)) continue;
+    stopHealthcheck();
+    ward.health.delete(container);
+  }
+  for (const container of checked) {
+    if (ward.health.has(container)) continue;
+    let stopped = false;
+    let timer: NodeJS.Timeout | undefined;
+    const stopHealthcheck = () => {
+      stopped = true;
+      clearTimeout(timer);
+    };
+    ward.health.set(container, stopHealthcheck);
+    let intervalMs = DEFAULT_HEALTH_MS;
+    let timeoutMs = DEFAULT_HEALTH_MS;
+    void podmanRequest(id, `/v4.0.0/libpod/containers/${container}/json`, (body) => {
+      const check = (JSON.parse(body) as { Config?: { Healthcheck?: { Interval?: unknown; Timeout?: unknown } } }).Config?.Healthcheck;
+      intervalMs = nsToMs(check?.Interval);
+      timeoutMs = nsToMs(check?.Timeout);
+    }).then(() => {
+      const run = () => {
+        if (stopped) return;
+        void podmanRequest(id, `/v4.0.0/libpod/containers/${container}/healthcheck`, undefined, timeoutMs + 5000).then(() => {
+          if (!stopped) timer = setTimeout(run, intervalMs);
+        });
+      };
+      run();
+    });
+  }
 }
 
 /** Make sure a host listener exists for a ward port; returns its host port. */
