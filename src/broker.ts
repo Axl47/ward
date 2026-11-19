@@ -29,6 +29,9 @@ function tryConnect(hosts: readonly string[], port: number): Promise<Socket> {
   return new Promise((resolve, reject) => {
     const socket = connect({ host, port });
     socket.once("connect", () => {
+      // Paused before Node starts reading, so nothing the server sends first (a greeting,
+      // or data and FIN) lands in this process; it all stays in the socket for wardd.
+      socket.pause();
       socket.removeAllListeners("error");
       resolve(socket);
     });

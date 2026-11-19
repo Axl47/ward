@@ -24,6 +24,7 @@ import {
   WORKTREES_DIR,
 } from "./paths.ts";
 import { listeningPorts } from "./procnet.ts";
+import { splice } from "./splice.ts";
 import { freeSlot, loadRegistry, MAX_SLOTS, saveRegistry, slotPorts, type WardRecord } from "./registry.ts";
 import { shouldStop, threadsByWorktree, type ThreadState } from "./t3state.ts";
 
@@ -341,9 +342,11 @@ function attach(record: WardRecord): void {
       ward.scanTimer ??= setInterval(() => scan(record.id), 1000);
       return scan(record.id);
     }
+    const upstream = socket instanceof Object && "pipe" in socket ? (socket as Socket) : undefined;
     const callback = ward.pending.get(reply.req);
     ward.pending.delete(reply.req);
-    callback?.(reply, socket instanceof Object && "pipe" in socket ? (socket as Socket) : undefined);
+    if (callback === undefined) return void upstream?.destroy(); // its client timed out meanwhile
+    callback(reply, upstream);
   });
   broker.on("exit", () => {
     if (live.get(record.id) === ward) detach(record.id);
@@ -493,7 +496,7 @@ async function ensureListener(id: string, wardPort: number): Promise<number> {
   const taken = new Set(Object.values(record.ports));
   const candidates = [...(known === undefined ? [] : [known]), ...slotPorts(record.slot).filter((p) => !taken.has(p))];
   for (const hostPort of candidates) {
-    const server = createServer({ pauseOnConnect: true }, (socket) => forward(id, wardPort, socket));
+    const server = createServer({ pauseOnConnect: true, allowHalfOpen: true }, (socket) => forward(id, wardPort, socket));
     const ok = await new Promise<boolean>((resolve) => {
       server.once("error", () => resolve(false));
       server.listen(hostPort, "127.0.0.1", () => resolve(true));
@@ -536,14 +539,7 @@ function forward(id: string, wardPort: number, client: Socket): void {
   ward.pending.set(req, (reply, upstream) => {
     clearTimeout(timer);
     if (reply.t !== "connected" || upstream === undefined) return void client.destroy();
-    client.pipe(upstream).pipe(client);
-    const close = () => {
-      client.destroy();
-      upstream.destroy();
-    };
-    client.on("error", close).on("close", close);
-    upstream.on("error", close).on("close", close);
-    client.resume();
+    splice(client, upstream);
   });
   const message: BrokerRequest = { t: "connect", req, port: wardPort, hosts: ward.listening.get(wardPort) ?? ["127.0.0.1", "::1"] };
   ward.broker.send(message);
