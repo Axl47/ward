@@ -19,6 +19,7 @@ if [ "$1" = --session ]; then
   up=
   if [ -n "$registry" ] && busctl --user set-property org.a11y.Bus /org/a11y/bus org.a11y.Status IsEnabled b true; then
     "$registry" &
+    echo $! > "$dir/registry.pid"
     # Apps that start before the registry is on the bus never register with it.
     for _ in $(seq 50); do
       bus=$(busctl --user call org.a11y.Bus /org/a11y/bus org.a11y.Bus GetAddress 2>/dev/null | sed -n 's/^s "\(.*\)"$/\1/p') || true
@@ -39,8 +40,8 @@ fi
 dir=$WARD_RUNTIME/$1/desktop
 umask 077
 mkdir -p "$dir/services"
-# `ward desktop` treats the desktop as up while this process lives: dbus-run-session
-# keeps this pid and exits with the compositor.
+# `ward desktop` treats the desktop as up while this process lives; it waits for
+# the compositor below.
 echo $$ > "$dir/pid"
 # Ward's own commands look for wardd under XDG_RUNTIME_DIR, which is $dir on this desktop.
 ln -s "$WARD_RUNTIME" "$dir/ward"
@@ -72,6 +73,19 @@ show_cheatsheet = false
 xwayland = false
 CONF
 
-unset WAYLAND_DISPLAY WAYLAND_SOCKET DISPLAY UMBRIEL_SOCKET DBUS_SESSION_BUS_ADDRESS
-export XDG_RUNTIME_DIR="$dir" WLR_BACKENDS=headless WLR_LIBINPUT_NO_DEVICES=1
-exec dbus-run-session --config-file="$dir/bus.conf" -- umbriel -c "$dir/umbriel.toml" -s "'$WARD_LIBEXEC/ward-desktop' --session"
+unset WAYLAND_DISPLAY WAYLAND_SOCKET DISPLAY UMBRIEL_SOCKET
+export XDG_RUNTIME_DIR="$dir" DBUS_SESSION_BUS_ADDRESS="unix:path=$dir/bus" WLR_BACKENDS=headless WLR_LIBINPUT_NO_DEVICES=1
+dbus-daemon --config-file="$dir/bus.conf" --nofork &
+bus=$!
+for _ in $(seq 250); do
+  [ -S "$dir/bus" ] && break
+  sleep 0.02
+done
+[ -S "$dir/bus" ] || { echo "ward: the desktop's session bus did not start" >&2; exit 1; }
+rc=0
+umbriel -c "$dir/umbriel.toml" -s "'$WARD_LIBEXEC/ward-desktop' --session" || rc=$?
+# The bus goes with the compositor, and the accessibility bus with the bus; the
+# registry is only on the latter, so it is stopped by pid.
+# shellcheck disable=SC2046 # no registry.pid, no second pid
+kill "$bus" $(cat "$dir/registry.pid" 2>/dev/null) 2>/dev/null || true
+exit $rc

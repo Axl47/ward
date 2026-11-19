@@ -6,7 +6,7 @@ Gives every T3 Code worktree on gaia-arch its own network namespace, Podman and 
 
 ## Setup
 
-Needs Linux with unprivileged user namespaces, Node 24+, `podman`, `passt`, `crun`, and subuid/subgid ranges for your user (`/etc/subuid`, `/etc/subgid`). Desktops also need `umbriel`, `dbus` (for `dbus-run-session`) and, for apps' text, `at-spi2-core`.
+Needs Linux with unprivileged user namespaces, Node 24+, `podman`, `passt`, `crun`, and subuid/subgid ranges for your user (`/etc/subuid`, `/etc/subgid`). Desktops also need `umbriel`, `dbus-daemon` and, for apps' text, `at-spi2-core`.
 
 ```sh
 pnpm install
