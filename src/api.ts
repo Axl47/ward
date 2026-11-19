@@ -40,6 +40,21 @@ export interface Routes {
 
 export type Route = keyof Routes;
 
+/** wardd → broker (src/broker.js), over Node IPC. */
+export type BrokerRequest = {
+  readonly t: "connect";
+  readonly req: number;
+  /** Addresses to try in order, e.g. ["127.0.0.1", "::1"]. */
+  readonly hosts: readonly string[];
+  readonly port: number;
+};
+
+/** broker → wardd; "connected" comes with the connected socket. */
+export type BrokerReply =
+  | { readonly t: "ready" }
+  | { readonly t: "connected"; readonly req: number }
+  | { readonly t: "failed"; readonly req: number; readonly message: string };
+
 export class WardError extends Error {}
 
 /** Call wardd. Rejects with WardError carrying the daemon's message on failure. */

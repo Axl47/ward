@@ -6,7 +6,8 @@ import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import { parseArgs } from "node:util";
 import { call, WardError, type WardInfo } from "./api.ts";
-import { CONTROL_SOCKET, enabledMarker, locate, WARD_HOME, wardRuntimeDir } from "./paths.ts";
+import { parseProjectHostPorts, wardHostPorts } from "./hostports.ts";
+import { CONTROL_SOCKET, enabledMarker, locate, parsePorts, projectHostPorts, WARD_HOME, wardRuntimeDir } from "./paths.ts";
 import { T3_TOKEN_FILE } from "./t3state.ts";
 
 const USAGE = `usage: ward <command>
@@ -19,7 +20,8 @@ const USAGE = `usage: ward <command>
   ports [--json]                    this ward's port mappings (ward port → host port)
   port PORT                         host port for a ward port, mapping it if needed
   env                               this ward's environment
-  enable [REPO] / disable [REPO]    turn wards on or off for a project
+  enable [REPO] [--host-ports LIST] turn wards on for a project; LIST replaces the host ports its wards reach
+  disable [REPO]                    turn wards off for a project
   gc                                run the reconciler now
   images ARGS...                    podman on the shared image store, e.g. images pull postgres:17
   install                           install the systemd units and put ward on PATH`;
@@ -32,6 +34,7 @@ const { positionals, values } = parseArgs({
     json: { type: "boolean" },
     quiet: { type: "boolean" },
     now: { type: "boolean" },
+    "host-ports": { type: "string" },
   },
 });
 const [command, ...args] = positionals;
@@ -54,6 +57,8 @@ const currentId = () => target().id;
 /** Start wardd if its socket is missing or stale (left behind by a crash). */
 async function ensureDaemon(): Promise<void> {
   if (existsSync(CONTROL_SOCKET) && (await reachable())) return;
+  // A second instance (WARD_UNIT set) must never start the installed wardd.service.
+  if (process.env.WARD_UNIT !== undefined) throw new WardError(`wardd is not running at ${CONTROL_SOCKET}; start this instance's daemon (see AGENTS.md)`);
   spawnSync("systemctl", ["--user", "reset-failed", "wardd.service"], { stdio: "ignore" });
   // start, not restart: a concurrent caller may already have started it and be mid-request.
   spawnSync("systemctl", ["--user", "start", "wardd.service"], { stdio: "inherit" });
@@ -103,6 +108,22 @@ function install(): void {
   execFileSync("systemctl", ["--user", "enable", "--now", "wardd.service"]);
   execFileSync("systemctl", ["--user", "restart", "wardd.service"]);
   console.log(`installed units in ${unitDir} and ward, ward-prefix, ward-bash-env in ${binDir}`);
+}
+
+/** Name the project's running wards whose pasta still forwards another host port list, and how to apply the new one. */
+async function reportStaleWards(repo: string, forwarded: string): Promise<void> {
+  if (!existsSync(CONTROL_SOCKET) || !(await reachable())) return;
+  const stale = (await call("GET /ls", {})).filter((w) => {
+    if (w.repo !== repo || !w.running) return false;
+    try {
+      return parsePorts(readFileSync(join(wardRuntimeDir(w.id), "host-ports"), "utf8")).sort().join() !== forwarded.split(",").sort().join();
+    } catch {
+      return true;
+    }
+  });
+  if (stale.length === 0) return;
+  console.log(`running wards keep their old host ports until they restart; to apply now (stops their processes and containers):`);
+  for (const w of stale) console.log(`  ward stop ${w.id}`);
 }
 
 function repoArg(): string {
@@ -171,11 +192,18 @@ async function main(): Promise<void> {
     case "disable": {
       const repo = repoArg();
       const marker = enabledMarker(repo);
-      if (command === "enable") {
-        mkdirSync(join(marker, ".."), { recursive: true });
-        writeFileSync(marker, "");
-      } else rmSync(marker, { force: true });
-      console.log(`wards ${command}d for ${repo}`);
+      if (command === "disable") {
+        rmSync(marker, { force: true });
+        return console.log(`wards disabled for ${repo}`);
+      }
+      const given = values["host-ports"];
+      if (given !== undefined && typeof given !== "string") throw new WardError("usage: ward enable [REPO] --host-ports PORT[,PORT...]");
+      const ports = given === undefined ? projectHostPorts(repo) : parseProjectHostPorts(given);
+      mkdirSync(join(marker, ".."), { recursive: true });
+      writeFileSync(marker, ports.join(","));
+      const forwarded = wardHostPorts(ports).join(",");
+      console.log(`wards enabled for ${repo}; they reach host ports ${forwarded} (and DNS)`);
+      if (given !== undefined) await reportStaleWards(repo, forwarded);
       return;
     }
     case "gc": {
@@ -185,7 +213,9 @@ async function main(): Promise<void> {
       return;
     }
     case "images": {
-      const result = spawnSync(join(WARD_HOME, "libexec/ward-images"), args, { stdio: "inherit" });
+      // Podman's own flags (-q, --quiet, ...) pass through untouched, so not parseArgs' view.
+      const raw = process.argv.slice(2);
+      const result = spawnSync(join(WARD_HOME, "libexec/ward-images"), raw.slice(raw.indexOf("images") + 1), { stdio: "inherit" });
       process.exitCode = result.status ?? 1;
       return;
     }

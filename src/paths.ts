@@ -1,7 +1,7 @@
 // Paths and worktree → ward resolution. libexec/ward-lib.sh mirrors these rules
 // for the shell hot path; keep the two in sync.
 import { createHash } from "node:crypto";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { homedir, userInfo } from "node:os";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -19,11 +19,12 @@ export const WORKTREES_DIR = join(T3_HOME, "worktrees");
 export const CONTROL_SOCKET = join(RUNTIME_DIR, "wardd.sock");
 export const REGISTRY_FILE = join(STATE_DIR, "registry.json");
 
-/** Host loopback ports forwarded into every ward (T3, adb, and always DNS); never mapped back out. */
-export const HOST_PORTS: ReadonlySet<number> = new Set([
-  53,
-  ...(env.WARD_HOST_PORTS ?? "3773,5037").split(",").map(Number).filter(Number.isInteger),
-]);
+/** Plain decimal TCP ports in a comma-separated list; anything else (hex, exponents, signs) is dropped. */
+export const parsePorts = (text: string) =>
+  text.split(",").map((p) => p.trim()).filter((p) => /^\d{1,5}$/.test(p)).map(Number).filter((p) => p > 0 && p < 65536);
+
+/** Host loopback ports forwarded into every ward (T3, adb); DNS (53) always is too. */
+export const HOST_PORTS: readonly number[] = parsePorts(env.WARD_HOST_PORTS ?? "3773,5037");
 
 export interface WardLocation {
   readonly id: string;
@@ -45,12 +46,23 @@ export function locate(dir: string): WardLocation | undefined {
   return { id: `${sanitize(repo)}.${sanitize(name)}`, repo, root: join(WORKTREES_DIR, repo, name) };
 }
 
+/** A project's opt-in marker. Its content lists more host ports for that project's wards, e.g. "39003". */
 export const enabledMarker = (repo: string) => join(CONFIG_DIR, "enabled", basename(repo));
 export const isEnabled = (repo: string) => existsSync(enabledMarker(repo));
+
+/** Host ports a project's wards reach on top of HOST_PORTS, from its marker. */
+export function projectHostPorts(repo: string): number[] {
+  try {
+    return parsePorts(readFileSync(enabledMarker(repo), "utf8"));
+  } catch {
+    return [];
+  }
+}
 
 export const wardRuntimeDir = (id: string) => join(RUNTIME_DIR, id);
 export const wardStateDir = (id: string) => join(STATE_DIR, "wards", id);
 /** Where a removed ward's data waits before it is purged, keyed by worktree so colliding ids can't clash. */
 export const wardTrashDir = (id: string, worktree: string) =>
   join(STATE_DIR, "trash", `${id}.${createHash("sha256").update(worktree).digest("hex").slice(0, 8)}`);
-export const unitName = (id: string) => `ward@${id}.service`;
+/** Unit template wards run under; WARD_UNIT names another, to run a second Ward beside the installed one. */
+export const unitName = (id: string) => `${env.WARD_UNIT ?? "ward"}@${id}.service`;
