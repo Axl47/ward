@@ -12,7 +12,7 @@ bin/ward install        # systemd user units, ward on PATH, read-only T3 token
 ward enable <repo>      # opt a project in (folder name under ~/.t3/worktrees)
 ```
 
-For T3 to run agent commands and terminals in wards, start the Annex server with `T3CODE_WARD_COMMAND=$HOME/.local/bin/ward`.
+For T3 to run agent commands and terminals in wards, start the Annex server with `T3CODE_WARD_COMMAND=$HOME/.local/bin/ward`. Ward serves the T3 at `~/.t3`; set `WARD_T3_HOME` for another.
 
 ## Use
 
@@ -26,7 +26,9 @@ ward stop | ward rm     # stop (keeps data) or remove a ward
 ward images pull IMAGE  # pull into the image store every ward shares
 ```
 
-Wards start on the first command in a worktree, stop when every thread on it is settled, archived or deleted, and are removed with their data when the worktree is deleted.
+Wards start on the first command in a worktree. They stop once every thread on it has settled, or 30 minutes after the last command when it has no active thread. When the worktree is deleted, the ward's data goes to a trash for 7 days.
+
+Inside a ward, `sudo` doesn't work, and host services are reachable only on the ports in `WARD_HOST_PORTS` (default `3773,5037`, plus DNS).
 
 ## Develop
 
