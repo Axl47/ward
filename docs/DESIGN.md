@@ -61,6 +61,42 @@ An MCP tool isn't needed in v1. T3's port list shows each ward port at its host 
 
 T3's device tools stay the source of truth for who holds which AVD; Ward doesn't add a second lease. (The research found per-thread sessions for local Android but no cross-thread lock; the agent tests will check this, and if it's missing the fix goes into Annex's `DeviceService`, not into Ward.) Ward adds the network plumbing: the ward reaches the host adb server through pasta, and a small `adb` shim rewrites `adb reverse tcp:8081 tcp:8081` to target the ward's mapped host port, so the app on the emulator reaches the ward's Metro. The shim is first on the ward's `PATH`, and the ward's `ANDROID_HOME` is an overlay of the real SDK whose `platform-tools/adb` is the shim, since React Native and Expo call adb by that path. Emulators keep running on the host with KVM; nothing about them needs to change when SVM comes on.
 
+## Desktops
+
+Goal, in the words of the request (2026-11-19): "give each ward its own headless Umbriel desktop, so parallel agents can drive and verify GUI apps with Puck without fighting over my one live session and cursor. […] Apps the agent launches open there, and Puck's tools […] act on that desktop instead of mine. My live session stays the default when there's no ward, or when the agent explicitly asks for it. […] A per-ward instance must not steal or disturb my live session's bus names, notifications, portals or audio. […] start the desktop lazily on first use, stop it with the ward, and make it reachable from agent commands inside the ward."
+
+A ward's desktop is three things in one folder, `$XDG_RUNTIME_DIR/ward/<id>/desktop`, which is the desktop's own `XDG_RUNTIME_DIR`:
+
+```
+ward "indexio/t3-d7059d66…"                         host
+┌───────────────────────────────────────────┐      ┌──────────────────────────────┐
+│ dbus-daemon (the desktop's session bus)   │      │ Puck's MCP server            │
+│  └ at-spi-bus-launcher, at-spi2-registryd │◀─────┤  asks `ward desktop` for the │
+│ umbriel, headless: HEADLESS-1 1280×720    │ unix │  env, then runs umbriel,     │
+│  └ apps: `ward desktop -- CMD`,           │ sock │  grim and AT-SPI with it     │
+│    Puck's launch_app                      │      │ live Umbriel + Noctalia:     │
+└───────────────────────────────────────────┘      │  never contacted             │
+                                                   └──────────────────────────────┘
+```
+
+- **A session bus of its own.** Everything a desktop shares with the live session goes through the session D-Bus and `XDG_RUNTIME_DIR`: bus names, notifications, portals, the tray, single-instance apps (a GTK app started on the live bus hands its window to the instance already running on your screen), the accessibility bus, PipeWire's socket, and Umbriel itself, which publishes `WAYLAND_DISPLAY` and `UMBRIEL_SOCKET` into the systemd user manager over that bus when it starts. So the desktop gets a `dbus-daemon` whose config lists one service folder holding one file, the accessibility bus, started with accessibility on. Nothing else can be activated on it: no portal, keyring, notification daemon or dconf writer. With no systemd and no PipeWire socket in its runtime folder, Umbriel's publish step finds no manager to talk to and apps have no audio.
+- **Umbriel, headless.** `WLR_BACKENDS=headless umbriel -c <its own config>`: no autostart, so no Noctalia shell, bar or notifications, and none of your keybinds. It makes one 1280×720 output, `HEADLESS-1`; `ward desktop -- umbriel output-create NAME 1920x1080` adds more.
+- **Inside the ward.** `wardd` starts it through `ward exec`, so it runs in the ward's namespaces and cgroup. Apps the compositor starts (Puck's `launch_app`) are therefore in the ward too and reach its `localhost` ports, and stopping the ward stops the desktop with everything on it. Its sockets are path sockets under the host's `/run/user`, so tools on the host connect to them like any others.
+- **Accessibility.** `at-spi-bus-launcher` runs the accessibility bus with `dbus-broker` when it can, and `dbus-broker` starts services through systemd, which the desktop doesn't have. So the registry (`at-spi2-registryd`) is started with the desktop rather than on demand; without it apps never register and Puck's `inspect` falls back to OCR.
+- **Lazy.** Nothing runs until the first `ward desktop`, which asks `wardd` to start the ward if needed and then the desktop, and waits until the compositor is up and the registry is on the accessibility bus: 0.4 s in all, and about 70 MB of memory (PSS) while it runs, nearly all of it Umbriel. `bin/ward` answers later calls itself from the desktop's `env` and `pid` files, without Node, in 8 ms. Its output goes to `desktop.log` in the ward's runtime folder.
+
+### How a command gets on it
+
+One rule, the usual Wayland one: a process is on the desktop its environment names (`XDG_RUNTIME_DIR`, `WAYLAND_DISPLAY`, `UMBRIEL_SOCKET`, `DBUS_SESSION_BUS_ADDRESS`). `ward desktop` prints the ward desktop's, and `ward desktop -- CMD` runs `CMD` in the ward with it. Puck follows the same rule, so `ward desktop -- puck state` reads the ward's desktop and a bare `puck state` the live one. Puck's MCP server can't be prefixed per call (it is one process outside the ward for the whole thread), so it asks `ward desktop` itself when its folder is a warded worktree, and `desktop_state` with `desktop: "live"` moves that session to your screen.
+
+Decided against:
+
+- **Putting the desktop in every ward command's environment**, so a bare `cargo run` would open there. The ward's commands would then lose the live session bus, and `gh` keeps its token in the keyring on that bus (`gh auth status`: "keyring"), as does `git push` through it. A GUI app half in (ward's Wayland socket, live bus) is worse: its notifications, tray icon and single-instance hand-off land on your screen.
+- **Making un-prefixed GUI launches fail in a ward**, by pointing `WAYLAND_DISPLAY` nowhere. Miranda, the first warded project, watches the live session on purpose and finds it through the one socket in `XDG_RUNTIME_DIR` when `WAYLAND_DISPLAY` is unset. So a GUI program started in a ward without the prefix still opens on your screen, as before.
+- **A Noctalia shell on the desktop.** It claims bus names and talks to NetworkManager, logind and PipeWire, and an agent checking an app needs none of it. Puck's notification and shell-setting tools say so on a ward's desktop.
+
+Limits: under `ward desktop --`, `XDG_RUNTIME_DIR` is the desktop's folder, so that command has no keyring, `systemctl --user`, gpg-agent or host PipeWire; start the app with it, and build, commit and push without it. (`$XDG_RUNTIME_DIR/ward` links back to Ward's own runtime folder, so `ward` still works there.) The folder's path plus a socket name must fit in 108 bytes, which holds for project folder names up to about 25 characters; longer ones get an error instead of a desktop. There is no Xwayland: it refuses `/tmp/.X11-unix`, whose owner (the host's root) is nobody inside the ward's user namespace, so X11-only apps don't run on a ward's desktop, and `DISPLAY` is empty there so they can't reach the live session's instead.
+
 ## Lifecycle and teardown
 
 | Event | Ward action |
@@ -102,5 +138,7 @@ System changes on gaia-arch, recorded in omarchy-config: install `podman`, `pass
 ## Verification
 
 Three Claude subagents in three real T3 worktrees of a small test app, in parallel: each starts a dev server on the same port, `docker compose up` Postgres on 5432, writes a row, and checks it reaches its own services. Pass means: no port errors, each sees only its own row, each ward's dev server answers on its own host port, `ward rm` leaves no processes, containers or ports behind, and the reconciler cleans up a worktree removed by hand.
+
+Desktops, verified in a second Ward instance (2026-11-19): two wards started their desktops in parallel from Puck's first MCP call; each ran its own instance of one GTK app (same application id) and of Evince; Puck's `screenshot`, `inspect` (accessibility text), `launch_app` and `move_window` acted on each ward's own desktop from outside the ward; and the live session's windows, focus, bar, notifications, bus names, accessibility apps and systemd environment were the same before and after.
 
 Verified since, with real T3 threads building a real project in parallel wards (2026-11-19): a settled thread's ward stopped 4 seconds after the settle; a merged thread's worktree removed by T3 sent its ward to the trash within seconds; Wayland screenshots, PipeWire recording, the accessibility bus and the GPU all work from inside a ward. Still unverified: emulators, until KVM.

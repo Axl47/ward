@@ -1,4 +1,5 @@
-// The `ward` CLI, except `ward exec` (bin/ward handles that in shell).
+// The `ward` CLI, except `ward exec` and what `ward desktop` does once the
+// desktop is up (bin/ward handles those in shell).
 import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { connect } from "node:net";
@@ -13,6 +14,8 @@ import { T3_TOKEN_FILE } from "./t3state.ts";
 const USAGE = `usage: ward <command>
 
   exec [--worktree DIR] -- CMD...   run CMD in the worktree's ward
+  desktop [--worktree DIR] [-- CMD...]
+                                    start the ward's private desktop; print its environment, or run CMD on it
   up [--worktree DIR]               start the worktree's ward
   stop [ID|--worktree DIR]          stop a ward, keeping its data
   rm [ID|--worktree DIR] [--now]    remove a ward; its data stays in the trash for 7 days (--now: delete it)
@@ -185,6 +188,11 @@ async function main(): Promise<void> {
       console.log((await call("POST /port", { id: currentId(), port })).host);
       return;
     }
+    case "desktop":
+      // From bin/ward, when the desktop isn't up; it prints the environment itself.
+      await ensureDaemon();
+      await call("POST /desktop", target());
+      return;
     case "env":
       process.stdout.write(readFileSync(join(wardRuntimeDir(currentId()), "env"), "utf8"));
       return;

@@ -1,0 +1,77 @@
+#!/bin/sh
+# A ward's private desktop: a session bus of its own and a headless Umbriel on
+# it, with $rt/desktop as their XDG_RUNTIME_DIR, so nothing on it reaches the
+# live session's compositor, bus names, notifications, portals or audio.
+# wardd runs `ward-desktop ID` through `ward exec`, inside the ward; it is up
+# once $rt/desktop/env exists (see docs/DESIGN.md, "Desktops").
+set -eu
+. "$(dirname -- "$(readlink -f -- "$0")")/ward-lib.sh"
+
+# ward-desktop --session: started by the compositor once it is up, with the
+# desktop's environment. Publishes that environment as the `env` file.
+if [ "$1" = --session ]; then
+  dir=$XDG_RUNTIME_DIR
+  # Accessibility on from the start (the launcher's --a11y=1 flag is broken in
+  # at-spi2-core 2.62), so apps expose their text from launch. The registry is
+  # started here, not on demand: the accessibility bus may be a dbus-broker,
+  # which starts services through systemd, and there is none on this desktop.
+  registry=$(sed -n 's/^Exec=\([^ ]*\).*/\1/p' /usr/share/dbus-1/accessibility-services/org.a11y.atspi.Registry.service 2>/dev/null || true)
+  up=
+  if [ -n "$registry" ] && busctl --user set-property org.a11y.Bus /org/a11y/bus org.a11y.Status IsEnabled b true; then
+    "$registry" &
+    # Apps that start before the registry is on the bus never register with it.
+    for _ in $(seq 50); do
+      bus=$(busctl --user call org.a11y.Bus /org/a11y/bus org.a11y.Bus GetAddress 2>/dev/null | sed -n 's/^s "\(.*\)"$/\1/p') || true
+      if [ -n "$bus" ] && busctl --address="$bus" status org.a11y.atspi.Registry >/dev/null 2>&1; then up=1; break; fi
+      sleep 0.1
+    done
+  fi
+  [ -n "$up" ] || echo "ward: warning: accessibility did not start; apps on this desktop expose no text" >&2
+  {
+    env | grep -E '^(XDG_RUNTIME_DIR|WAYLAND_DISPLAY|UMBRIEL_SOCKET|DBUS_SESSION_BUS_ADDRESS|XDG_CURRENT_DESKTOP|XDG_SESSION_DESKTOP|XDG_SESSION_TYPE)='
+    # No X server here (see below); empty, so an X11 app can't fall back to the live session's.
+    echo DISPLAY=
+  } > "$dir/env.tmp"
+  mv "$dir/env.tmp" "$dir/env"
+  exit 0
+fi
+
+dir=$WARD_RUNTIME/$1/desktop
+umask 077
+mkdir -p "$dir/services"
+# `ward desktop` treats the desktop as up while this process lives: dbus-run-session
+# keeps this pid and exits with the compositor.
+echo $$ > "$dir/pid"
+# Ward's own commands look for wardd under XDG_RUNTIME_DIR, which is $dir on this desktop.
+ln -s "$WARD_RUNTIME" "$dir/ward"
+
+# The only service the bus can start is the accessibility bus: no portals,
+# keyring or notifications.
+launcher=$(sed -n 's/^Exec=\([^ ]*\).*/\1/p' /usr/share/dbus-1/services/org.a11y.Bus.service 2>/dev/null || true)
+[ -z "$launcher" ] || printf '[D-BUS Service]\nName=org.a11y.Bus\nExec=%s\n' "$launcher" > "$dir/services/org.a11y.Bus.service"
+cat > "$dir/bus.conf" <<CONF
+<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN" "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig>
+  <type>session</type>
+  <listen>unix:path=$dir/bus</listen>
+  <servicedir>$dir/services</servicedir>
+  <policy context="default">
+    <allow send_destination="*" eavesdrop="true"/>
+    <allow eavesdrop="true"/>
+    <allow own="*"/>
+  </policy>
+</busconfig>
+CONF
+# Not your config: no autostart (the Noctalia shell), keybinds or window rules.
+# No Xwayland either: it refuses /tmp/.X11-unix, whose owner (the host's root)
+# is nobody in the ward's user namespace.
+cat > "$dir/umbriel.toml" <<CONF
+[general]
+autostart = []
+show_cheatsheet = false
+xwayland = false
+CONF
+
+unset WAYLAND_DISPLAY WAYLAND_SOCKET DISPLAY UMBRIEL_SOCKET DBUS_SESSION_BUS_ADDRESS
+export XDG_RUNTIME_DIR="$dir" WLR_BACKENDS=headless WLR_LIBINPUT_NO_DEVICES=1
+exec dbus-run-session --config-file="$dir/bus.conf" -- umbriel -c "$dir/umbriel.toml" -s "'$WARD_LIBEXEC/ward-desktop' --session"

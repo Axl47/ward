@@ -2,7 +2,7 @@
 // maps each port a ward listens on to a host port in the ward's slot, and runs
 // the reconciler that stops or removes wards when T3 is done with them.
 import { execFile, spawn, type ChildProcess } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, watch, writeFileSync, type FSWatcher } from "node:fs";
+import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, watch, writeFileSync, type FSWatcher } from "node:fs";
 import { createServer as createHttpServer, request as httpRequest, type ClientRequest, type IncomingMessage, type ServerResponse } from "node:http";
 import { type Server, type Socket } from "node:net";
 import { userInfo } from "node:os";
@@ -19,6 +19,7 @@ import {
   STATE_DIR,
   unitName,
   WARD_HOME,
+  wardDesktopDir,
   wardRuntimeDir,
   wardStateDir,
   wardTrashDir,
@@ -36,6 +37,9 @@ const RECONCILE_MS = 60_000;
 const READY_TIMEOUT_MS = 60_000;
 const CONNECT_TIMEOUT_MS = 10_000;
 const TRASH_DAYS = 7;
+const DESKTOP_TIMEOUT_MS = 20_000;
+/** sockaddr_un's path limit, less its NUL. */
+const SOCKET_PATH_MAX = 107;
 
 /** A running ward's in-memory plumbing. */
 interface LiveWard {
@@ -293,6 +297,59 @@ async function stopContainers(id: string): Promise<void> {
   await run("podman", ["--url", `unix://${join(wardRuntimeDir(id), "podman/podman.sock")}`, "stop", "--all", "--time", "10"], { timeout: 20_000 }).catch(
     (e: unknown) => log(`ward ${id}: stopping its containers: ${e instanceof Error ? e.message.split("\n")[0] : String(e)}`),
   );
+}
+
+/** Whether the ward's desktop is up; bin/ward makes the same check. */
+function desktopReady(id: string): boolean {
+  const dir = wardDesktopDir(id);
+  try {
+    return existsSync(join(dir, "env")) && existsSync(`/proc/${Number(readFileSync(join(dir, "pid"), "utf8"))}`);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Start the ward's private desktop (libexec/ward-desktop) unless it is up,
+ * starting the ward first if needed. It runs through `ward exec`, so it lives in
+ * the ward's namespaces and cgroup and stops with the ward; nothing here stops it.
+ */
+async function desktop(id: string, worktree?: string): Promise<{ started: boolean }> {
+  const root = worktree ?? requireRecord(id).worktree;
+  const result = await up(root);
+  if (!result.enabled) throw new Error(result.reason);
+  const ward = result.ward.id;
+  return serialized(ward, async () => {
+    if (desktopReady(ward)) return { started: false };
+    const dir = wardDesktopDir(ward);
+    // The longest socket path in it; a longer one fails to bind, with an error that doesn't say why.
+    if (Buffer.byteLength(join(dir, "umbriel-wayland-0.sock")) > SOCKET_PATH_MAX)
+      throw new Error(`ward ${ward} can't have a desktop: ${dir} is too long a path for its sockets (shorten the project's folder name)`);
+    rmSync(dir, { recursive: true, force: true });
+    // Like init.log: journald drops what is written from inside the ward's user namespace.
+    const logFile = join(wardRuntimeDir(ward), "desktop.log");
+    const out = openSync(logFile, "w");
+    const child = spawn(join(WARD_HOME, "bin/ward"), ["exec", "--worktree", root, "--", join(WARD_HOME, "libexec/ward-desktop"), ward], {
+      detached: true,
+      stdio: ["ignore", out, out],
+    });
+    closeSync(out);
+    child.unref();
+    let exited = false;
+    child.once("exit", () => (exited = true)).once("error", () => (exited = true));
+    const deadline = Date.now() + DESKTOP_TIMEOUT_MS;
+    while (!desktopReady(ward)) {
+      if (exited || Date.now() > deadline) {
+        // Its own process group (detached), so this takes the bus and compositor with it.
+        if (!exited && child.pid !== undefined) process.kill(-child.pid, "SIGKILL");
+        const tail = readFileSync(logFile, "utf8").split("\n").filter(Boolean).slice(-15).join("\n");
+        throw new Error(`ward ${ward}'s desktop ${exited ? "failed to start" : `did not start within ${DESKTOP_TIMEOUT_MS / 1000}s`}${tail ? `:\n${tail}` : ""}`);
+      }
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    log(`started ward ${ward}'s desktop`);
+    return { started: true };
+  });
 }
 
 /** A free slot, else the slot of the stopped ward unused the longest. */
@@ -809,6 +866,7 @@ const handlers: Handlers = {
     requireRecord(id);
     return { host: await ensureListener(id, port) };
   },
+  "POST /desktop": ({ id, worktree }) => desktop(id, worktree).finally(watchWorktreeParents),
   "POST /gc": async () => ({ actions: await runReconcile() }),
   "GET /ls": async () => {
     await Promise.all([...live.keys()].map(scan)); // what listens now, not at the last scan

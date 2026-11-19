@@ -34,6 +34,8 @@ export interface Routes {
   /** Moves the ward's data to the trash, or deletes it now with `now`. */
   "POST /rm": { body: { id: string; worktree?: string; now?: boolean }; result: { removed: boolean } };
   "POST /port": { body: { id: string; port: number }; result: { host: number } };
+  /** Starts the ward if needed, then its desktop; answers once the desktop is up. */
+  "POST /desktop": { body: { id: string; worktree?: string }; result: { started: boolean } };
   "POST /gc": { body: Record<string, never>; result: { actions: string[] } };
   "GET /ls": { body: Record<string, never>; result: WardInfo[] };
 }

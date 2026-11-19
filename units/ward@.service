@@ -7,7 +7,7 @@ StopWhenUnneeded=no
 [Service]
 Type=simple
 ExecStart=@WARD_HOME@/libexec/ward-init %i
-ExecStopPost=/bin/sh -c 'rm -rf "$XDG_RUNTIME_DIR/ward/%i/ready" "$XDG_RUNTIME_DIR/ward/%i/pid"'
+ExecStopPost=/bin/sh -c 'rm -rf "$XDG_RUNTIME_DIR/ward/%i/ready" "$XDG_RUNTIME_DIR/ward/%i/pid" "$XDG_RUNTIME_DIR/ward/%i/desktop"'
 KillMode=control-group
 TimeoutStopSec=15
 Restart=no
