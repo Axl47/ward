@@ -1,0 +1,21 @@
+#!/bin/sh
+# adb inside a ward. The adb server and emulators live on the host, so for
+# `adb reverse DEVICE tcp:PORT` the local side must be the ward's host-mapped
+# port for PORT; everything else goes to the real adb unchanged.
+real=${WARD_REAL_ADB:-${ANDROID_HOME:-$HOME/Android/Sdk}/platform-tools/adb}
+seen_reverse=0 specs=0
+for a in "$@"; do
+  [ "$a" = reverse ] && seen_reverse=1
+  [ $seen_reverse = 1 ] && case "$a" in tcp:*|localabstract:*|localreserved:*|localfilesystem:*|jdwp:*) specs=$((specs + 1)) ;; esac
+done
+if [ $seen_reverse = 1 ] && [ $specs = 2 ]; then
+  n=$#; i=0
+  for a in "$@"; do
+    i=$((i + 1)); shift
+    if [ $i = $n ]; then
+      case "$a" in tcp:*) a=tcp:$(ward port "${a#tcp:}") || exit 1 ;; esac
+    fi
+    set -- "$@" "$a"
+  done
+fi
+exec "$real" "$@"

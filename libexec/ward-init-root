@@ -1,0 +1,79 @@
+#!/bin/bash
+# Root inside the ward's user namespace, still in the host network namespace.
+# Creates the ward's network namespace, connects it to the internet with pasta,
+# starts the ward's Podman API service, then waits; if any part exits, the unit
+# stops and systemd kills the rest.
+set -euo pipefail
+[ -n "${WARD_TRACE:-}" ] && set -x
+. "$(dirname -- "$(readlink -f -- "$0")")/ward-lib.sh"
+id=$1
+rt=$WARD_RUNTIME/$id
+st=$WARD_STATE/wards/$id
+# Host loopback ports reachable from inside the ward (adb server by default).
+host_ports=${WARD_HOST_PORTS:-5037}
+
+# 1. Network namespace, held open by a sleep whose pid is the ward's join point.
+unshare --net -- sh -c 'ip link set lo up && exec sleep infinity' &
+ns=$!
+for _ in $(seq 100); do
+  [ "$(readlink /proc/$ns/ns/net)" != "$(readlink /proc/self/ns/net)" ] && break
+  sleep 0.02
+done
+
+# 2. Internet via pasta. No inbound forwarding: wardd maps ports itself, so the
+# ward's ports never appear on the host under their own numbers.
+pasta_t=()
+for p in ${host_ports//,/ }; do pasta_t+=(-T "$p"); done
+pasta --config-net --quiet --foreground -t none -u none -U none "${pasta_t[@]}" \
+  --netns "/proc/$ns/ns/net" --runas 0:0 &
+
+# 3. Podman, as root of the ward, in its own mount namespace with private /run
+# and storage. Containers' published ports land in the ward's loopback.
+chown 0:0 "$rt/podman" "$st/storage" "$st/net"
+cat > "$st/containers.conf" <<CONF
+[containers]
+cgroups = "disabled"
+[engine]
+cgroup_manager = "cgroupfs"
+events_logger = "file"
+runtime = "crun"
+[network]
+network_config_dir = "$st/net"
+CONF
+cat > "$st/storage.conf" <<CONF
+[storage]
+driver = "overlay"
+graphroot = "/var/lib/containers/storage"
+runroot = "/run/containers/storage"
+[storage.options]
+additionalimagestores = ["$WARD_STATE/images"]
+CONF
+nsenter -n -t "$ns" -- unshare -m --propagation private -- sh -c '
+  set -e
+  # Private /run for podman, keeping the host resolver and the socket folder.
+  mount --bind /run/systemd/resolve "$1/resolve"
+  mount --bind "$2/podman" "$1/sock"
+  mount -t tmpfs tmpfs /run
+  mkdir -p /run/lock /run/systemd/resolve "$2/podman"
+  mount --move "$1/resolve" /run/systemd/resolve
+  mount --move "$1/sock" "$2/podman"
+  mount --bind "$1/storage" /var/lib/containers
+  export CONTAINERS_CONF="$1/containers.conf" CONTAINERS_STORAGE_CONF="$1/storage.conf" HOME="$1/home"
+  unset XDG_RUNTIME_DIR
+  umask 000
+  exec podman system service --time=0 "unix://$2/podman/podman.sock"
+' sh "$st" "$rt" &
+
+for _ in $(seq 250); do
+  [ -S "$rt/podman/podman.sock" ] && break
+  sleep 0.02
+done
+[ -S "$rt/podman/podman.sock" ] || { echo "ward: podman service did not start" >&2; exit 1; }
+chmod 755 "$rt/podman"
+chmod 666 "$rt/podman/podman.sock"
+
+echo "$ns" > "$rt/pid"
+touch "$rt/ready"
+wait -n
+echo "ward: a ward process exited; stopping ward $id" >&2
+exit 1

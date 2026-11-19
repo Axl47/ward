@@ -1,0 +1,14 @@
+# One ward: its namespaces, pasta, Podman and every process `ward exec` starts.
+# Installed by `ward install`, which fills in @WARD_HOME@.
+[Unit]
+Description=Ward %i
+StopWhenUnneeded=no
+
+[Service]
+Type=simple
+ExecStart=@WARD_HOME@/libexec/ward-init %i
+ExecStopPost=/bin/sh -c 'rm -rf "$XDG_RUNTIME_DIR/ward/%i/ready" "$XDG_RUNTIME_DIR/ward/%i/pid"'
+KillMode=control-group
+TimeoutStopSec=15
+Restart=no
+CPUWeight=100

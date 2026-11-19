@@ -1,0 +1,15 @@
+{
+  "name": "ward",
+  "private": true,
+  "type": "module",
+  "description": "Per-worktree isolated environments for T3 Code agent threads",
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "typecheck": "tsc",
+    "test": "node --test test/*.test.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  }
+}

@@ -1,0 +1,13 @@
+# Ward daemon: port mapping, ward lifecycle and the reconciler.
+# Installed by `ward install`, which fills in @WARD_HOME@ and @NODE@.
+[Unit]
+Description=Ward daemon
+
+[Service]
+Type=simple
+ExecStart=@NODE@ --disable-warning=ExperimentalWarning @WARD_HOME@/src/daemon.ts
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,13 @@
+#!/bin/sh
+# ExecStart of ward@<id>.service. Runs as you in the host namespaces, records the
+# unit's cgroup, then enters a new user namespace as root for ward-init-root.
+set -eu
+. "$(dirname -- "$(readlink -f -- "$0")")/ward-lib.sh"
+id=$1
+rt=$WARD_RUNTIME/$id
+st=$WARD_STATE/wards/$id
+mkdir -p "$rt/podman" "$st/storage" "$st/home" "$st/tmp" "$st/net" "$st/resolve" "$st/sock" "$WARD_STATE/images"
+rm -f "$rt/ready" "$rt/pid"
+echo "/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup)" > "$rt/cgroup"
+# shellcheck disable=SC2046 # word splitting of the map flags is intended
+exec unshare $(ward_map_args) --setuid 0 --setgid 0 -- "$WARD_LIBEXEC/ward-init-root" "$id"

@@ -1,0 +1,20 @@
+#!/bin/sh
+# ward-images PODMAN-ARGS...: run podman against the shared read-only image store
+# that every ward reads (additionalimagestores), e.g. `ward images pull postgres:17`.
+set -eu
+. "$(dirname -- "$(readlink -f -- "$0")")/ward-lib.sh"
+store=$WARD_STATE/images
+mkdir -p "$store" "$WARD_STATE/images-home"
+# shellcheck disable=SC2046
+exec unshare $(ward_map_args) --setuid 0 --setgid 0 --mount --propagation private -- sh -c '
+  set -e
+  chown 0:0 "$1" "$2"
+  mount --bind /run/systemd/resolve "$2"
+  mount -t tmpfs tmpfs /run
+  mkdir -p /run/lock /run/systemd/resolve
+  mount --move "$2" /run/systemd/resolve
+  export HOME="$2" CONTAINERS_CONF=/dev/null
+  unset XDG_RUNTIME_DIR
+  store=$1; shift 2
+  exec podman --root "$store" --runroot /run/ward-images --storage-driver overlay --cgroup-manager cgroupfs --events-backend file "$@"
+' sh "$store" "$WARD_STATE/images-home" "$@"

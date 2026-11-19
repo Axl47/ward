@@ -1,0 +1,47 @@
+#!/bin/sh
+# ward: per-worktree isolated environments for T3 agent threads.
+# `ward exec` is the hot path (runs on every agent command), so it stays in shell;
+# every other command is handled by src/cli.ts.
+set -eu
+. "$(dirname -- "$(readlink -f -- "$0")")/../libexec/ward-lib.sh"
+
+ward_node() {
+  node_bin=${WARD_NODE:-$(command -v node || true)}
+  [ -n "$node_bin" ] || { echo "ward: node not found (set WARD_NODE)" >&2; exit 127; }
+  exec "$node_bin" --disable-warning=ExperimentalWarning "$WARD_HOME/src/cli.ts" "$@"
+}
+
+# ward exec [--worktree DIR] -- CMD...: run CMD inside DIR's ward, or directly
+# when DIR is not a T3 worktree of an enabled project.
+ward_exec() {
+  dir=
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --worktree) dir=$2; shift 2 ;;
+      --worktree=*) dir=${1#*=}; shift ;;
+      --) shift; break ;;
+      *) break ;;
+    esac
+  done
+  [ $# -gt 0 ] || { echo "usage: ward exec [--worktree DIR] -- CMD..." >&2; exit 2; }
+  [ -n "$dir" ] || dir=$(pwd -P)
+  dir=$(readlink -f -- "$dir" 2>/dev/null || printf '%s' "$dir")
+  if [ -n "${WARD_ID:-}" ] || ! ward_resolve "$dir" || ! ward_enabled "$WARD_REPO"; then
+    exec "$@"   # already inside a ward, or not a warded worktree
+  fi
+  rt=$WARD_RUNTIME/$WARD_ID
+  pid=$(cat "$rt/pid" 2>/dev/null || true)
+  if [ ! -e "$rt/ready" ] || [ -z "$pid" ] || [ ! -e "/proc/$pid" ]; then
+    "$0" up --worktree "$WARD_ROOT" --quiet >&2 || { echo "ward: could not start ward $WARD_ID" >&2; exit 1; }
+    pid=$(cat "$rt/pid")
+  fi
+  # Join the ward's cgroup so stopping the ward kills everything started here.
+  echo $$ > "$(cat "$rt/cgroup")/cgroup.procs" || { echo "ward: could not join the cgroup of ward $WARD_ID" >&2; exit 1; }
+  set -a; . "$rt/env"; set +a
+  exec nsenter -U -n -t "$pid" --setuid "$(id -u)" --setgid "$(id -g)" -- "$@"
+}
+
+case "${1:-}" in
+  exec) shift; ward_exec "$@" ;;
+  *) ward_node "$@" ;;
+esac

@@ -1,0 +1,9 @@
+#!/bin/sh
+# Value for CLAUDE_CODE_SHELL_PREFIX. Claude Code calls it with one argument, the
+# full command string, for Bash tool commands and also for the MCP servers, hooks
+# and LSP servers it starts. Only Bash tool commands (they source a shell
+# snapshot) go into the ward; the agent's own tooling stays on the host.
+case "${1:-}" in
+  *"/shell-snapshots/"*) exec "$(dirname -- "$(readlink -f -- "$0")")/ward" exec -- bash -c "$1" ;;
+  *) exec bash -c "$1" ;;
+esac
