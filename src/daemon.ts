@@ -37,9 +37,8 @@ const RECONCILE_MS = 60_000;
 const READY_TIMEOUT_MS = 60_000;
 const CONNECT_TIMEOUT_MS = 10_000;
 const TRASH_DAYS = 7;
-const DESKTOP_TIMEOUT_MS = 20_000;
-/** sockaddr_un's path limit, less its NUL. */
-const SOCKET_PATH_MAX = 107;
+// With READY_TIMEOUT_MS, inside the 70 s a client waits for an answer.
+const DESKTOP_TIMEOUT_MS = 8_000;
 
 /** A running ward's in-memory plumbing. */
 interface LiveWard {
@@ -314,22 +313,23 @@ function desktopReady(id: string): boolean {
  * starting the ward first if needed. It runs through `ward exec`, so it lives in
  * the ward's namespaces and cgroup and stops with the ward; nothing here stops it.
  */
-async function desktop(id: string, worktree?: string): Promise<{ started: boolean }> {
+async function desktop(id: string, worktree?: string): Promise<Record<string, never>> {
   const root = worktree ?? requireRecord(id).worktree;
   const result = await up(root);
   if (!result.enabled) throw new Error(result.reason);
-  const ward = result.ward.id;
+  const { id: ward, slot } = result.ward;
   return serialized(ward, async () => {
-    if (desktopReady(ward)) return { started: false };
-    const dir = wardDesktopDir(ward);
-    // The longest socket path in it; a longer one fails to bind, with an error that doesn't say why.
-    if (Buffer.byteLength(join(dir, "umbriel-wayland-0.sock")) > SOCKET_PATH_MAX)
-      throw new Error(`ward ${ward} can't have a desktop: ${dir} is too long a path for its sockets (shorten the project's folder name)`);
-    rmSync(dir, { recursive: true, force: true });
-    // Like init.log: journald drops what is written from inside the ward's user namespace.
-    const logFile = join(wardRuntimeDir(ward), "desktop.log");
-    const out = openSync(logFile, "w");
-    const child = spawn(join(WARD_HOME, "bin/ward"), ["exec", "--worktree", root, "--", join(WARD_HOME, "libexec/ward-desktop"), ward], {
+    if (desktopReady(ward)) return {};
+    // Stopped since `up` answered: `ward exec` below would start it again, and wait on this very lock.
+    if (!isReady(ward)) throw new Error(`ward ${ward} was stopped while its desktop was starting; try again`);
+    rmSync(wardDesktopDir(ward), { recursive: true, force: true });
+    // In a file, as init.log is: journald drops what is written from inside the ward's
+    // user namespace. With the ward's data and not its runtime folder, because
+    // every program the compositor starts writes here, for as long as the ward exists.
+    const logFile = join(wardStateDir(ward), "desktop.log");
+    const out = openSync(logFile, "a");
+    const child = spawn(join(WARD_HOME, "bin/ward"), ["exec", "--worktree", root, "--", join(WARD_HOME, "libexec/ward-desktop"), ward, String(slot)], {
+      cwd: root, // where programs the compositor starts (Puck's launch_app) start
       detached: true,
       stdio: ["ignore", out, out],
     });
@@ -348,7 +348,7 @@ async function desktop(id: string, worktree?: string): Promise<{ started: boolea
       await new Promise((r) => setTimeout(r, 50));
     }
     log(`started ward ${ward}'s desktop`);
-    return { started: true };
+    return {};
   });
 }
 

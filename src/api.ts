@@ -35,7 +35,7 @@ export interface Routes {
   "POST /rm": { body: { id: string; worktree?: string; now?: boolean }; result: { removed: boolean } };
   "POST /port": { body: { id: string; port: number }; result: { host: number } };
   /** Starts the ward if needed, then its desktop; answers once the desktop is up. */
-  "POST /desktop": { body: { id: string; worktree?: string }; result: { started: boolean } };
+  "POST /desktop": { body: { id: string; worktree?: string }; result: Record<string, never> };
   "POST /gc": { body: Record<string, never>; result: { actions: string[] } };
   "GET /ls": { body: Record<string, never>; result: WardInfo[] };
 }

@@ -21,7 +21,10 @@ ward_enter() {
   if [ ! -e "$rt/ready" ] || [ -z "$pid" ] || [ ! -e "/proc/$pid" ] || [ "$(cat "$rt/root" 2>/dev/null)" != "$WARD_ROOT" ]; then
     rc=0
     "$0" up --worktree "$WARD_ROOT" --quiet >&2 || rc=$?
-    [ $rc = 3 ] && exec "$@"   # wardd says this folder isn't warded
+    if [ $rc = 3 ]; then   # wardd says this folder isn't warded
+      [ -z "${desktop:-}" ] || exit 3
+      exec "$@"
+    fi
     [ $rc = 0 ] || { echo "ward: could not start ward $WARD_ID" >&2; exit 1; }
     pid=$(cat "$rt/pid")
   fi
@@ -29,7 +32,7 @@ ward_enter() {
   echo $$ > "$(cat "$rt/cgroup")/cgroup.procs" || { echo "ward: could not join the cgroup of ward $WARD_ID" >&2; exit 1; }
   # The reconciler won't stop a ward used after its threads went idle.
   : > "$rt/last-exec"
-  set -a; . "$rt/env"; [ -z "${desktop:-}" ] || . "$rt/desktop/env"; set +a
+  set -a; . "$rt/env"; [ -z "${desktop:-}" ] || ward_desktop_env; set +a
   exec nsenter -U -n -t "$pid" --setuid "$(id -u)" --setgid "$(id -g)" -- "$@"
 }
 
@@ -54,9 +57,17 @@ ward_exec() {
   ward_enter "$@"
 }
 
+# Put this shell on the desktop of ward $WARD_ID.
+ward_desktop_env() {
+  # shellcheck disable=SC2086
+  unset $WARD_DESKTOP_UNSET
+  . "$WARD_RUNTIME/$WARD_ID/desktop/env"
+}
+
 # ward desktop [--worktree DIR] [-- CMD...]: the ward's private desktop (a headless
 # Umbriel on a session bus of its own), started on first use. Prints the desktop's
-# environment, or runs CMD in the ward with it. The checks here keep wardd and
+# environment, or runs CMD in the ward with it; exits 3 where there is no ward,
+# never running CMD on the live session instead. The checks here keep wardd and
 # Node out of every call after the first (Puck asks before each tool call).
 ward_desktop() {
   dir=
@@ -73,20 +84,20 @@ ward_desktop() {
     [ -n "$dir" ] || dir=$(pwd -P)
     dir=$(readlink -f -- "$dir" 2>/dev/null || printf '%s' "$dir")
     if ! ward_resolve "$dir" || ! ward_enabled "$WARD_REPO"; then
-      [ $# -eq 0 ] || exec "$@"   # as `ward exec`: no ward, so the session this was run from
-      echo "ward: $dir is not a warded worktree" >&2
+      echo "ward: $dir is not a warded worktree, so it has no desktop" >&2
       exit 3
     fi
   fi
   d=$WARD_RUNTIME/$WARD_ID/desktop
   pid=$(cat "$d/pid" 2>/dev/null || true)
-  if [ ! -e "$d/env" ] || [ -z "$pid" ] || [ ! -e "/proc/$pid" ]; then
+  # The root check: as in ward_enter.
+  if [ ! -e "$d/env" ] || [ -z "$pid" ] || [ ! -e "/proc/$pid" ] || [ "$(cat "$WARD_RUNTIME/$WARD_ID/root" 2>/dev/null)" != "$WARD_ROOT" ]; then
     # wardd starts the ward if needed, then the desktop, and answers once it is up.
     if [ -n "$inside" ]; then (ward_node desktop); else (ward_node desktop --worktree "$WARD_ROOT"); fi >&2 || exit 1
   fi
   [ $# -gt 0 ] || exec cat "$d/env"
   if [ -n "$inside" ]; then
-    set -a; . "$d/env"; set +a
+    set -a; ward_desktop_env; set +a
     exec "$@"
   fi
   desktop=1

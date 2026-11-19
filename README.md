@@ -6,7 +6,7 @@ Gives every T3 Code worktree on gaia-arch its own network namespace, Podman and 
 
 ## Setup
 
-Needs Linux with unprivileged user namespaces, Node 24+, `podman`, `passt`, `crun`, and subuid/subgid ranges for your user (`/etc/subuid`, `/etc/subgid`). Desktops also need `umbriel`, `dbus-daemon` and, for apps' text, `at-spi2-core`.
+Needs Linux with unprivileged user namespaces, Node 24+, `podman`, `passt`, `crun`, and subuid/subgid ranges for your user (`/etc/subuid`, `/etc/subgid`). Desktops also need `umbriel`, `dbus-daemon`, `at-spi2-core` for apps' text, and `wtype` for typing into them.
 
 ```sh
 pnpm install
@@ -33,9 +33,9 @@ Wards start on the first command in a worktree. They stop once every thread on i
 
 ### Desktops
 
-`ward desktop -- CMD` runs `CMD` in the ward on a desktop of its own: a headless Umbriel with one 1280×720 output, its own session bus and no shell. It starts on the first `ward desktop` and stops with the ward. Nothing on it reaches your session's windows, cursor, notifications, portals or audio. [Puck](https://github.com/Axl47/puck)'s MCP tools act on it by default in a warded worktree; `ward desktop` alone prints its environment (`WAYLAND_DISPLAY` and the rest) for anything else that should.
+`ward desktop -- CMD` runs `CMD` in the ward on a desktop of its own: a headless Umbriel with one 1280×720 output, its own session bus and no shell. It starts on the first `ward desktop` and stops with the ward. It shares no compositor, session bus, notifications, portals or sound with your session, and Chromium-family browsers get a profile of their own there. [Puck](https://github.com/Axl47/puck) acts on it by default for an agent in a ward; `ward desktop` alone prints its environment (`WAYLAND_DISPLAY` and the rest) for anything else that should. Its log is `desktop.log` in the ward's data folder.
 
-Only the prefixed command is on that desktop: a GUI app started without it opens on your screen, as outside a ward. The prefixed command has no keyring, `systemctl --user` or audio, so build, commit and push without it. X11-only apps don't run there.
+Only the prefixed command is on that desktop: a GUI app started without it opens on your screen, as outside a ward, and where there is no ward the prefixed command fails rather than opening there. The prefixed command has no keyring, `systemctl --user` or sound, so build, commit and push without it. X11-only apps don't run there. Your home folder is shared, so an Electron app that allows one instance, or a Firefox-family browser, needs a data folder of its own (`--user-data-dir=DIR`, `--profile DIR`) or it finds the copy on your screen.
 
 ### Limits
 
@@ -45,7 +45,7 @@ Connections through a mapped port end with a reset when their ward stops or `war
 
 ## Upgrade
 
-`git pull`, then `systemctl --user restart wardd`. The restart resets connections open through mapped ports; wards and what runs in them carry on. Running wards keep the settings they started with (their TCP table size, host ports) until they next start.
+`git pull`, then `systemctl --user restart wardd`, and `bin/ward install` again when `units/` changed. The restart resets connections open through mapped ports; wards and what runs in them carry on. Running wards keep the settings they started with (their TCP table size, host ports) until they next start.
 
 ## Develop
 
