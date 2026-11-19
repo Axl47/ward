@@ -7,7 +7,7 @@ import { basename, join } from "node:path";
 import { parseArgs } from "node:util";
 import { call, WardError, type WardInfo } from "./api.ts";
 import { parseProjectHostPorts, wardHostPorts } from "./hostports.ts";
-import { CONTROL_SOCKET, enabledMarker, locate, projectHostPorts, WARD_HOME, wardRuntimeDir } from "./paths.ts";
+import { CONTROL_SOCKET, enabledMarker, locate, parsePorts, projectHostPorts, WARD_HOME, wardRuntimeDir } from "./paths.ts";
 import { T3_TOKEN_FILE } from "./t3state.ts";
 
 const USAGE = `usage: ward <command>
@@ -58,7 +58,7 @@ const currentId = () => target().id;
 async function ensureDaemon(): Promise<void> {
   if (existsSync(CONTROL_SOCKET) && (await reachable())) return;
   // A second instance (WARD_UNIT set) must never start the installed wardd.service.
-  if (process.env.WARD_UNIT) throw new WardError(`wardd is not running at ${CONTROL_SOCKET}; start this instance's daemon (see AGENTS.md)`);
+  if (process.env.WARD_UNIT !== undefined) throw new WardError(`wardd is not running at ${CONTROL_SOCKET}; start this instance's daemon (see AGENTS.md)`);
   spawnSync("systemctl", ["--user", "reset-failed", "wardd.service"], { stdio: "ignore" });
   // start, not restart: a concurrent caller may already have started it and be mid-request.
   spawnSync("systemctl", ["--user", "start", "wardd.service"], { stdio: "inherit" });
@@ -116,7 +116,7 @@ async function reportStaleWards(repo: string, forwarded: string): Promise<void> 
   const stale = (await call("GET /ls", {})).filter((w) => {
     if (w.repo !== repo || !w.running) return false;
     try {
-      return readFileSync(join(wardRuntimeDir(w.id), "host-ports"), "utf8").trim() !== forwarded;
+      return parsePorts(readFileSync(join(wardRuntimeDir(w.id), "host-ports"), "utf8")).sort().join() !== forwarded.split(",").sort().join();
     } catch {
       return true;
     }

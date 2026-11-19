@@ -169,8 +169,9 @@ function writeEnvFile(record: WardRecord): void {
     // the classic builder runs in the ward's Podman.
     DOCKER_BUILDKIT: "0",
     COMPOSE_BAKE: "false",
-    // What this ward's pasta forwards, from when it started.
-    WARD_HOST_PORTS: hostPorts,
+    // What this ward's pasta forwards, from when it started. Not WARD_HOST_PORTS:
+    // that is the global setting, and a `ward` run in the ward would read this as it.
+    WARD_FORWARDED_PORTS: hostPorts,
   };
   const sdk = process.env.ANDROID_HOME;
   if (sdk && existsSync(join(sdk, "platform-tools/adb"))) {
@@ -223,6 +224,7 @@ async function up(worktree: string): Promise<UpResult> {
     if (starting) writeHostPorts(record);
     writeEnvFile(record);
     if (starting) {
+      rmSync(join(wardRuntimeDir(record.id), "init.log"), { force: true }); // no previous start's errors
       await systemctl("start", unitName(record.id));
       await waitReady(record.id);
       log(`started ward ${record.id}`);
@@ -246,18 +248,20 @@ function initLog(id: string): string[] {
   }
 }
 
+const initLogTail = (id: string) => {
+  const tail = initLog(id).slice(-15);
+  return tail.length ? `:\n${tail.join("\n")}` : `; see \`journalctl --user -u ${unitName(id)}\``;
+};
+
 async function waitReady(id: string): Promise<void> {
   const deadline = Date.now() + READY_TIMEOUT_MS;
   while (Date.now() < deadline) {
     if (isReady(id)) return;
     const state = await systemctl("is-active", unitName(id)).then((r) => r.stdout.trim(), (e: { stdout?: string }) => e.stdout?.trim() ?? "unknown");
-    if (state === "failed" || state === "inactive") {
-      const tail = initLog(id).slice(-15);
-      throw new Error(`ward ${id} failed to start${tail.length ? `:\n${tail.join("\n")}` : `; see \`journalctl --user -u ${unitName(id)}\``}`);
-    }
+    if (state === "failed" || state === "inactive") throw new Error(`ward ${id} failed to start${initLogTail(id)}`);
     await new Promise((r) => setTimeout(r, 50));
   }
-  throw new Error(`ward ${id} did not become ready within ${READY_TIMEOUT_MS / 1000}s`);
+  throw new Error(`ward ${id} did not become ready within ${READY_TIMEOUT_MS / 1000}s${initLogTail(id)}`);
 }
 
 /**
@@ -535,7 +539,9 @@ function watchContainers(id: string, ward: LiveWard): void {
   const filters = encodeURIComponent(JSON.stringify({ type: ["container"] }));
   // Replays the last moments too, so a container that starts around the first list isn't missed.
   const since = Math.floor(Date.now() / 1000) - 1;
-  const req = httpRequest({ socketPath: join(wardRuntimeDir(id), "podman/podman.sock"), path: `/v4.0.0/libpod/events?stream=true&since=${since}&filters=${filters}` }, (res) => {
+  const req = httpRequest({ socketPath: join(wardRuntimeDir(id), "podman/podman.sock"), path: `/v4.0.0/libpod/events?stream=true&since=${since}&filters=${filters}`,
+    // A connection of its own, so "connect" fires: a reused keep-alive socket would never clear the timer.
+    agent: false }, (res) => {
     let pending = "";
     res.setEncoding("utf8");
     res.on("data", (chunk: string) => {
@@ -743,7 +749,8 @@ async function reconcile(): Promise<string[]> {
       continue;
     }
     if (!isReady(record.id)) continue;
-    if (!live.has(record.id)) attach(record); // its broker died, or it came up while wardd was down
+    // Its broker died, or it came up while wardd was down; not while a stop or rm holds it.
+    if (!live.has(record.id) && !locks.has(record.id)) attach(record);
     // T3 unreachable: leave running wards alone.
     if (threads === undefined || !shouldStop(threads.get(record.worktree) ?? [], lastActivity(record.id), now)) continue;
     if (await stop(record.id, record.worktree)) actions.push(`stopped ${record.id}: no active thread needs it`);

@@ -6,11 +6,12 @@ set -eu
 id=$1
 rt=$WARD_RUNTIME/$id
 st=$WARD_STATE/wards/$id
-mkdir -p "$rt/podman" "$st/storage" "$st/home" "$st/tmp" "$st/net" "$st/resolve" "$st/sock" "$WARD_STATE/images"
-rm -f "$rt/ready" "$rt/pid"
-echo "/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup)" > "$rt/cgroup"
+mkdir -p "$rt"
 # journald drops what processes in the ward's user namespace write, so their
 # stderr goes to a file; wardd shows its tail when a ward fails to start.
 exec 2>"$rt/init.log"
+mkdir -p "$rt/podman" "$st/storage" "$st/home" "$st/tmp" "$st/net" "$st/resolve" "$st/sock" "$WARD_STATE/images"
+rm -f "$rt/ready" "$rt/pid"
+echo "/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup)" > "$rt/cgroup"
 # shellcheck disable=SC2046 # word splitting of the map flags is intended
 exec unshare $(ward_map_args) --setuid 0 --setgid 0 -- "$WARD_LIBEXEC/ward-init-root" "$id"

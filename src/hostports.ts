@@ -22,8 +22,9 @@ export function wardHostPorts(project: readonly number[], global: readonly numbe
 
 /**
  * Parse `--host-ports` input into the project's own list: plain decimal ports,
- * deduplicated and without those already in the global list. Throws on
- * anything else, or when the combined list wouldn't fit.
+ * deduplicated. Ports also in the global list stay, so the stored list doesn't
+ * depend on this process's view of it. Throws on anything else, or when the
+ * combined list wouldn't fit.
  */
 export function parseProjectHostPorts(text: string, global: readonly number[] = HOST_PORTS): number[] {
   const ports = new Set<number>();
@@ -32,7 +33,7 @@ export function parseProjectHostPorts(text: string, global: readonly number[] = 
     if (!(port >= 1 && port <= 65535)) throw new Error(`bad port ${token}`);
     const problem = hostPortProblem(port);
     if (problem !== undefined) throw new Error(problem);
-    if (!global.includes(port)) ports.add(port);
+    ports.add(port);
   }
   const total = new Set([...global, ...ports]).size;
   if (total > MAX_HOST_PORTS) throw new Error(`${total} host ports in all; at most ${MAX_HOST_PORTS} fit`);

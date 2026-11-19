@@ -8,10 +8,10 @@ test("only plain decimal ports parse", () => {
   for (const bad of ["0x50", "1e3", "+80", "80.0", "0", "65536", "abc"]) assert.throws(() => parseProjectHostPorts(bad, []), /bad port/);
 });
 
-test("project ports: DNS and Ward's own range are refused, global ones dropped, duplicates merged", () => {
+test("project ports: DNS and Ward's own range are refused, duplicates merged", () => {
   assert.throws(() => parseProjectHostPorts("53", [3773]), /DNS/);
   assert.throws(() => parseProjectHostPorts("28000", [3773]), /range/);
-  assert.deepEqual(parseProjectHostPorts("39003, 3773,39003,20099,30000", [3773]), [39003, 20099, 30000]);
+  assert.deepEqual(parseProjectHostPorts("39003, 3773,39003,20099,30000", [3773]), [39003, 3773, 20099, 30000]);
 });
 
 test("a list that can't fit pasta's rules is refused", () => {
