@@ -473,6 +473,7 @@ function watchContainers(id: string, ward: LiveWard): void {
   // Replays the last moments too, so a container that starts around the first list isn't missed.
   const since = Math.floor(Date.now() / 1000) - 1;
   const req = httpRequest({ socketPath: join(wardRuntimeDir(id), "podman/podman.sock"), path: `/v4.0.0/libpod/events?stream=true&since=${since}&filters=${filters}` }, (res) => {
+    clearTimeout(stalled);
     refreshContainers(id, ward);
     let pending = "";
     res.setEncoding("utf8");
@@ -495,8 +496,14 @@ function watchContainers(id: string, ward: LiveWard): void {
       if (changed) refreshContainers(id, ward);
     });
   });
+  // A Podman that never answers still gets its containers listed, and the stream retried.
+  const stalled = setTimeout(() => {
+    refreshContainers(id, ward);
+    req.destroy();
+  }, 5000);
   req.on("error", () => undefined); // "close" follows and reconnects
   req.on("close", () => {
+    clearTimeout(stalled);
     if (ward.events === req) ward.events = undefined;
     setTimeout(() => watchContainers(id, ward), 1000);
   });
@@ -586,7 +593,11 @@ async function ensureListener(id: string, wardPort: number): Promise<number> {
       server.once("error", () => resolve(false));
       server.listen(hostPort, "127.0.0.1", () => resolve(true));
     });
-    if (!ok) continue;
+    if (!ok) {
+      const won = ward.listeners.has(wardPort) ? wards.get(id)?.ports[String(wardPort)] : undefined;
+      if (won !== undefined) return won; // a concurrent call mapped it meanwhile
+      continue;
+    }
     if (live.get(id) !== ward || ward.listeners.has(wardPort)) {
       server.close(); // lost a race with detach or another ensureListener
       return ward.listeners.has(wardPort) ? (wards.get(id) ?? record).ports[String(wardPort)]! : hostPort;
