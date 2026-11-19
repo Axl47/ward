@@ -2,7 +2,7 @@
 
 # Ward
 
-Gives every T3 Code worktree on gaia-arch its own network namespace, Podman and `/tmp`, so parallel agent threads can all run a dev server on 5173 and Postgres on 5432 without colliding. [docs/DESIGN.md](docs/DESIGN.md) explains how.
+Gives every T3 Code worktree on gaia-arch its own network namespace, Podman and `/tmp`, so parallel agent threads can all run a dev server on 5173 and Postgres on 5432 without colliding. [docs/DESIGN.md](docs/DESIGN.md) explains how, and [docs/PROFILE.md](docs/PROFILE.md) what it costs.
 
 ## Setup
 
