@@ -21,10 +21,12 @@ done
 
 # 2. Internet via pasta. No inbound forwarding: wardd maps ports itself, so the
 # ward's ports never appear on the host under their own numbers. Outbound, the
-# host ports listed in WARD_HOST_PORTS and DNS (the host's stub resolver at
-# 127.0.0.53, which /etc/resolv.conf names) reach the host's loopback.
+# host ports wardd wrote to $rt/host-ports (WARD_HOST_PORTS plus the project's
+# own) and DNS (the host's stub resolver at 127.0.0.53, which /etc/resolv.conf
+# names) reach the host's loopback.
+host_ports=$(cat "$rt/host-ports" 2>/dev/null || echo "$WARD_HOST_PORTS")
 pasta_t=(-T 53)
-for p in ${WARD_HOST_PORTS//,/ }; do pasta_t+=(-T "$p"); done
+for p in ${host_ports//,/ }; do pasta_t+=(-T "$p"); done
 pasta --config-net --quiet --foreground -t none -u none -U 53 "${pasta_t[@]}" \
   --netns "/proc/$ns/ns/net" --runas 0:0 &
 

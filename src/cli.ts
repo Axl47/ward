@@ -6,7 +6,7 @@ import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import { parseArgs } from "node:util";
 import { call, WardError, type WardInfo } from "./api.ts";
-import { CONTROL_SOCKET, enabledMarker, locate, WARD_HOME, wardRuntimeDir } from "./paths.ts";
+import { CONTROL_SOCKET, enabledMarker, locate, parsePorts, projectHostPorts, WARD_HOME, wardRuntimeDir } from "./paths.ts";
 import { T3_TOKEN_FILE } from "./t3state.ts";
 
 const USAGE = `usage: ward <command>
@@ -19,7 +19,8 @@ const USAGE = `usage: ward <command>
   ports [--json]                    this ward's port mappings (ward port → host port)
   port PORT                         host port for a ward port, mapping it if needed
   env                               this ward's environment
-  enable [REPO] / disable [REPO]    turn wards on or off for a project
+  enable [REPO] [--host-ports LIST] turn wards on for a project; LIST: more host ports its wards reach
+  disable [REPO]                    turn wards off for a project
   gc                                run the reconciler now
   images ARGS...                    podman on the shared image store, e.g. images pull postgres:17
   install                           install the systemd units and put ward on PATH`;
@@ -32,6 +33,7 @@ const { positionals, values } = parseArgs({
     json: { type: "boolean" },
     quiet: { type: "boolean" },
     now: { type: "boolean" },
+    "host-ports": { type: "string" },
   },
 });
 const [command, ...args] = positionals;
@@ -171,11 +173,18 @@ async function main(): Promise<void> {
     case "disable": {
       const repo = repoArg();
       const marker = enabledMarker(repo);
-      if (command === "enable") {
-        mkdirSync(join(marker, ".."), { recursive: true });
-        writeFileSync(marker, "");
-      } else rmSync(marker, { force: true });
-      console.log(`wards ${command}d for ${repo}`);
+      if (command === "disable") {
+        rmSync(marker, { force: true });
+        return console.log(`wards disabled for ${repo}`);
+      }
+      const given = values["host-ports"];
+      if (given !== undefined && typeof given !== "string") throw new WardError("usage: ward enable [REPO] --host-ports PORT[,PORT...]");
+      const ports = given === undefined ? projectHostPorts(repo) : parsePorts(given);
+      if (given !== undefined && ports.length !== given.split(",").filter((p) => p.trim()).length)
+        throw new WardError(`bad port list: ${given}`);
+      mkdirSync(join(marker, ".."), { recursive: true });
+      writeFileSync(marker, ports.join(","));
+      console.log(`wards enabled for ${repo}${ports.length ? `; its wards reach host ports ${ports.join(",")} once they next start` : ""}`);
       return;
     }
     case "gc": {

@@ -10,7 +10,8 @@ WARD_RUNTIME=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/ward
 # their own state folder, and agents inherit it.
 WARD_WORKTREES=${WARD_T3_HOME:-$HOME/.t3}/worktrees
 # Host loopback ports reachable from inside every ward: T3's server and the adb
-# server. DNS (53) is always forwarded too.
+# server. DNS (53) is always forwarded too. Only a fallback: wardd writes each
+# ward's list, with its project's ports, to $rt/host-ports.
 WARD_HOST_PORTS=${WARD_HOST_PORTS:-3773,5037}
 
 # ID map for every ward's user namespace: your uid/gid stays itself (1000 → 1000),

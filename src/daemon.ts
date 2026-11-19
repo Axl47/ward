@@ -14,6 +14,8 @@ import {
   CONTROL_SOCKET,
   HOST_PORTS,
   isEnabled,
+  parsePorts,
+  projectHostPorts,
   locate,
   STATE_DIR,
   unitName,
@@ -60,6 +62,8 @@ interface LiveWard {
   readonly health: Map<string, HealthSchedule | "pending">;
   scanCount: number;
   nextReq: number;
+  /** Host ports pasta forwards into the ward; they listen inside it but aren't the ward's own. */
+  readonly hostPorts: ReadonlySet<number>;
 }
 
 const wards = loadRegistry();
@@ -143,6 +147,7 @@ function sdkOverlay(sdk: string, overlay: string, shim: string): void {
 
 function writeEnvFile(record: WardRecord): void {
   const rt = wardRuntimeDir(record.id);
+  const hostPorts = [...new Set([...HOST_PORTS, ...projectHostPorts(record.repo)])].join(",");
   const podman = `unix://${rt}/podman/podman.sock`;
   const shims = join(WARD_HOME, "shims");
   const vars: Record<string, string> = {
@@ -156,6 +161,8 @@ function writeEnvFile(record: WardRecord): void {
     // the classic builder runs in the ward's Podman.
     DOCKER_BUILDKIT: "0",
     COMPOSE_BAKE: "false",
+    // Takes effect when the ward next starts, like the file below.
+    WARD_HOST_PORTS: hostPorts,
   };
   const sdk = process.env.ANDROID_HOME;
   if (sdk && existsSync(join(sdk, "platform-tools/adb"))) {
@@ -167,6 +174,8 @@ function writeEnvFile(record: WardRecord): void {
   lines.push(`PATH=${shellQuote(shims)}:"$PATH"`);
   mkdirSync(rt, { recursive: true });
   writeFileSync(join(rt, "env"), lines.join("\n") + "\n");
+  // Read by ward-init-root when the ward starts: host ports pasta forwards in.
+  writeFileSync(join(rt, "host-ports"), hostPorts);
   // Which worktree owns this id; bin/ward checks it before joining.
   writeFileSync(join(rt, "root"), record.worktree);
 }
@@ -335,6 +344,7 @@ function attach(record: WardRecord): void {
     health: new Map(),
     scanCount: 0,
     nextReq: 1,
+    hostPorts: new Set([53, ...readHostPorts(record.id)]),
   };
   live.set(record.id, ward);
   broker.on("message", (reply: BrokerReply, socket: unknown) => {
@@ -351,6 +361,15 @@ function attach(record: WardRecord): void {
   broker.on("exit", () => {
     if (live.get(record.id) === ward) detach(record.id);
   });
+}
+
+/** The host ports a ward was started with. */
+function readHostPorts(id: string): readonly number[] {
+  try {
+    return parsePorts(readFileSync(join(wardRuntimeDir(id), "host-ports"), "utf8"));
+  } catch {
+    return HOST_PORTS;
+  }
 }
 
 function detach(id: string): void {
@@ -380,7 +399,7 @@ function scan(id: string): void {
       return; // broker gone; its exit handler detaches the ward
     }
     for (const [port, hosts] of listeningPorts(text)) {
-      if (!HOST_PORTS.has(port)) found.set(port, [...new Set([...(found.get(port) ?? []), ...hosts])]);
+      if (!ward.hostPorts.has(port)) found.set(port, [...new Set([...(found.get(port) ?? []), ...hosts])]);
     }
   }
   for (const port of ward.containerPorts) if (!found.has(port)) found.set(port, ["127.0.0.1"]);
