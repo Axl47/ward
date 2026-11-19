@@ -9,8 +9,6 @@ set -euo pipefail
 id=$1
 rt=$WARD_RUNTIME/$id
 st=$WARD_STATE/wards/$id
-# Host loopback ports reachable from inside the ward (adb server by default).
-host_ports=${WARD_HOST_PORTS:-5037}
 
 # 1. Network namespace, held open by a sleep whose pid is the ward's join point.
 unshare --net -- sh -c 'ip link set lo up && exec sleep infinity' &
@@ -19,12 +17,15 @@ for _ in $(seq 100); do
   [ "$(readlink /proc/$ns/ns/net)" != "$(readlink /proc/self/ns/net)" ] && break
   sleep 0.02
 done
+[ "$(readlink /proc/$ns/ns/net)" != "$(readlink /proc/self/ns/net)" ] || { echo "ward: network namespace did not start" >&2; exit 1; }
 
 # 2. Internet via pasta. No inbound forwarding: wardd maps ports itself, so the
-# ward's ports never appear on the host under their own numbers.
-pasta_t=()
-for p in ${host_ports//,/ }; do pasta_t+=(-T "$p"); done
-pasta --config-net --quiet --foreground -t none -u none -U none "${pasta_t[@]}" \
+# ward's ports never appear on the host under their own numbers. Outbound, the
+# host ports listed in WARD_HOST_PORTS and DNS (the host's stub resolver at
+# 127.0.0.53, which /etc/resolv.conf names) reach the host's loopback.
+pasta_t=(-T 53)
+for p in ${WARD_HOST_PORTS//,/ }; do pasta_t+=(-T "$p"); done
+pasta --config-net --quiet --foreground -t none -u none -U 53 "${pasta_t[@]}" \
   --netns "/proc/$ns/ns/net" --runas 0:0 &
 
 # 3. Podman, as root of the ward, in its own mount namespace with private /run

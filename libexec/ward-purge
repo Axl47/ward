@@ -1,11 +1,21 @@
 #!/bin/sh
-# ward-purge ID: delete a stopped ward's state. Container files belong to
-# subordinate ids, so the delete runs as root of a ward-mapped user namespace.
+# ward-purge TARGET...: delete ward data. Each TARGET is wards/ID (a ward's
+# state), trash/ID (a trashed copy) or runtime/ID (its runtime folder).
+# Container files belong to subordinate ids, so the delete runs as root of a
+# ward-mapped user namespace.
 set -eu
 . "$(dirname -- "$(readlink -f -- "$0")")/ward-lib.sh"
-id=$1
-case "$id" in ''|*/*|.|..) echo "ward-purge: bad id" >&2; exit 2 ;; esac
-[ -d "$WARD_STATE/wards/$id" ] || exit 0
-# shellcheck disable=SC2046
-unshare $(ward_map_args) --setuid 0 --setgid 0 -- rm -rf -- "$WARD_STATE/wards/$id"
-rm -rf -- "$WARD_RUNTIME/$id"
+paths=
+for target in "$@"; do
+  name=${target#*/}
+  case "$name" in ''|*[!A-Za-z0-9._-]*|.|..) echo "ward-purge: bad target $target" >&2; exit 2 ;; esac
+  case "$target" in
+    wards/*|trash/*) path=$WARD_STATE/$target ;;
+    runtime/*) path=$WARD_RUNTIME/$name ;;
+    *) echo "ward-purge: bad target $target" >&2; exit 2 ;;
+  esac
+  [ -e "$path" ] && paths="$paths $path"
+done
+[ -n "$paths" ] || exit 0
+# shellcheck disable=SC2046,SC2086 # names are checked above, so splitting is safe
+unshare $(ward_map_args) --setuid 0 --setgid 0 -- rm -rf -- $paths

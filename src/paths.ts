@@ -12,16 +12,17 @@ export const WARD_HOME = dirname(dirname(fileURLToPath(import.meta.url)));
 export const STATE_DIR = join(env.XDG_STATE_HOME ?? join(home, ".local/state"), "ward");
 export const CONFIG_DIR = join(env.XDG_CONFIG_HOME ?? join(home, ".config"), "ward");
 export const RUNTIME_DIR = join(env.XDG_RUNTIME_DIR ?? `/run/user/${userInfo().uid}`, "ward");
-export const T3_HOME = env.T3CODE_HOME ?? join(home, ".t3");
+/** The T3 home Ward serves. Not T3CODE_HOME: dev servers point that at their own state. */
+export const T3_HOME = env.WARD_T3_HOME ?? join(home, ".t3");
 export const WORKTREES_DIR = join(T3_HOME, "worktrees");
-export const T3_STATE_DB = join(T3_HOME, "userdata/statev2.sqlite");
 export const CONTROL_SOCKET = join(RUNTIME_DIR, "wardd.sock");
 export const REGISTRY_FILE = join(STATE_DIR, "registry.json");
 
-/** Host loopback ports forwarded into every ward; never mapped back out. */
-export const HOST_PORTS: ReadonlySet<number> = new Set(
-  (env.WARD_HOST_PORTS ?? "5037").split(",").map(Number).filter(Number.isInteger),
-);
+/** Host loopback ports forwarded into every ward (T3, adb, and always DNS); never mapped back out. */
+export const HOST_PORTS: ReadonlySet<number> = new Set([
+  53,
+  ...(env.WARD_HOST_PORTS ?? "3773,5037").split(",").map(Number).filter(Number.isInteger),
+]);
 
 export interface WardLocation {
   readonly id: string;
@@ -41,9 +42,11 @@ export function locate(dir: string): WardLocation | undefined {
   return { id: `${sanitize(repo)}.${sanitize(name)}`, repo, root: join(WORKTREES_DIR, repo, name) };
 }
 
-export const isEnabled = (repo: string) => existsSync(join(CONFIG_DIR, "enabled", repo));
 export const enabledMarker = (repo: string) => join(CONFIG_DIR, "enabled", basename(repo));
+export const isEnabled = (repo: string) => existsSync(enabledMarker(repo));
 
 export const wardRuntimeDir = (id: string) => join(RUNTIME_DIR, id);
 export const wardStateDir = (id: string) => join(STATE_DIR, "wards", id);
+/** Where a removed worktree's ward data waits before it is purged. */
+export const wardTrashDir = (id: string) => join(STATE_DIR, "trash", id);
 export const unitName = (id: string) => `ward@${id}.service`;

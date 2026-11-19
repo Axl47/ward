@@ -6,7 +6,12 @@ WARD_LIBEXEC=$WARD_HOME/libexec
 WARD_STATE=${XDG_STATE_HOME:-$HOME/.local/state}/ward
 WARD_CONFIG=${XDG_CONFIG_HOME:-$HOME/.config}/ward
 WARD_RUNTIME=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/ward
-WARD_WORKTREES=${T3CODE_HOME:-$HOME/.t3}/worktrees
+# The T3 home Ward serves. Deliberately not T3CODE_HOME: dev servers set that to
+# their own state folder, and agents inherit it.
+WARD_WORKTREES=${WARD_T3_HOME:-$HOME/.t3}/worktrees
+# Host loopback ports reachable from inside every ward: T3's server and the adb
+# server. DNS (53) is always forwarded too.
+WARD_HOST_PORTS=${WARD_HOST_PORTS:-3773,5037}
 
 # ID map for every ward's user namespace: your uid/gid stays itself (1000 → 1000),
 # root and the other ids come from your subuid/subgid range.

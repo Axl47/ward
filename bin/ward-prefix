@@ -2,8 +2,12 @@
 # Value for CLAUDE_CODE_SHELL_PREFIX. Claude Code calls it with one argument, the
 # full command string, for Bash tool commands and also for the MCP servers, hooks
 # and LSP servers it starts. Only Bash tool commands (they source a shell
-# snapshot) go into the ward; the agent's own tooling stays on the host.
+# snapshot) go into the ward; the agent's own tooling stays on the host. The
+# snapshot exports the PATH Claude started with, so a `source` wrapper puts the
+# ward's shims back in front after it.
 case "${1:-}" in
-  *"/shell-snapshots/"*) exec "$(dirname -- "$(readlink -f -- "$0")")/ward" exec -- bash -c "$1" ;;
+  *"/shell-snapshots/"*)
+    exec "$(dirname -- "$(readlink -f -- "$0")")/ward" exec -- bash -c \
+      'source() { builtin source "$@"; local status=$?; PATH="${WARD_SHIMS:+$WARD_SHIMS:}$PATH"; return $status; }; '"$1" ;;
   *) exec bash -c "$1" ;;
 esac

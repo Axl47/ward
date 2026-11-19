@@ -62,6 +62,21 @@ export function threadState(thread: ShellThread): ThreadState | undefined {
   return { threadId: thread.id, worktree: thread.worktreePath, idleSince };
 }
 
+/** How long a ward whose worktree has no active thread (archived, deleted, or none) may sit unused. */
+export const NO_THREAD_GRACE_MS = 30 * 60_000;
+
+/**
+ * Whether the reconciler should stop a running ward. lastActivity is when the
+ * ward last started or ran a command (ms). With threads: once all are idle and
+ * the latest went idle after that activity, so opening a settled thread's
+ * terminal isn't undone. Without: after NO_THREAD_GRACE_MS unused.
+ */
+export function shouldStop(threads: readonly ThreadState[], lastActivity: number, now: number): boolean {
+  if (threads.length === 0) return now - lastActivity > NO_THREAD_GRACE_MS;
+  const idle = threads.map((t) => (t.idleSince === undefined ? Number.NaN : Date.parse(t.idleSince)));
+  return !idle.some(Number.isNaN) && Math.max(...idle) > lastActivity;
+}
+
 export function isSettled(thread: Pick<ShellThread, "settledOverride" | "settledAt" | "unsettledAt">): boolean {
   if (thread.settledOverride === "settled") return Boolean(thread.settledAt);
   if (thread.settledOverride === "active" || !thread.settledAt) return false;

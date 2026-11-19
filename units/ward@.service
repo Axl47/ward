@@ -11,4 +11,5 @@ ExecStopPost=/bin/sh -c 'rm -rf "$XDG_RUNTIME_DIR/ward/%i/ready" "$XDG_RUNTIME_D
 KillMode=control-group
 TimeoutStopSec=15
 Restart=no
-CPUWeight=100
+# Under T3's agents slice, so ward processes share the agents' memory limit.
+Slice=app-t3code-agents-wards.slice

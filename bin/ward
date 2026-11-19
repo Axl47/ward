@@ -33,10 +33,13 @@ ward_exec() {
   pid=$(cat "$rt/pid" 2>/dev/null || true)
   if [ ! -e "$rt/ready" ] || [ -z "$pid" ] || [ ! -e "/proc/$pid" ]; then
     "$0" up --worktree "$WARD_ROOT" --quiet >&2 || { echo "ward: could not start ward $WARD_ID" >&2; exit 1; }
-    pid=$(cat "$rt/pid")
+    # wardd can decline (it resolved the folder differently); run unwarded then.
+    pid=$(cat "$rt/pid" 2>/dev/null) || exec "$@"
   fi
   # Join the ward's cgroup so stopping the ward kills everything started here.
   echo $$ > "$(cat "$rt/cgroup")/cgroup.procs" || { echo "ward: could not join the cgroup of ward $WARD_ID" >&2; exit 1; }
+  # The reconciler won't stop a ward used after its threads went idle.
+  : > "$rt/last-exec"
   set -a; . "$rt/env"; set +a
   exec nsenter -U -n -t "$pid" --setuid "$(id -u)" --setgid "$(id -g)" -- "$@"
 }

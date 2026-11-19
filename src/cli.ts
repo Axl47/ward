@@ -117,7 +117,8 @@ async function main(): Promise<void> {
       return;
     }
     case "ls": {
-      await ensureDaemon();
+      // No auto-start: T3 polls this, and a stopped wardd just means no running wards.
+      if (!existsSync(CONTROL_SOCKET)) return console.log(values.json ? "[]" : "no wards");
       const list = await call("GET /ls", {});
       if (values.json) return console.log(JSON.stringify(list, null, 2));
       if (list.length === 0) return console.log("no wards");

@@ -1,0 +1,4 @@
+#!/bin/sh
+# sudo can't work inside a ward: setuid binaries don't run in a user namespace.
+echo "sudo: not available inside a ward (this worktree's commands run in a user namespace). Ask the user to run this command." >&2
+exit 1

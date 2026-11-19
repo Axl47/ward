@@ -2,7 +2,7 @@
 // maps each port a ward listens on to a host port in the ward's slot, and runs
 // the reconciler that stops or removes wards when T3 is done with them.
 import { execFile, spawn, type ChildProcess } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, rmSync, unlinkSync, watch, writeFileSync, type FSWatcher } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, watch, writeFileSync, type FSWatcher } from "node:fs";
 import { createServer as createHttpServer, request as httpRequest, type IncomingMessage, type ServerResponse } from "node:http";
 import { createServer, type Server, type Socket } from "node:net";
 import { userInfo } from "node:os";
@@ -15,20 +15,24 @@ import {
   HOST_PORTS,
   isEnabled,
   locate,
+  STATE_DIR,
   unitName,
   WARD_HOME,
   wardRuntimeDir,
   wardStateDir,
+  wardTrashDir,
+  WORKTREES_DIR,
 } from "./paths.ts";
 import { listeningPorts } from "./procnet.ts";
-import { freeSlot, loadRegistry, saveRegistry, slotPorts, type WardRecord } from "./registry.ts";
-import { threadsByWorktree, type ThreadState } from "./t3state.ts";
+import { freeSlot, loadRegistry, MAX_SLOTS, saveRegistry, slotPorts, type WardRecord } from "./registry.ts";
+import { shouldStop, threadsByWorktree, type ThreadState } from "./t3state.ts";
 
 const run = promisify(execFile);
 const { uid, gid } = userInfo();
 const RECONCILE_MS = 60_000;
 const READY_TIMEOUT_MS = 60_000;
 const CONNECT_TIMEOUT_MS = 10_000;
+const TRASH_DAYS = 7;
 
 /** A running ward's in-memory plumbing. */
 interface LiveWard {
@@ -52,8 +56,6 @@ const live = new Map<string, LiveWard>();
 const locks = new Map<string, Promise<unknown>>();
 /** Threads by worktree from the last reconcile, for attributing wards to threads. */
 let lastThreads: Map<string, ThreadState[]> | undefined;
-/** When wardd last saw each ward start (ISO time), for the reconciler. */
-const startedAtById = new Map<string, string>();
 const log = (message: string) => console.log(message);
 
 /** Run fn after any earlier operation on the same ward has settled. */
@@ -82,18 +84,51 @@ function readPid(id: string): number | undefined {
 
 const shellQuote = (value: string) => `'${value.replaceAll("'", `'\\''`)}'`;
 
+/** When the ward last started or ran a command (ms since epoch), from files that outlive wardd restarts. */
+function lastActivity(id: string): number {
+  const times = ["ready", "last-exec"].map((file) => {
+    try {
+      return statSync(join(wardRuntimeDir(id), file)).mtimeMs;
+    } catch {
+      return 0;
+    }
+  });
+  return Math.max(...times);
+}
+
+/**
+ * An Android SDK whose platform-tools/adb is Ward's shim and everything else
+ * links to the real SDK, so tools that call $ANDROID_HOME/platform-tools/adb
+ * directly (React Native, Expo, Gradle) get the `adb reverse` rewrite too.
+ */
+function sdkOverlay(sdk: string, overlay: string, shim: string): void {
+  rmSync(overlay, { recursive: true, force: true });
+  mkdirSync(join(overlay, "platform-tools"), { recursive: true });
+  for (const entry of readdirSync(sdk)) if (entry !== "platform-tools") symlinkSync(join(sdk, entry), join(overlay, entry));
+  for (const entry of readdirSync(join(sdk, "platform-tools")))
+    symlinkSync(entry === "adb" ? shim : join(sdk, "platform-tools", entry), join(overlay, "platform-tools", entry));
+}
+
 function writeEnvFile(record: WardRecord): void {
   const rt = wardRuntimeDir(record.id);
   const podman = `unix://${rt}/podman/podman.sock`;
+  const shims = join(WARD_HOME, "shims");
   const vars: Record<string, string> = {
     WARD_ID: record.id,
     WARD_ROOT: record.worktree,
+    WARD_SHIMS: shims,
     DOCKER_HOST: podman,
     CONTAINER_HOST: podman,
     TMPDIR: join(wardStateDir(record.id), "tmp"),
   };
+  const sdk = process.env.ANDROID_HOME;
+  if (sdk && existsSync(join(sdk, "platform-tools/adb"))) {
+    const overlay = join(wardStateDir(record.id), "android-sdk");
+    sdkOverlay(sdk, overlay, join(shims, "adb"));
+    Object.assign(vars, { ANDROID_HOME: overlay, ANDROID_SDK_ROOT: overlay, WARD_REAL_ADB: join(sdk, "platform-tools/adb") });
+  }
   const lines = Object.entries(vars).map(([k, v]) => `${k}=${shellQuote(v)}`);
-  lines.push(`PATH=${shellQuote(join(WARD_HOME, "shims"))}:"$PATH"`);
+  lines.push(`PATH=${shellQuote(shims)}:"$PATH"`);
   mkdirSync(rt, { recursive: true });
   writeFileSync(join(rt, "env"), lines.join("\n") + "\n");
 }
@@ -116,15 +151,22 @@ async function up(worktree: string): Promise<UpResult> {
   if (!existsSync(location.root)) throw new Error(`${location.root} does not exist`);
   return serialized(location.id, async () => {
     let record = wards.get(location.id);
+    if (record !== undefined && record.worktree !== location.root)
+      throw new Error(`ward id ${location.id} already belongs to ${record.worktree}; rename one of the folders`);
     if (record === undefined) {
-      record = { id: location.id, repo: location.repo, worktree: location.root, slot: freeSlot(wards), ports: {}, createdAt: new Date().toISOString() };
+      restoreFromTrash(location.id);
+      record = { id: location.id, repo: location.repo, worktree: location.root, slot: claimSlot(), ports: {}, createdAt: new Date().toISOString() };
       wards.set(record.id, record);
       saveRegistry(wards);
       log(`created ward ${record.id} in slot ${record.slot}`);
+    } else if (record.slot === 0) {
+      record = { ...record, slot: claimSlot() };
+      wards.set(record.id, record);
+      saveRegistry(wards);
+      log(`ward ${record.id} got slot ${record.slot}`);
     }
     writeEnvFile(record);
     if (!isReady(record.id)) {
-      startedAtById.set(record.id, new Date().toISOString());
       await systemctl("start", unitName(record.id));
       await waitReady(record.id);
       log(`started ward ${record.id}`);
@@ -157,16 +199,58 @@ function stop(id: string): Promise<boolean> {
   });
 }
 
-function rm(id: string): Promise<boolean> {
+/** A free slot, else the slot of the stopped ward unused the longest. */
+function claimSlot(): number {
+  const slot = freeSlot(wards);
+  if (slot !== undefined) return slot;
+  const victim = [...wards.values()]
+    .filter((w) => w.slot > 0 && !isReady(w.id))
+    .sort((a, b) => lastActivity(a.id) - lastActivity(b.id))[0];
+  if (victim === undefined) throw new Error(`all ${MAX_SLOTS} ward slots are held by running wards; stop some with \`ward stop\``);
+  wards.set(victim.id, { ...victim, slot: 0, ports: {} });
+  log(`ward ${victim.id}: gave its slot ${victim.slot} to a new ward`);
+  return victim.slot;
+}
+
+const purge = (...targets: string[]) => run(join(WARD_HOME, "libexec/ward-purge"), targets);
+
+/**
+ * Remove a ward. With trash, its data moves to the trash for TRASH_DAYS and
+ * comes back if the same worktree reappears; otherwise it is deleted now.
+ */
+function rm(id: string, { trash = false } = {}): Promise<boolean> {
   return serialized(id, async () => {
     await systemctl("stop", unitName(id)).catch(() => undefined);
     detach(id);
-    await run(join(WARD_HOME, "libexec/ward-purge"), [id]);
+    if (trash && existsSync(wardStateDir(id))) {
+      await purge(`trash/${id}`);
+      mkdirSync(dirname(wardTrashDir(id)), { recursive: true });
+      renameSync(wardStateDir(id), wardTrashDir(id));
+      const now = new Date();
+      utimesSync(wardTrashDir(id), now, now); // the trash clock starts now
+    }
+    await purge(`wards/${id}`, `runtime/${id}`);
     const existed = wards.delete(id);
     saveRegistry(wards);
-    if (existed) log(`removed ward ${id}`);
+    if (existed) log(`removed ward ${id}${trash ? " (data in trash)" : ""}`);
     return existed;
   });
+}
+
+function restoreFromTrash(id: string): void {
+  if (!existsSync(wardTrashDir(id)) || existsSync(wardStateDir(id))) return;
+  mkdirSync(dirname(wardStateDir(id)), { recursive: true });
+  renameSync(wardTrashDir(id), wardStateDir(id));
+  log(`ward ${id}: restored its data from the trash`);
+}
+
+async function purgeOldTrash(): Promise<string[]> {
+  const dir = join(STATE_DIR, "trash");
+  if (!existsSync(dir)) return [];
+  const cutoff = Date.now() - TRASH_DAYS * 86_400_000;
+  const old = readdirSync(dir).filter((name) => statSync(join(dir, name)).mtimeMs < cutoff);
+  if (old.length > 0) await purge(...old.map((name) => `trash/${name}`));
+  return old.map((name) => `purged ${name} from the trash`);
 }
 
 // ── Port mapping ─────────────────────────────────────────────────────────────
@@ -202,8 +286,6 @@ function attach(record: WardRecord): void {
   broker.on("message", (reply: BrokerReply, socket: unknown) => {
     if (reply.t === "ready") {
       ward.scanTimer ??= setInterval(() => scan(record.id), 1000);
-      // Re-open listeners for ports mapped in an earlier run.
-      for (const wardPort of Object.keys(record.ports)) void ensureListener(record.id, Number(wardPort)).catch(() => undefined);
       return scan(record.id);
     }
     const callback = ward.pending.get(reply.req);
@@ -247,6 +329,13 @@ function scan(id: string): void {
   }
   for (const port of ward.containerPorts) if (!found.has(port)) found.set(port, ["127.0.0.1"]);
   ward.listening.clear();
+  // Close listeners whose port went quiet, so the host sees "refused", not accept-then-reset.
+  // The registry keeps the port number for when it listens again.
+  for (const [port, server] of ward.listeners) {
+    if (found.has(port)) continue;
+    server.close();
+    ward.listeners.delete(port);
+  }
   for (const [port, hosts] of found) {
     ward.listening.set(port, hosts);
     if (!ward.listeners.has(port)) void ensureListener(id, port).catch((e: unknown) => log(`ward ${id}: port ${port}: ${String(e)}`));
@@ -312,7 +401,8 @@ async function ensureListener(id: string, wardPort: number): Promise<number> {
     }
     ward.listeners.set(wardPort, server);
     if (known !== hostPort) {
-      wards.set(id, { ...record, ports: { ...record.ports, [String(wardPort)]: hostPort } });
+      const current = wards.get(id) ?? record; // re-read: other mappings may have landed meanwhile
+      wards.set(id, { ...current, ports: { ...current.ports, [String(wardPort)]: hostPort } });
       saveRegistry(wards);
       log(`ward ${id}: port ${wardPort} → 127.0.0.1:${hostPort}`);
     }
@@ -323,8 +413,9 @@ async function ensureListener(id: string, wardPort: number): Promise<number> {
   if (stale === undefined) throw new Error(`all ${slotPorts(record.slot).length} host ports of slot ${record.slot} are in use`);
   ward.listeners.get(stale)?.close();
   ward.listeners.delete(stale);
-  const { [String(stale)]: _released, ...ports } = record.ports;
-  wards.set(id, { ...record, ports });
+  const current = wards.get(id) ?? record;
+  const { [String(stale)]: _released, ...ports } = current.ports;
+  wards.set(id, { ...current, ports });
   saveRegistry(wards);
   log(`ward ${id}: released port ${stale} (not listening) to make room`);
   return ensureListener(id, wardPort);
@@ -357,9 +448,9 @@ function forward(id: string, wardPort: number, client: Socket): void {
 // ── Reconciler ───────────────────────────────────────────────────────────────
 
 /**
- * Remove wards whose worktree is gone (the only path that deletes data) and stop
- * wards whose threads all went idle (settled, archived or deleted) after the
- * ward last started, so reopening a settled thread's terminal isn't undone.
+ * Trash wards whose worktree is gone (data is kept TRASH_DAYS), re-attach
+ * running wards wardd lost track of, and stop wards no thread needs (see
+ * shouldStop).
  */
 async function reconcile(): Promise<string[]> {
   const actions: string[] = [];
@@ -369,21 +460,23 @@ async function reconcile(): Promise<string[]> {
   } catch (error) {
     log(`reconcile: cannot read T3 thread state: ${error instanceof Error ? error.message : String(error)}`);
   }
+  const now = Date.now();
   for (const record of [...wards.values()]) {
     if (!existsSync(record.worktree)) {
-      await rm(record.id);
-      actions.push(`removed ${record.id}: worktree is gone`);
+      // No worktrees folder at all means it was moved or unmounted, not that worktrees were removed.
+      if (!existsSync(WORKTREES_DIR)) continue;
+      await rm(record.id, { trash: true });
+      actions.push(`removed ${record.id}: worktree is gone (data kept in the trash for ${TRASH_DAYS} days)`);
       continue;
     }
-    const states = threads?.get(record.worktree) ?? [];
-    const startedAt = startedAtById.get(record.id);
-    // No thread uses this worktree (or T3 is unreachable): leave the ward alone.
-    if (states.length === 0 || startedAt === undefined || !isReady(record.id)) continue;
-    if (states.every((t) => t.idleSince !== undefined && t.idleSince > startedAt)) {
-      await stop(record.id);
-      actions.push(`stopped ${record.id}: its threads are settled, archived or deleted`);
-    }
+    if (!isReady(record.id)) continue;
+    if (!live.has(record.id)) attach(record); // its broker died, or it came up while wardd was down
+    // T3 unreachable: leave running wards alone.
+    if (threads === undefined || !shouldStop(threads.get(record.worktree) ?? [], lastActivity(record.id), now)) continue;
+    await stop(record.id);
+    actions.push(`stopped ${record.id}: no active thread needs it`);
   }
+  actions.push(...(await purgeOldTrash()));
   return actions;
 }
 
@@ -475,9 +568,7 @@ function main(): void {
   const server = createHttpServer((req, res) => void handle(req, res));
   server.listen(CONTROL_SOCKET, () => log(`wardd listening on ${CONTROL_SOCKET}`));
   for (const record of wards.values()) {
-    if (!isReady(record.id)) continue;
-    startedAtById.set(record.id, new Date().toISOString());
-    attach(record);
+    if (isReady(record.id)) attach(record);
   }
   watchWorktreeParents();
   void runReconcile();
