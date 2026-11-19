@@ -36,7 +36,7 @@ Connections through a mapped port end with a reset when their ward stops or `war
 
 ## Upgrade
 
-`git pull`, then `systemctl --user restart wardd`. Running wards keep the settings they started with (their TCP table size, host ports) until they next start.
+`git pull`, then `systemctl --user restart wardd`. The restart resets connections open through mapped ports; wards and what runs in them carry on. Running wards keep the settings they started with (their TCP table size, host ports) until they next start.
 
 ## Develop
 

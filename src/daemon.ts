@@ -283,12 +283,14 @@ function stop(id: string, worktree?: string): Promise<boolean> {
 }
 
 /**
- * Stop a running ward's containers with a short grace period, so one that ignores
- * SIGTERM doesn't hold the unit's stop for its whole timeout and leave it failed.
+ * Stop a running ward's containers before its unit, with Docker's default 10-second grace
+ * period: long enough for a database to shut down cleanly, and short enough that a
+ * container ignoring SIGTERM doesn't hold the unit's stop for its whole timeout and
+ * leave it failed.
  */
 async function stopContainers(id: string): Promise<void> {
   if (!isReady(id)) return;
-  await run("podman", ["--url", `unix://${join(wardRuntimeDir(id), "podman/podman.sock")}`, "stop", "--all", "--time", "2"], { timeout: 10_000 }).catch(
+  await run("podman", ["--url", `unix://${join(wardRuntimeDir(id), "podman/podman.sock")}`, "stop", "--all", "--time", "10"], { timeout: 20_000 }).catch(
     (e: unknown) => log(`ward ${id}: stopping its containers: ${e instanceof Error ? e.message.split("\n")[0] : String(e)}`),
   );
 }
