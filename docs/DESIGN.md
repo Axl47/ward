@@ -65,7 +65,7 @@ T3's device tools stay the source of truth for who holds which AVD; Ward doesn't
 | Event | Ward action |
 | --- | --- |
 | First command in a worktree (lazy) | `up`: create namespaces, unit, slot, Podman service |
-| Every thread on the worktree settled, and the latest settled after the ward's last start or command, or nothing has run for 30 minutes since | `stop`: kill processes (open terminals included) and containers, release host ports; keep volumes so the next command resumes |
+| Every thread on the worktree settled, and the latest settled after the ward's last start, command, or terminal input, or none of those for 30 minutes | `stop`: kill processes (open terminals included) and containers, release host ports; keep volumes so the next command resumes |
 | No active thread on the worktree (its threads were archived or deleted) and no command for 30 minutes | `stop` |
 | Worktree removed | `rm`: move the ward's data, including the container store and volumes, to a trash; it comes back if the same worktree reappears within 7 days, then it is purged. `ward rm` also uses the trash; `ward rm --now` deletes at once |
 

@@ -111,19 +111,20 @@ function lastActivity(id: string): number {
 }
 
 function terminalInputTimes(id: string): number[] {
+  let procs: string[];
   try {
-    const procs = readFileSync(join(readFileSync(join(wardRuntimeDir(id), "cgroup"), "utf8").trim(), "cgroup.procs"), "utf8");
-    const ptys = new Set(procs.split("\n").filter(Boolean).map((pid) => {
-      try {
-        return readlinkSync(`/proc/${pid}/fd/0`);
-      } catch {
-        return "";
-      }
-    }));
-    return [...ptys].filter((pty) => pty.startsWith("/dev/pts/")).map((pty) => statSync(pty).atimeMs);
+    procs = readFileSync(join(readFileSync(join(wardRuntimeDir(id), "cgroup"), "utf8").trim(), "cgroup.procs"), "utf8").split("\n").filter(Boolean);
   } catch {
     return [];
   }
+  return procs.flatMap((pid) => {
+    try {
+      // stat through /proc so a terminal that closes meanwhile only drops itself
+      return readlinkSync(`/proc/${pid}/fd/0`).startsWith("/dev/pts/") ? [statSync(`/proc/${pid}/fd/0`).atimeMs] : [];
+    } catch {
+      return [];
+    }
+  });
 }
 
 /**
@@ -226,8 +227,16 @@ async function waitReady(id: string): Promise<void> {
   throw new Error(`ward ${id} did not become ready within ${READY_TIMEOUT_MS / 1000}s`);
 }
 
-function stop(id: string): Promise<boolean> {
+/**
+ * Whether ward id still belongs to worktree (when given). Checked inside the
+ * per-id lock: a queued request must not act on a colliding worktree's ward
+ * that took over the id meanwhile.
+ */
+const owns = (id: string, worktree: string | undefined) => worktree === undefined || wards.get(id)?.worktree === worktree;
+
+function stop(id: string, worktree?: string): Promise<boolean> {
   return serialized(id, async () => {
+    if (!owns(id, worktree)) return false;
     const wasRunning = isReady(id) || live.has(id);
     await systemctl("stop", unitName(id)).catch(() => undefined);
     detach(id);
@@ -255,18 +264,19 @@ const purge = (...targets: string[]) => run(join(WARD_HOME, "libexec/ward-purge"
  * Remove a ward. With trash, its data moves to the trash for TRASH_DAYS and
  * comes back if the same worktree reappears; otherwise it is deleted now.
  */
-function rm(id: string, { trash = false } = {}): Promise<boolean> {
+function rm(id: string, { trash = false, worktree }: { trash?: boolean; worktree?: string } = {}): Promise<boolean> {
   return serialized(id, async () => {
+    if (!owns(id, worktree)) return false;
     await systemctl("stop", unitName(id)).catch(() => undefined);
     detach(id);
-    const worktree = wards.get(id)?.worktree;
-    if (trash && worktree !== undefined && existsSync(wardStateDir(id))) {
-      const dest = wardTrashDir(id, worktree);
+    const recorded = wards.get(id)?.worktree;
+    if (trash && recorded !== undefined && existsSync(wardStateDir(id))) {
+      const dest = wardTrashDir(id, recorded);
       await purge(`trash/${basename(dest)}`);
       mkdirSync(dirname(dest), { recursive: true });
-      renameSync(wardStateDir(id), dest);
       const now = new Date();
-      utimesSync(dest, now, now); // the trash clock starts now
+      utimesSync(wardStateDir(id), now, now); // the trash clock starts now, even if wardd dies mid-move
+      renameSync(wardStateDir(id), dest);
     }
     await purge(`wards/${id}`, `runtime/${id}`);
     const existed = wards.delete(id);
@@ -557,16 +567,15 @@ async function reconcile(): Promise<string[]> {
     if (!existsSync(record.worktree)) {
       // No worktrees folder at all means it was moved or unmounted, not that worktrees were removed.
       if (!existsSync(WORKTREES_DIR)) continue;
-      await rm(record.id, { trash: true });
-      actions.push(`removed ${record.id}: worktree is gone (data kept in the trash for ${TRASH_DAYS} days)`);
+      if (await rm(record.id, { trash: true, worktree: record.worktree }))
+        actions.push(`removed ${record.id}: worktree is gone (data kept in the trash for ${TRASH_DAYS} days)`);
       continue;
     }
     if (!isReady(record.id)) continue;
     if (!live.has(record.id)) attach(record); // its broker died, or it came up while wardd was down
     // T3 unreachable: leave running wards alone.
     if (threads === undefined || !shouldStop(threads.get(record.worktree) ?? [], lastActivity(record.id), now)) continue;
-    await stop(record.id);
-    actions.push(`stopped ${record.id}: no active thread needs it`);
+    if (await stop(record.id, record.worktree)) actions.push(`stopped ${record.id}: no active thread needs it`);
   }
   actions.push(...(await purgeOldTrash()));
   return actions;
@@ -614,8 +623,8 @@ const requireRecord = (id: string, worktree?: string) => {
 
 const handlers: Handlers = {
   "POST /up": ({ worktree }) => up(worktree).finally(watchWorktreeParents),
-  "POST /stop": async ({ id, worktree }) => ({ stopped: await stop(requireRecord(id, worktree).id) }),
-  "POST /rm": async ({ id, worktree, now }) => ({ removed: await rm(requireRecord(id, worktree).id, { trash: !now }) }),
+  "POST /stop": async ({ id, worktree }) => ({ stopped: await stop(requireRecord(id, worktree).id, worktree) }),
+  "POST /rm": async ({ id, worktree, now }) => ({ removed: await rm(requireRecord(id, worktree).id, { trash: !now, ...(worktree === undefined ? {} : { worktree }) }) }),
   "POST /port": async ({ id, port }) => {
     if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error(`bad port ${port}`);
     requireRecord(id);
