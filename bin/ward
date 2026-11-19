@@ -5,6 +5,8 @@
 # src/cli.ts.
 set -eu
 . "$(dirname -- "$(readlink -f -- "$0")")/../libexec/ward-lib.sh"
+# Set by the commands below, never taken from the environment.
+desktop= running=
 
 ward_node() {
   node_bin=${WARD_NODE:-$(command -v node || true)}
@@ -19,6 +21,7 @@ ward_enter() {
   pid=$(cat "$rt/pid" 2>/dev/null || true)
   # The root check keeps two folders whose names sanitize alike out of one ward.
   if [ ! -e "$rt/ready" ] || [ -z "$pid" ] || [ ! -e "/proc/$pid" ] || [ "$(cat "$rt/root" 2>/dev/null)" != "$WARD_ROOT" ]; then
+    [ -z "${running:-}" ] || { echo "ward: ward $WARD_ID is not running" >&2; exit 1; }
     rc=0
     "$0" up --worktree "$WARD_ROOT" --quiet >&2 || rc=$?
     if [ $rc = 3 ]; then   # wardd says this folder isn't warded
@@ -37,13 +40,16 @@ ward_enter() {
 }
 
 # ward exec [--worktree DIR] -- CMD...: run CMD inside DIR's ward, or directly
-# when DIR is not a T3 worktree of an enabled project.
+# when DIR is not a T3 worktree of an enabled project. With --running (wardd's
+# own, for what must never run outside a ward or start one), it fails instead
+# unless the ward is up.
 ward_exec() {
   dir=
   while [ $# -gt 0 ]; do
     case "$1" in
       --worktree) dir=$2; shift 2 ;;
       --worktree=*) dir=${1#*=}; shift ;;
+      --running) running=1; shift ;;
       --) shift; break ;;
       *) break ;;
     esac
@@ -52,6 +58,7 @@ ward_exec() {
   [ -n "$dir" ] || dir=$(pwd -P)
   dir=$(readlink -f -- "$dir" 2>/dev/null || printf '%s' "$dir")
   if [ -n "${WARD_ID:-}" ] || ! ward_resolve "$dir" || ! ward_enabled "$WARD_REPO"; then
+    [ -z "$running" ] || { echo "ward: $dir is not a warded worktree" >&2; exit 3; }
     exec "$@"   # already inside a ward, or not a warded worktree
   fi
   ward_enter "$@"
