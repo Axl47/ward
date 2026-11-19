@@ -11,6 +11,8 @@ exec unshare $(ward_map_args) --setuid 0 --setgid 0 --mount --propagation privat
   chown 0:0 "$1" "$2"
   mount --bind /run/systemd/resolve "$2"
   mount -t tmpfs tmpfs /run
+  # Podman as root records short-name aliases in /var/cache/containers, which is the host'"'"'s.
+  mount -t tmpfs tmpfs /var/cache
   mkdir -p /run/lock /run/systemd/resolve
   mount --move "$2" /run/systemd/resolve
   export HOME="$2" CONTAINERS_CONF=/dev/null

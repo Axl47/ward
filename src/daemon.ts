@@ -4,7 +4,7 @@
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, watch, writeFileSync, type FSWatcher } from "node:fs";
 import { createServer as createHttpServer, request as httpRequest, type ClientRequest, type IncomingMessage, type ServerResponse } from "node:http";
-import { createServer, type Server, type Socket } from "node:net";
+import { type Server, type Socket } from "node:net";
 import { userInfo } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { promisify } from "node:util";
@@ -24,8 +24,9 @@ import {
   wardTrashDir,
   WORKTREES_DIR,
 } from "./paths.ts";
+import { wardHostPorts } from "./hostports.ts";
 import { listeningPorts } from "./procnet.ts";
-import { splice } from "./splice.ts";
+import { mappedServer, splice } from "./splice.ts";
 import { freeSlot, loadRegistry, MAX_SLOTS, saveRegistry, slotPorts, type WardRecord } from "./registry.ts";
 import { shouldStop, threadsByWorktree, type ThreadState } from "./t3state.ts";
 
@@ -56,6 +57,11 @@ interface LiveWard {
   /** A container list request is in flight; another is wanted after it. */
   refreshing: boolean;
   refreshAgain: boolean;
+  /** A failed container list is retried, backing off, until one succeeds. */
+  refreshRetry: NodeJS.Timeout | undefined;
+  refreshFailures: number;
+  /** Both sockets of every connection through a mapped port, so detach can reset them. */
+  readonly connections: Set<Socket>;
   nextReq: number;
   /** Host ports pasta forwards into the ward; they listen inside it but aren't the ward's own. */
   readonly hostPorts: ReadonlySet<number>;
@@ -140,9 +146,16 @@ function sdkOverlay(sdk: string, overlay: string, shim: string): void {
     symlinkSync(entry === "adb" ? shim : join(sdk, "platform-tools", entry), join(overlay, "platform-tools", entry));
 }
 
+/** Write the host ports pasta forwards in, read by ward-init-root; only when the ward starts, since pasta keeps the ones it started with. */
+function writeHostPorts(record: WardRecord): void {
+  mkdirSync(wardRuntimeDir(record.id), { recursive: true });
+  writeFileSync(join(wardRuntimeDir(record.id), "host-ports"), wardHostPorts(projectHostPorts(record.repo)).join(","));
+}
+
+/** The env `ward exec` loads; rewritten on every `up` so env changes reach running wards. */
 function writeEnvFile(record: WardRecord): void {
   const rt = wardRuntimeDir(record.id);
-  const hostPorts = [...new Set([...HOST_PORTS, ...projectHostPorts(record.repo)])].join(",");
+  const hostPorts = readHostPorts(record.id).join(",");
   const podman = `unix://${rt}/podman/podman.sock`;
   const shims = join(WARD_HOME, "shims");
   const vars: Record<string, string> = {
@@ -156,7 +169,7 @@ function writeEnvFile(record: WardRecord): void {
     // the classic builder runs in the ward's Podman.
     DOCKER_BUILDKIT: "0",
     COMPOSE_BAKE: "false",
-    // Takes effect when the ward next starts, like the file below.
+    // What this ward's pasta forwards, from when it started.
     WARD_HOST_PORTS: hostPorts,
   };
   const sdk = process.env.ANDROID_HOME;
@@ -169,8 +182,6 @@ function writeEnvFile(record: WardRecord): void {
   lines.push(`PATH=${shellQuote(shims)}:"$PATH"`);
   mkdirSync(rt, { recursive: true });
   writeFileSync(join(rt, "env"), lines.join("\n") + "\n");
-  // Read by ward-init-root when the ward starts: host ports pasta forwards in.
-  writeFileSync(join(rt, "host-ports"), hostPorts);
   // Which worktree owns this id; bin/ward checks it before joining.
   writeFileSync(join(rt, "root"), record.worktree);
 }
@@ -208,11 +219,14 @@ async function up(worktree: string): Promise<UpResult> {
       saveRegistry(wards);
       log(`ward ${record.id} got slot ${record.slot}`);
     }
-    if (!isReady(record.id)) {
-      writeEnvFile(record); // only on start: pasta keeps the host ports it started with
+    const starting = !isReady(record.id);
+    if (starting) writeHostPorts(record);
+    writeEnvFile(record);
+    if (starting) {
       await systemctl("start", unitName(record.id));
       await waitReady(record.id);
       log(`started ward ${record.id}`);
+      for (const line of initLog(record.id).filter((l) => l.startsWith("ward: warning"))) log(`ward ${record.id}: ${line}`);
     }
     if (!live.has(record.id)) attach(record);
     if (!lastThreads?.has(record.worktree)) void runReconcile(); // learn which threads use it
@@ -220,13 +234,27 @@ async function up(worktree: string): Promise<UpResult> {
   });
 }
 
+/**
+ * Lines the ward's init scripts wrote to stderr in its last start. They go to a
+ * file because journald drops what is written from inside the ward's user namespace.
+ */
+function initLog(id: string): string[] {
+  try {
+    return readFileSync(join(wardRuntimeDir(id), "init.log"), "utf8").split("\n").filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
 async function waitReady(id: string): Promise<void> {
   const deadline = Date.now() + READY_TIMEOUT_MS;
   while (Date.now() < deadline) {
     if (isReady(id)) return;
     const state = await systemctl("is-active", unitName(id)).then((r) => r.stdout.trim(), (e: { stdout?: string }) => e.stdout?.trim() ?? "unknown");
-    if (state === "failed" || state === "inactive")
-      throw new Error(`ward ${id} failed to start; see \`journalctl --user -u ${unitName(id)}\``);
+    if (state === "failed" || state === "inactive") {
+      const tail = initLog(id).slice(-15);
+      throw new Error(`ward ${id} failed to start${tail.length ? `:\n${tail.join("\n")}` : `; see \`journalctl --user -u ${unitName(id)}\``}`);
+    }
     await new Promise((r) => setTimeout(r, 50));
   }
   throw new Error(`ward ${id} did not become ready within ${READY_TIMEOUT_MS / 1000}s`);
@@ -243,11 +271,23 @@ function stop(id: string, worktree?: string): Promise<boolean> {
   return serialized(id, async () => {
     if (!owns(id, worktree)) return false;
     const wasRunning = isReady(id) || live.has(id);
-    await systemctl("stop", unitName(id)).catch(() => undefined);
     detach(id);
+    await stopContainers(id);
+    await systemctl("stop", unitName(id)).catch(() => undefined);
     if (wasRunning) log(`stopped ward ${id}`);
     return wasRunning;
   });
+}
+
+/**
+ * Stop a running ward's containers with a short grace period, so one that ignores
+ * SIGTERM doesn't hold the unit's stop for its whole timeout and leave it failed.
+ */
+async function stopContainers(id: string): Promise<void> {
+  if (!isReady(id)) return;
+  await run("podman", ["--url", `unix://${join(wardRuntimeDir(id), "podman/podman.sock")}`, "stop", "--all", "--time", "2"], { timeout: 10_000 }).catch(
+    (e: unknown) => log(`ward ${id}: stopping its containers: ${e instanceof Error ? e.message.split("\n")[0] : String(e)}`),
+  );
 }
 
 /** A free slot, else the slot of the stopped ward unused the longest. */
@@ -272,8 +312,9 @@ const purge = (...targets: string[]) => run(join(WARD_HOME, "libexec/ward-purge"
 function rm(id: string, { trash = false, worktree }: { trash?: boolean; worktree?: string } = {}): Promise<boolean> {
   return serialized(id, async () => {
     if (!owns(id, worktree)) return false;
-    await systemctl("stop", unitName(id)).catch(() => undefined);
     detach(id);
+    await stopContainers(id);
+    await systemctl("stop", unitName(id)).catch(() => undefined);
     const recorded = wards.get(id)?.worktree;
     if (trash && recorded !== undefined && existsSync(wardStateDir(id))) {
       const dest = wardTrashDir(id, recorded);
@@ -340,6 +381,9 @@ function attach(record: WardRecord): void {
     events: undefined,
     refreshing: false,
     refreshAgain: false,
+    refreshRetry: undefined,
+    refreshFailures: 0,
+    connections: new Set(),
     nextReq: 1,
     hostPorts: new Set([53, ...readHostPorts(record.id)]),
   };
@@ -376,7 +420,16 @@ function detach(id: string): void {
   if (ward === undefined) return;
   live.delete(id);
   clearInterval(ward.scanTimer);
+  clearTimeout(ward.refreshRetry);
   ward.events?.destroy();
+  // A reset, not a clean end: a client must not take a cut-off download for a complete one.
+  for (const socket of ward.connections) {
+    try {
+      socket.resetAndDestroy();
+    } catch {
+      socket.destroy();
+    }
+  }
   for (const stopHealthcheck of ward.health.values()) stopHealthcheck();
   for (const server of ward.listeners.values()) server.close();
   for (const callback of ward.pending.values()) callback({ t: "failed", req: 0, message: "ward stopped" }, undefined);
@@ -434,28 +487,36 @@ interface PodmanContainer {
   }> | null;
 }
 
-/** GET a path on the ward's Podman API; onBody gets the body of a 200 reply. Never rejects. */
-function podmanRequest(id: string, path: string, onBody?: (body: string) => void, timeoutMs = 2000): Promise<void> {
+/**
+ * GET a path on the ward's Podman API; onBody gets the body of a 200 reply.
+ * Resolves true once onBody ran without throwing, false on any failure. Never rejects.
+ */
+function podmanRequest(id: string, path: string, onBody?: (body: string) => void, timeoutMs = 2000): Promise<boolean> {
   return new Promise((resolve) => {
     const req = httpRequest({ socketPath: join(wardRuntimeDir(id), "podman/podman.sock"), path, timeout: timeoutMs }, (res) => {
       let data = "";
       res.setEncoding("utf8");
       res.on("data", (chunk: string) => (data += chunk));
       res.on("end", () => {
+        if (res.statusCode !== 200) return resolve(false);
         try {
-          if (res.statusCode === 200) onBody?.(data);
+          onBody?.(data);
+          resolve(true);
         } catch (error) {
           log(`ward ${id}: unexpected Podman reply for ${path}: ${String(error)}`);
+          resolve(false);
         }
-        resolve();
       });
     });
-    req.on("error", () => resolve());
-    req.on("close", () => resolve()); // also when Podman hangs up mid-reply
+    req.on("error", () => resolve(false));
+    req.on("close", () => resolve(false)); // also when Podman hangs up mid-reply; no-op after a resolve
     req.on("timeout", () => req.destroy());
     req.end();
   });
 }
+
+/** Delay before retry n (1-based) of a failed Podman request: 1, 2, 4, … capped at 30 s. */
+const retryMs = (n: number) => Math.min(1000 * 2 ** (n - 1), 30_000);
 
 const DEFAULT_HEALTH_MS = 30_000; // Podman's default interval and timeout
 const nsToMs = (ns: unknown) => (typeof ns === "number" && ns > 0 ? ns / 1e6 : DEFAULT_HEALTH_MS);
@@ -464,8 +525,10 @@ const CONTAINER_CHANGES = new Set(["start", "died", "remove"]);
 
 /**
  * Follow the ward's Podman events and refresh the container list on each change,
- * so nothing polls Podman while its containers stay as they are. Reconnects
- * (and refreshes, to catch what it missed) while the ward is live.
+ * so nothing polls Podman while its containers stay as they are. Lists once on
+ * each (re)connect: Podman sends the stream's headers only with its first event,
+ * so the list can't wait for them; the `since` replay covers the gap. Reconnects
+ * while the ward is live.
  */
 function watchContainers(id: string, ward: LiveWard): void {
   if (live.get(id) !== ward) return;
@@ -473,8 +536,6 @@ function watchContainers(id: string, ward: LiveWard): void {
   // Replays the last moments too, so a container that starts around the first list isn't missed.
   const since = Math.floor(Date.now() / 1000) - 1;
   const req = httpRequest({ socketPath: join(wardRuntimeDir(id), "podman/podman.sock"), path: `/v4.0.0/libpod/events?stream=true&since=${since}&filters=${filters}` }, (res) => {
-    clearTimeout(stalled);
-    refreshContainers(id, ward);
     let pending = "";
     res.setEncoding("utf8");
     res.on("data", (chunk: string) => {
@@ -496,11 +557,9 @@ function watchContainers(id: string, ward: LiveWard): void {
       if (changed) refreshContainers(id, ward);
     });
   });
-  // A Podman that never answers still gets its containers listed, and the stream retried.
-  const stalled = setTimeout(() => {
-    refreshContainers(id, ward);
-    req.destroy();
-  }, 5000);
+  // Only for connecting: once connected, an idle stream legitimately stays silent.
+  const stalled = setTimeout(() => req.destroy(), 5000);
+  req.on("socket", (socket) => socket.once("connect", () => clearTimeout(stalled)));
   req.on("error", () => undefined); // "close" follows and reconnects
   req.on("close", () => {
     clearTimeout(stalled);
@@ -509,12 +568,15 @@ function watchContainers(id: string, ward: LiveWard): void {
   });
   ward.events = req;
   req.end();
+  refreshContainers(id, ward);
 }
 
 /** Re-read the ward's containers: published ports and healthchecks. Coalesces overlapping calls. */
 function refreshContainers(id: string, ward: LiveWard): void {
   if (ward.refreshing) return void (ward.refreshAgain = true);
   ward.refreshing = true;
+  clearTimeout(ward.refreshRetry);
+  ward.refreshRetry = undefined;
   void podmanRequest(id, "/v4.0.0/libpod/containers/json", (data) => {
     const containers = JSON.parse(data) as PodmanContainer[];
     if (!Array.isArray(containers) || live.get(id) !== ward) return;
@@ -527,11 +589,16 @@ function refreshContainers(id: string, ward: LiveWard): void {
     );
     trackHealthchecks(id, ward, containers);
     void scan(id);
-  }).then(() => {
+  }).then((ok) => {
     ward.refreshing = false;
+    if (live.get(id) !== ward) return;
+    // Podman may be busy (a `compose up`): until a list succeeds, published ports stay unmapped.
+    ward.refreshFailures = ok ? 0 : ward.refreshFailures + 1;
     if (ward.refreshAgain) {
       ward.refreshAgain = false;
       refreshContainers(id, ward);
+    } else if (!ok) {
+      ward.refreshRetry = setTimeout(() => refreshContainers(id, ward), retryMs(ward.refreshFailures));
     }
   });
 }
@@ -560,19 +627,25 @@ function trackHealthchecks(id: string, ward: LiveWard, containers: readonly Podm
     ward.health.set(container, stopHealthcheck);
     let intervalMs = DEFAULT_HEALTH_MS;
     let timeoutMs = DEFAULT_HEALTH_MS;
-    void podmanRequest(id, `/v4.0.0/libpod/containers/${container}/json`, (body) => {
-      const check = (JSON.parse(body) as { Config?: { Healthcheck?: { Interval?: unknown; Timeout?: unknown } } }).Config?.Healthcheck;
-      intervalMs = nsToMs(check?.Interval);
-      timeoutMs = nsToMs(check?.Timeout);
-    }).then(() => {
-      const run = () => {
-        if (stopped) return;
-        void podmanRequest(id, `/v4.0.0/libpod/containers/${container}/healthcheck`, undefined, timeoutMs + 5000).then(() => {
-          if (!stopped) timer = setTimeout(run, intervalMs);
-        });
-      };
-      run();
-    });
+    const run = () => {
+      if (stopped) return;
+      void podmanRequest(id, `/v4.0.0/libpod/containers/${container}/healthcheck`, undefined, timeoutMs + 5000).then(() => {
+        if (!stopped) timer = setTimeout(run, intervalMs);
+      });
+    };
+    // The interval and timeout come from an inspect, retried until it succeeds.
+    const inspect = (attempt: number) => {
+      if (stopped) return;
+      void podmanRequest(id, `/v4.0.0/libpod/containers/${container}/json`, (body) => {
+        const check = (JSON.parse(body) as { Config?: { Healthcheck?: { Interval?: unknown; Timeout?: unknown } } }).Config?.Healthcheck;
+        intervalMs = nsToMs(check?.Interval);
+        timeoutMs = nsToMs(check?.Timeout);
+      }).then((ok) => {
+        if (ok) run();
+        else if (!stopped) timer = setTimeout(() => inspect(attempt + 1), retryMs(attempt));
+      });
+    };
+    inspect(1);
   }
 }
 
@@ -588,7 +661,7 @@ async function ensureListener(id: string, wardPort: number): Promise<number> {
   const taken = new Set(Object.values(record.ports));
   const candidates = [...(known === undefined ? [] : [known]), ...slotPorts(record.slot).filter((p) => !taken.has(p))];
   for (const hostPort of candidates) {
-    const server = createServer({ pauseOnConnect: true, allowHalfOpen: true }, (socket) => forward(id, wardPort, socket));
+    const server = mappedServer((socket) => forward(id, wardPort, socket));
     const ok = await new Promise<boolean>((resolve) => {
       server.once("error", () => resolve(false));
       server.listen(hostPort, "127.0.0.1", () => resolve(true));
@@ -635,6 +708,10 @@ function forward(id: string, wardPort: number, client: Socket): void {
   ward.pending.set(req, (reply, upstream) => {
     clearTimeout(timer);
     if (reply.t !== "connected" || upstream === undefined) return void client.destroy();
+    for (const socket of [client, upstream]) {
+      ward.connections.add(socket);
+      socket.once("close", () => ward.connections.delete(socket));
+    }
     splice(client, upstream);
   });
   const message: BrokerRequest = { t: "connect", req, port: wardPort, hosts: ward.listening.get(wardPort) ?? ["127.0.0.1", "::1"] };

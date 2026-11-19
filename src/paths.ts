@@ -19,9 +19,9 @@ export const WORKTREES_DIR = join(T3_HOME, "worktrees");
 export const CONTROL_SOCKET = join(RUNTIME_DIR, "wardd.sock");
 export const REGISTRY_FILE = join(STATE_DIR, "registry.json");
 
-/** Valid TCP ports in a comma-separated list; anything else is dropped. */
+/** Plain decimal TCP ports in a comma-separated list; anything else (hex, exponents, signs) is dropped. */
 export const parsePorts = (text: string) =>
-  text.split(",").map((p) => Number(p.trim())).filter((p) => Number.isInteger(p) && p > 0 && p < 65536);
+  text.split(",").map((p) => p.trim()).filter((p) => /^\d{1,5}$/.test(p)).map(Number).filter((p) => p > 0 && p < 65536);
 
 /** Host loopback ports forwarded into every ward (T3, adb); DNS (53) always is too. */
 export const HOST_PORTS: readonly number[] = parsePorts(env.WARD_HOST_PORTS ?? "3773,5037");

@@ -14,9 +14,16 @@ st=$WARD_STATE/wards/$id
 # It is made from a throwaway namespace whose tcp_child_ehash_entries gives it a
 # TCP hash table of its own: otherwise every read of its /proc/net/tcp, which
 # wardd scans each second, walks the host's whole table (3.4 ms against 0.1 ms).
+# The kernel sizes two limits from that table (TIME_WAIT buckets, SYN backlog),
+# so the ward gets the host's values back; a load test would overflow them.
+sysctl=/proc/sys/net/ipv4
+inner='{ echo "$1" > '$sysctl'/tcp_max_tw_buckets && echo "$2" > '$sysctl'/tcp_max_syn_backlog; } 2>/dev/null ||
+  echo "ward: warning: could not raise tcp_max_tw_buckets and tcp_max_syn_backlog; the ward keeps the kernel'"'"'s smaller defaults" >&2
+ip link set lo up && exec sleep infinity'
 unshare --net -- sh -c '
-  echo 4096 > /proc/sys/net/ipv4/tcp_child_ehash_entries 2>/dev/null || true
-  exec unshare --net -- sh -c "ip link set lo up && exec sleep infinity"' &
+  { echo 4096 > '$sysctl'/tcp_child_ehash_entries; } 2>/dev/null ||
+    echo "ward: warning: could not set tcp_child_ehash_entries; the ward shares the host'"'"'s TCP hash table, so port scans cost more" >&2
+  exec unshare --net -- sh -c "$1" sh "$2" "$3"' sh "$inner" "$(cat $sysctl/tcp_max_tw_buckets)" "$(cat $sysctl/tcp_max_syn_backlog)" &
 ns=$!
 for _ in $(seq 100); do
   [ "$(cat /proc/$ns/comm 2>/dev/null)" = sleep ] && break
@@ -30,8 +37,14 @@ done
 # own) and DNS (the host's stub resolver at 127.0.0.53, which /etc/resolv.conf
 # names) reach the host's loopback.
 host_ports=$(cat "$rt/host-ports" 2>/dev/null || echo "$WARD_HOST_PORTS")
+# Deduplicated, since pasta refuses a port forwarded twice (the file may be edited by hand).
 pasta_t=(-T 53)
-for p in ${host_ports//,/ }; do pasta_t+=(-T "$p"); done
+seen=" 53 "
+for p in ${host_ports//,/ }; do
+  [[ $p =~ ^[0-9]+$ && $seen != *" $p "* ]] || continue
+  seen+="$p "
+  pasta_t+=(-T "$p")
+done
 pasta --config-net --quiet --foreground -t none -u none -U 53 "${pasta_t[@]}" \
   --netns "/proc/$ns/ns/net" --runas 0:0 &
 
@@ -65,6 +78,8 @@ nsenter -n -t "$ns" -- unshare -m --propagation private -- sh -c '
   mount --bind /run/systemd/resolve "$1/resolve"
   mount --bind "$2/podman" "$1/sock"
   mount -t tmpfs tmpfs /run
+  # Podman as root records short-name aliases in /var/cache/containers, which is the host'"'"'s.
+  mount -t tmpfs tmpfs /var/cache
   mkdir -p /run/lock /run/systemd/resolve "$2/podman"
   mount --move "$1/resolve" /run/systemd/resolve
   mount --move "$1/sock" "$2/podman"

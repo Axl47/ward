@@ -30,7 +30,13 @@ ward images pull IMAGE  # pull into the image store every ward shares
 
 Wards start on the first command in a worktree. They stop once every thread on it has settled, or 30 minutes after the last command when it has no active thread. When the worktree is deleted, the ward's data goes to a trash for 7 days.
 
-Inside a ward, `sudo` doesn't work, and host services are reachable only on the ports in `WARD_HOST_PORTS` (default `3773,5037`, plus DNS) and the project's own, set with `ward enable <repo> --host-ports 39003,…` and applied when its wards next start (`ward env` shows them). `/tmp` and `XDG_RUNTIME_DIR` are the host's, shared by every ward, so keep per-worktree pid files and sockets in `TMPDIR`.
+Inside a ward, `sudo` doesn't work, and host services are reachable only on the ports in `WARD_HOST_PORTS` (default `3773,5037`, plus DNS) and the project's own, set with `ward enable <repo> --host-ports 39003,…`. The flag replaces the project's list, and a ward picks up a new list only when it next starts: `ward enable` names the running wards still on the old one (`ward stop` them to apply it now). A forwarded host port is taken inside the ward, so a server in the ward can't listen on it (`EADDRINUSE`). Port 53, Ward's own host ports (20100–29999) and lists over 200 ports in all are refused. `/tmp` and `XDG_RUNTIME_DIR` are the host's, shared by every ward, so keep per-worktree pid files and sockets in `TMPDIR`.
+
+Connections through a mapped port end with a reset when their ward stops or `wardd` restarts, so a transfer in flight fails rather than looking complete.
+
+## Upgrade
+
+`git pull`, then `systemctl --user restart wardd`. Running wards keep the settings they started with (their TCP table size, host ports) until they next start.
 
 ## Develop
 

@@ -1,11 +1,15 @@
 // The byte copy between a host-side connection and the ward-side socket the
 // broker dialed. wardd runs one per connection through a mapped port.
-import type { Socket } from "node:net";
+import { createServer, type Server, type Socket } from "node:net";
+
+/** The host-side listener of a mapped port: paused until the broker's socket arrives, half-close kept for splice. */
+export const mappedServer = (onConnection: (client: Socket) => void): Server =>
+  createServer({ pauseOnConnect: true, allowHalfOpen: true }, onConnection);
 
 /**
  * Copy both ways until both sides are done. Half-close passes through (a
  * client may send FIN and still read the reply), so `client` must come from
- * a server with allowHalfOpen; an error on either side drops both.
+ * mappedServer; an error on either side drops both.
  */
 export function splice(client: Socket, upstream: Socket): void {
   upstream.allowHalfOpen = true; // a socket received over IPC can't be created with it
