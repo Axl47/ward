@@ -1,6 +1,6 @@
 # Ward design
 
-Status: draft for review (2026-11-19).
+Status: approved 2026-11-19 and built. Where the build departed from the draft, this file now describes what was built.
 
 ## Problem
 
@@ -16,7 +16,7 @@ The threat model is accidental collision between trusted agents, not containment
 - Claude and Codex get `T3CODE_THREAD_ID`; terminals have every `T3CODE_*` variable stripped.
 - Annex already has a `PortScanner.PortDiscovery` service that watches agent-started ports.
 
-So the hooks Ward needs (wrap every process a thread starts, react to worktree removal) don't exist. They belong in Annex as one small, generic hook; everything else lives in Ward.
+So the hook Ward needs, wrapping every process a thread starts, doesn't exist. It belongs in Annex as one small hook; everything else, including reacting to worktree removal, lives in Ward.
 
 ## The isolation unit: one ward per worktree
 
@@ -35,9 +35,9 @@ host (init namespaces)                         ward "indexio/t3-d7059d66…"
 ```
 
 - **Namespaces.** `unshare --user --net` with a custom ID map: your uid maps to itself (1000), so files in the worktree stay yours and nothing runs as root (Postgres `initdb` and Chromium's sandbox both refuse root); uid 0 and the rest map to your subuid range for the container engine. Proven on this machine with a single-uid map: a server bound inside is invisible to the host, processes that join see it, and files they create are owned by you. The full subuid map is part of the spike below.
-- **cgroup.** Each ward is a systemd user unit, `ward@<id>.service`, with `Delegate=yes`. `ward exec` moves the command into that cgroup before entering the namespaces, so stopping the unit kills every process the agent started, including daemonized dev servers, and gives per-ward CPU/memory accounting and limits.
-- **Internet.** `pasta` (from `passt`) attaches to the ward's netns for outbound traffic, and forwards a short allow-list of host loopback services into it (adb server 5037).
-- **Containers.** Each ward runs its own Podman API service as root-inside-the-ward. Agents use the normal `docker` / `docker compose` CLI via `DOCKER_HOST`. Published ports land in the ward's own loopback, so `docker run -p 5432:5432 postgres` just works in every ward at once. Images are pulled once into a shared read-only store (Podman `additionalimagestores`), so wards don't re-download. This also means you never need the root-equivalent `docker` group.
+- **cgroup.** Each ward is a systemd user unit, `ward@<id>.service`, `ward exec` moves the command into that cgroup before entering the namespaces, so stopping the unit (`KillMode=control-group`) kills every process the agent started, including daemonized dev servers and container processes, and gives per-ward CPU accounting. Containers run with Podman's cgroups disabled (crun, not runc), so they share the ward's cgroup.
+- **Internet.** `pasta` (from `passt`), started as root inside the user namespace, attaches to the ward's netns for outbound traffic and forwards a short allow-list of host loopback services into it (`WARD_HOST_PORTS`, default the adb server on 5037).
+- **Containers.** Each ward runs its own Podman API service as root-inside-the-ward, in a private mount namespace with its own `/run` and `/var/lib/containers`. Agents use the normal `docker` / `docker compose` CLI via `DOCKER_HOST`. Published ports land in the ward's own loopback, so `docker run -p 5432:5432 postgres` just works in every ward at once. Images are pulled once into a shared read-only store (Podman `additionalimagestores`), so wards don't re-download. This also means you never need the root-equivalent `docker` group.
 - **Caches.** Lock-safe content-addressed caches stay shared (pnpm store, Cargo registry, Gradle caches). Per-ward: `TMPDIR` (covers Metro, Vite and most tools), the container store, and volumes.
 
 ## Ports
@@ -46,13 +46,14 @@ No allocation inside the ward: every ward can use any port, including hardcoded 
 
 - Each ward gets a slot N and a host block `20000 + 100·N … +99` (below the ephemeral range 32768+).
 - `wardd` watches the ward's listening sockets (`/proc/<pid>/net/tcp*` is per-netns) and maps each new one to the next free port in the block, stable for the ward's life: ward `:5173` → host `127.0.0.1:20103`.
-- Mechanism: a tiny broker process inside the ward creates listening and connected sockets there and hands the file descriptors to `wardd` (Unix-socket fd passing), so `wardd` owns all the plumbing and no traffic goes through the broker.
+- Mechanism: `wardd` listens on the host port itself. For each incoming connection, a tiny broker process inside the ward (joined with `nsenter`, talking over Node IPC) dials the ward port and passes the connected socket back, so no traffic goes through the broker. Ports Podman publishes are DNAT rules rather than listening sockets, so `wardd` also asks the ward's Podman API which ports its containers publish.
+- Mappings live in `~/.local/state/ward/registry.json`. When a ward's block of 100 is full, a mapping whose ward port stopped listening is released.
 
 ## How an agent finds its ports and services
 
-Mostly it doesn't need to: inside the ward, services are at their usual `localhost` ports. The ward's env carries `WARD_ID`, `DOCKER_HOST`, `TMPDIR` and, once the thread holds a device, `ANDROID_SERIAL`. For the only thing that differs, host-visible URLs, `ward ports` prints the mapping (also in `$WARD_DIR/ports.json`). Nothing is written into the worktree, so `git status` stays clean. A one-line note in the global agent instructions says this.
+Mostly it doesn't need to: inside the ward, services are at their usual `localhost` ports. The ward's env carries `WARD_ID`, `WARD_ROOT`, `DOCKER_HOST`/`CONTAINER_HOST` and a per-ward `TMPDIR`; T3's device tools still set `ANDROID_SERIAL`. For the only thing that differs, host-visible URLs, `ward ports` prints the mapping and `ward port 5173` maps one on demand. Nothing is written into the worktree, so `git status` stays clean. A one-line note in the global agent instructions says this.
 
-An MCP tool isn't needed in v1; the Annex hook below makes it redundant by translating preview URLs.
+An MCP tool isn't needed in v1. T3's port list shows each ward port at its host address, attributed to the worktree's thread.
 
 ## Emulators
 
@@ -63,33 +64,35 @@ T3's device tools stay the source of truth for who holds which AVD; Ward doesn't
 | Event | Ward action |
 | --- | --- |
 | First command in a worktree (lazy) or worktree create/restore | `up`: create namespaces, unit, slot, Podman service |
-| Thread settles | `stop`: kill processes and containers, release host ports; keep volumes so unsettling resumes |
-| Worktree removed, or its thread deleted | `rm`: destroy everything, including the container store and volumes |
+| Every thread on the worktree settled, archived or deleted since the ward last started | `stop`: kill processes and containers, release host ports; keep volumes so the next command resumes |
+| Worktree removed | `rm`: destroy everything, including the container store and volumes |
 
-Because worktrees are removed on many paths, `wardd` also runs a reconciler (every minute, plus inotify on `~/.t3/worktrees`) that reads `statev2.sqlite` read-only and applies the table above. The Annex hook makes it immediate; the reconciler makes it correct even when the hook doesn't fire (manual `git worktree remove`, crashes).
+`wardd` runs a reconciler every minute, plus within about two seconds of a change in a warded repo's worktree folder. It reads thread state from T3's orchestration API (`GET /api/orchestration/shell`) with a read-only `orchestration:read` token in `~/.config/ward/t3-token`, and applies the table above. Deleting a thread only stops its ward, because the worktree, and so the work, may outlive it; only a worktree that is gone deletes data. If T3 is unreachable, nothing is stopped. Stopping is safe to get wrong: the next command in the worktree starts the ward again.
 
 ## The Annex change
 
-One generic, Ward-agnostic hook, so Annex stays easy to rebase on upstream:
+Ward needs no lifecycle hooks from T3: wards start lazily on the first command, and the reconciler handles stop and removal. So the Annex change is only the process wrapping, behind one env var, `T3CODE_WARD_COMMAND` (the `ward` executable), in a new `apps/server/src/ward/Ward.ts` with one-line seams:
 
-- A server setting `threadEnvironment.command` (e.g. `ward`). When set, Annex runs `<cmd> up|stop|rm --worktree <path> --thread <id>` at the lifecycle points above (one funnel in `GitVcsDriverCore.removeWorktree` covers every removal path).
-- Every process Annex starts for a worktree is prefixed with `<cmd> exec --worktree <path> --`: integrated terminals, project scripts, and the Codex app-server when it's per-thread. For Claude, Annex sets `CLAUDE_CODE_SHELL_PREFIX` in the thread's spawn env, so the Claude process stays on the host (its API traffic and MCP untouched) while every Bash command runs in the ward.
-- Preview: for a ward thread, `preview_open` and `t3.json` `previewUrl` rewrite `localhost:<port>` to the mapped host port, and `PortDiscovery` reads mappings from `ward ports`.
+- Claude gets `CLAUDE_CODE_SHELL_PREFIX=ward-prefix`. Claude Code runs MCP servers, hooks and LSP servers through the same prefix, so `ward-prefix` sends only Bash tool commands (the ones that source a shell snapshot) into the ward. The Claude process, its API traffic and MCP stay on the host.
+- Codex runs one app-server per thread, but its commands go through `bash -c`, so it gets `BASH_ENV=ward-bash-env`, which re-runs the command in the ward when the working folder is a warded worktree.
+- Integrated terminals are launched as `ward exec --worktree <cwd> -- <shell>`.
+- The port scanner replaces `wardd`'s host sockets with one entry per ward port, attributed to the worktree's thread.
 
-Until that ships, Ward is usable by hand (`ward exec -- …`), which is how the parallel agent tests will run first.
+Every hook passes through untouched for folders that aren't warded worktrees, so non-worktree threads and projects without `ward enable` behave as before.
 
 ## Code shape
 
-TypeScript on Node 22, one package: the `ward` CLI and the `wardd` user daemon. Node's IPC can pass socket handles between processes, which covers the fd broker without native code. `ward exec` is a small POSIX shell script on the hot path (cgroup move + `nsenter`), since it runs on every agent command.
+TypeScript on Node 24 (run directly, no build step), one package: the `ward` CLI and the `wardd` user daemon. Node's IPC can pass socket handles between processes, which covers the fd broker without native code. `ward exec` is a small POSIX shell script on the hot path (cgroup move + `nsenter`), since it runs on every agent command.
 
-System changes on gaia-arch, recorded in omarchy-config: install `podman` and `passt`; enable `wardd.service` (user unit).
+System changes on gaia-arch, recorded in omarchy-config: install `podman`, `passt` and `crun`; subuid/subgid ranges for the user; enable `wardd.service` (user unit).
 
-## Risks and the spike that comes first
+## Risks and limits
 
-1. **Podman as root inside a custom user namespace** (overlay storage, netavark firewall rules inside the netns, cgroups disabled per container). If this fights back, the fallback is a per-ward rootless `dockerd` in the same namespaces; nothing else in the design changes.
-2. **`sudo` doesn't work inside a ward** (setuid binaries can't run in a user namespace). Agents that need system changes would need an escape hatch, e.g. `ward host -- <cmd>` going through `wardd`, or Annex keeping a project-level opt-out (projects like omarchy-config don't need wards at all). I'd make wards opt-in per project.
-3. **Codex**: if one app-server serves several threads, wrapping it per thread doesn't work and Codex commands need a different path. To confirm while building the Annex hook.
+1. **Podman as root inside a custom user namespace** worked, with cgroups disabled, crun, file event logging, and a private `/run`.
+2. **`sudo` doesn't work inside a ward** (setuid binaries can't run in a user namespace). Wards are opt-in per project (`ward enable <repo>`), so projects that need system changes simply don't enable them.
+3. **Codex** runs one app-server per thread, but wrapping the app-server would put its API traffic and MCP in the ward too, so the `BASH_ENV` hook wraps its commands instead.
+4. **Emulators** were not tested end to end: `/dev/kvm` is absent until SVM is turned on. The adb path (host server reachable from a ward, `adb reverse` rewrite) is tested without a device.
 
 ## Verification plan
 
-Three Claude subagents in three real T3 worktrees of a small test app, in parallel: each starts Vite on 5173, `docker compose up` Postgres on 5432, writes a row, and reaches the dev server from an emulator through `adb reverse`. Pass means: no port errors, each sees only its own row, each emulator loads its own ward's page, `ward rm` leaves no processes, containers or ports behind, and the reconciler cleans up a worktree removed by hand.
+Three Claude subagents in three real T3 worktrees of a small test app, in parallel: each starts a dev server on the same port, `docker compose up` Postgres on 5432, writes a row, and checks it reaches its own services. Pass means: no port errors, each sees only its own row, each ward's dev server answers on its own host port, `ward rm` leaves no processes, containers or ports behind, and the reconciler cleans up a worktree removed by hand. Emulator checks wait for KVM.
