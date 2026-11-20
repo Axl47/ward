@@ -33,12 +33,17 @@ st=$WARD_STATE/wards/$id
 # - Credentials are hidden: Ward's config folder except the enable markers (so
 #   its T3 token, even one written after the ward started), and each T3 home's
 #   userdata (T3's keys and its database of every thread) except attachments.
+# - Miranda's store is hidden (the user's screen and terminal timeline, Glosses,
+#   every agent's commands, and the control file that turns recording on),
+#   except its `shell` folder, where the bash hook in a ward's terminal leaves
+#   the commands typed there. Miranda's MCP server runs on the host and still
+#   reads the store; its CLI inside a ward doesn't.
 # Every folder above one of these that you could rename (whose parent is yours)
 # becomes a mount point too, or a ward could move it aside and put a forged copy
 # where the host looks.
 lock_down() {
-  local uid=$WARD_HOST_UID p a held=" " ancestors=() protected=()
-  for p in "$WARD_STATE" "$WARD_CONFIG" "$WARD_RUNTIME" "$WARD_HOME" "$HOME"/.t3*/userdata "$WARD_T3/userdata" \
+  local uid=$WARD_HOST_UID p a held=" " ancestors=() protected=() miranda=${MIRANDA_HOME:-$HOME/.local/share/miranda}
+  for p in "$WARD_STATE" "$WARD_CONFIG" "$WARD_RUNTIME" "$WARD_HOME" "$HOME"/.t3*/userdata "$WARD_T3/userdata" "$miranda" \
            "/run/user/$uid/systemd" "/run/user/$uid/bus" "${XDG_RUNTIME_DIR:-}/systemd" "${XDG_RUNTIME_DIR:-}/bus"; do
     [ -e "$p" ] && [ ! -L "$p" ] || continue
     p=$(readlink -f -- "$p")
@@ -81,6 +86,7 @@ lock_down() {
         seal "$p" ;;
       "$(readlink -f "$WARD_CONFIG")") hide_except "$p" enabled; [ ! -d "$p/enabled" ] || seal "$p/enabled" ;;
       "$(readlink -f "$WARD_HOME")") ro "$p"; seal "$p" ;;
+      "$(readlink -f "$miranda")") hide_except "$p" shell ;;
       */userdata) hide_except "$p" attachments ;;
       */bus) if [ -S "$rt/bus" ]; then mount --bind "$rt/bus" "$p"; else mount --bind /dev/null "$p"; fi ;;
       */systemd) mount -t tmpfs -o ro,mode=0755,size=4k tmpfs "$p" ;;
