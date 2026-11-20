@@ -201,8 +201,8 @@ async function prepareGradle(record: WardRecord, starting: boolean): Promise<str
     const { stdout } = await systemctl("show", "--property=ActiveState,ControlGroup", unitName(record.id));
     const unit = Object.fromEntries(stdout.split("\n").map((line) => line.split(/=(.*)/s)));
     if (unit.ActiveState !== "inactive" && unit.ActiveState !== "failed") throw new Error(`its unit is ${unit.ActiveState}`);
-    if (unit.ControlGroup && readFileSync(join("/sys/fs/cgroup", unit.ControlGroup, "cgroup.procs"), "utf8").trim() !== "")
-      throw new Error("its unit still has processes");
+    const procs = join("/sys/fs/cgroup", unit.ControlGroup ?? "", "cgroup.procs");
+    if (unit.ControlGroup && existsSync(procs) && readFileSync(procs, "utf8").trim() !== "") throw new Error("its unit still has processes");
     const kotlin = realFolder(KOTLIN_DAEMON_DIR);
     // own-homes is NAME PATH lines that ward-init-root reads word by word.
     if ([source, kotlin].some((path) => /\n|^\s|\s$/.test(path))) throw new Error("a path starts or ends with a space, or has a line break");
