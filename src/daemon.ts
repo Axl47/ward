@@ -317,11 +317,16 @@ async function stopContainers(id: string): Promise<void> {
   );
 }
 
-/** Whether the ward's desktop is up; bin/ward makes the same check. */
+/**
+ * Whether the desktop is up; bin/ward makes the same check. A ward's desktop
+ * writes its pid as the ward's PID namespace sees it, so it is looked up in the
+ * ward's /proc, through the namespace holder; a thread's desktop runs on the host.
+ */
 function desktopReady(id: string): boolean {
   const dir = wardDesktopDir(id);
   try {
-    return existsSync(join(dir, "env")) && existsSync(`/proc/${Number(readFileSync(join(dir, "pid"), "utf8"))}`);
+    const proc = wards.has(id) ? `/proc/${readPid(id) ?? 0}/root/proc` : "/proc";
+    return existsSync(join(dir, "env")) && existsSync(`${proc}/${Number(readFileSync(join(dir, "pid"), "utf8"))}`);
   } catch {
     return false;
   }
