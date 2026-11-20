@@ -493,14 +493,16 @@ async function reconcileThreadDesktops(threads: readonly ShellThread[] | undefin
       if (thread === undefined) return rmSync(desktopStateDir(id), { recursive: true, force: true }); // left by a start that never finished
       if (threads === undefined) return; // T3 unreachable: leave it as it is
       const known = threads.find((t) => t.id === thread);
-      let used = Math.max(lastActivity(id), statSync(marker).mtimeMs);
+      const used = Math.max(lastActivity(id), statSync(marker).mtimeMs);
       const done = shouldStop(known ? [{ idleSince: idleSince(known) }] : [], used, now);
       if (running && (done || now - used > DESKTOP_IDLE_MS)) {
         await clearThreadDesktop(id);
-        used = statSync(marker).mtimeMs; // its last use, with any call that came in while it stopped
         actions.push(`stopped the desktop of thread ${thread}: ${!done ? `unused for ${DESKTOP_IDLE_MS / 3_600_000} h` : known ? "the thread is done" : "unused, and T3 has no such thread"}`);
+      } else if (!known && now - used > NO_THREAD_GRACE_MS) {
+        // Never in the pass that stopped it: the marker now holds the last use, with any
+        // call that came in during the stop, and a call that raced it has a pass to come back.
+        rmSync(desktopStateDir(id), { recursive: true, force: true });
       }
-      if (!known && now - used > NO_THREAD_GRACE_MS) rmSync(desktopStateDir(id), { recursive: true, force: true });
     }).catch((error: unknown) => log(`reconcile: thread desktop ${id}: ${error instanceof Error ? error.message : String(error)}`));
   }
   return actions;
