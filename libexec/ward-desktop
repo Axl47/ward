@@ -105,18 +105,19 @@ ln -s "$TMPDIR" "$dir/tmp"
 # The config folder here mirrors yours: folders of its own, with a link to each
 # of your files. Programs read your settings, and what they create stays in the
 # ward, so an app that first starts here makes its profile here. Your existing
-# app profiles are left out (folders holding Chromium's `Local State`, at most
-# one folder down, or Firefox's `profiles.ini`), so those apps start fresh too.
+# app profiles are left out (folders holding Chromium's `Local State` or
+# Firefox's `profiles.ini`, at most one folder down), so those apps start fresh too.
 # Redone at every start: new files of yours appear, links to deleted ones go.
 yours=${XDG_CONFIG_HOME:-$HOME/.config}
 find "$data/config" -xtype l -lname "$yours/*" -delete
 for entry in "$yours"/* "$yours"/.[!.]* "$yours"/..?*; do
   [ -e "$entry" ] || continue
   profile=
-  for mark in "$entry/Local State" "$entry"/*/"Local State" "$entry/profiles.ini"; do
+  for mark in "$entry/Local State" "$entry"/*/"Local State" "$entry/profiles.ini" "$entry"/*/profiles.ini; do
     [ ! -e "$mark" ] || profile=1
   done
-  [ -n "$profile" ] || cp -asn "$entry" "$data/config/" || true
+  # -H: an entry that is itself a link to a folder (dotfiles kept elsewhere) is mirrored like any folder.
+  [ -n "$profile" ] || cp -asHn "$entry" "$data/config/" || true
 done
 # Named through the short link, like TMPDIR: a shell reads `env`, and the state folder's path may hold spaces.
 export XDG_RUNTIME_DIR="$dir" DBUS_SESSION_BUS_ADDRESS="unix:path=$dir/bus" WLR_BACKENDS=headless WLR_LIBINPUT_NO_DEVICES=1 \
