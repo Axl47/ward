@@ -2,8 +2,9 @@
 # A ward's private desktop: a session bus of its own and a headless Umbriel on
 # it, with a runtime folder of their own as XDG_RUNTIME_DIR, so nothing on it
 # reaches the live session's compositor, bus names, notifications, portals or
-# audio. wardd runs `ward-desktop ID` through `ward exec`, inside the ward;
-# it is up once $rt/desktop/env exists (see docs/DESIGN.md, "Desktops").
+# sound server (with Caliban installed, it gets a sound server of its own).
+# wardd runs `ward-desktop ID` through `ward exec`, inside the ward; it is up
+# once $rt/desktop/env exists (see docs/DESIGN.md, "Desktops").
 set -eu
 . "$(dirname -- "$(readlink -f -- "$0")")/ward-lib.sh"
 
@@ -124,14 +125,29 @@ export XDG_RUNTIME_DIR="$dir" DBUS_SESSION_BUS_ADDRESS="unix:path=$dir/bus" WLR_
   TMPDIR="$dir/tmp" XDG_CACHE_HOME="$data/cache" XDG_CONFIG_HOME="$dir/tmp/desktop/config"
 dbus-daemon --config-file="$dir/bus.conf" --nofork &
 bus=$!
+sound=
 # The bus goes with the compositor, however this ends, and the accessibility bus
 # with the bus; the registry is only on the latter, so it is stopped by pid. So
-# do `env`, which says the desktop is up, and the desktop's name.
-# shellcheck disable=SC2046 # no registry.pid, no second pid
-trap 'kill "$bus" $(cat "$dir/registry.pid" 2>/dev/null) 2>/dev/null; rm -f "$dir/env" "$dir"' EXIT
+# do the sound server, `env`, which says the desktop is up, and the desktop's name.
+# shellcheck disable=SC2046,SC2086 # no registry.pid or sound server, no pid
+trap 'kill "$bus" $sound $(cat "$dir/registry.pid" 2>/dev/null) 2>/dev/null; rm -f "$dir/env" "$dir"' EXIT
 for _ in $(seq 100); do
   [ -S "$dir/bus" ] && break
   sleep 0.02
 done
 [ -S "$dir/bus" ] || { echo "ward: the desktop's session bus did not start" >&2; exit 1; }
+# Sound, when Caliban is installed: a PipeWire of the desktop's own with one null
+# sink, its sockets in $dir, so apps here play into a sink Caliban can record
+# rather than finding no server (Caliban's docs/DESIGN.md, "Sound server"). An
+# app picks its sound server when it starts, so the desktop isn't up (no `env`)
+# until the server is ready, waiting at most 3 s; without it, no sound, as before.
+if command -v caliban >/dev/null; then
+  caliban audio serve &
+  sound=$!
+  for _ in $(seq 30); do
+    [ ! -e "$dir/caliban/ready" ] && kill -0 "$sound" 2>/dev/null || break
+    sleep 0.1
+  done
+  [ -e "$dir/caliban/ready" ] || echo "ward: warning: Caliban's sound server did not start; apps on this desktop have no sound" >&2
+fi
 umbriel -c "$dir/umbriel.toml" -s "'$WARD_LIBEXEC/ward-desktop' --session"
