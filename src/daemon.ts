@@ -511,12 +511,20 @@ function noteThreadWard(thread: ShellThread): string | undefined {
  * and removed once T3 no longer lists the thread with that worktree. One whose
  * ward went away (the worktree removed, the project disabled, the thread
  * deleted but still listed) stays, and bin/ward then gives the thread a desktop
- * of its own. A thread T3 moved off its worktree gets the marker of a thread
- * desktop in the note's place. Either way a thread that was private doesn't
- * fall to the live session while T3 lists it.
+ * of its own. A thread T3 moved off its worktree, or no longer lists, gets the
+ * marker of a thread desktop in the note's place, which the reconciler forgets
+ * by the thread desktops' rule. So a thread that was private doesn't fall to the
+ * live session at once.
  */
 function syncThreadNotes(threads: readonly ShellThread[]): void {
-  for (const thread of threads) noteThreadWard(thread);
+  const failed = (what: string, error: unknown) => log(`reconcile: thread note ${what}: ${error instanceof Error ? error.message : String(error)}`);
+  for (const thread of threads) {
+    try {
+      noteThreadWard(thread);
+    } catch (error) {
+      failed(thread.id, error); // the others still get theirs
+    }
+  }
   if (!existsSync(THREAD_WARDS_DIR)) return;
   const roots = new Map(threads.map((t) => [t.id, t.worktreePath ? locate(t.worktreePath)?.root : undefined]));
   for (const name of readdirSync(THREAD_WARDS_DIR)) {
@@ -528,14 +536,14 @@ function syncThreadNotes(threads: readonly ShellThread[]): void {
       }
       const [root, thread] = readFileSync(note, "utf8").split("\n");
       if (thread !== undefined && roots.get(thread) === root) continue;
-      if (thread !== undefined && roots.has(thread) && !existsSync(threadMarker(name))) {
+      // The marker keeps its plain asks private; the reconciler forgets it as it does any thread's desktop.
+      if (thread !== undefined && !existsSync(threadMarker(name))) {
         mkdirSync(desktopStateDir(name), { recursive: true });
         writeFileSync(threadMarker(name), thread);
       }
       rmSync(note, { force: true });
     } catch (error) {
-      // The note stays for the next pass; the others still get their turn.
-      log(`reconcile: thread note ${name}: ${error instanceof Error ? error.message : String(error)}`);
+      failed(name, error); // it stays for the next pass; the others still get their turn
     }
   }
 }
