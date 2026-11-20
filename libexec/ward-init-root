@@ -26,6 +26,10 @@ st=$WARD_STATE/wards/$id
 #   the ward's own state folder (TMPDIR, Podman), its desktop's folder and its
 #   Podman socket's folder: the host trusts these files (it runs the checkout,
 #   sources the env file, reads the enable markers that set the host ports).
+# - Of Ward's state folder the ward sees only its own folder and the shared image
+#   store (read-only): every ward's container root is the same host uid (one
+#   subuid range), so other wards' stores, the trash and thread desktops' data
+#   are kept from it by not being there.
 # - Credentials are hidden: Ward's config folder except the enable markers (so
 #   its T3 token, even one written after the ward started), and each T3 home's
 #   userdata (T3's keys and its database of every thread) except attachments.
@@ -47,7 +51,8 @@ lock_down() {
       [[ $held == *" $a "* ]] || { mount --rbind "$a" "$a"; held+="$a "; }
     done
   done
-  # hide_except DIR ENTRY...: an empty, read-only DIR showing only the ENTRY folders it had.
+  # hide_except DIR ENTRY...: an empty, read-only DIR showing only the ENTRY folders
+  # (paths under DIR) it had, each as writable as before.
   hide_except() {
     local dir=$1 e owner
     shift
@@ -56,7 +61,7 @@ lock_down() {
     mount -t tmpfs -o mode=0755,size=64k tmpfs "$dir"
     chown "$owner" "$dir"
     for e in "$@"; do
-      if [ -d "/proc/self/fd/9/$e" ]; then mkdir "$dir/$e"; mount --no-canonicalize --bind "/proc/self/fd/9/$e" "$dir/$e"; fi
+      if [ -d "/proc/self/fd/9/$e" ]; then mkdir -p "$dir/$e"; mount --no-canonicalize --bind "/proc/self/fd/9/$e" "$dir/$e"; fi
     done
     exec 9<&-
     seal "$dir"
@@ -66,7 +71,7 @@ lock_down() {
   seal() { mount -o remount,bind,ro "$1"; }
   for p in "${protected[@]}"; do
     case $p in
-      "$(readlink -f "$WARD_STATE")") ro "$p"; rw "$st"; seal "$p" ;;
+      "$(readlink -f "$WARD_STATE")") hide_except "$p" images "wards/$id"; seal "$p/images" ;;
       "$(readlink -f "$WARD_RUNTIME")") ro "$p"; rw "$rt/desktop"; rw "$rt/podman"; seal "$p" ;;
       "$(readlink -f "$WARD_CONFIG")") hide_except "$p" enabled; [ ! -d "$p/enabled" ] || seal "$p/enabled" ;;
       "$(readlink -f "$WARD_HOME")") ro "$p"; seal "$p" ;;
