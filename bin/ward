@@ -36,7 +36,11 @@ ward_enter() {
   # The reconciler won't stop a ward used after its threads went idle.
   : > "$rt/last-exec"
   set -a; . "$rt/env"; [ -z "${desktop:-}" ] || ward_desktop_env; set +a
-  exec nsenter -U -n -t "$pid" --setuid "$(id -u)" --setgid "$(id -g)" -- "$@"
+  # Joining the mount namespace moves the command to its root, so it goes back to
+  # this folder by path, inside: a directory carried in from outside would let
+  # relative paths reach what the ward's namespace hides (libexec/ward-init-root).
+  exec nsenter -U -m -n -t "$pid" --setuid "$(id -u)" --setgid "$(id -g)" -- \
+    /bin/sh -c 'cd -- "$0" || { echo "ward: $0 is not visible inside the ward" >&2; exit 1; }; exec "$@"' "$(pwd)" "$@"
 }
 
 # ward exec [--worktree DIR] -- CMD...: run CMD inside DIR's ward, or directly
@@ -62,13 +66,6 @@ ward_exec() {
     exec "$@"   # already inside a ward, or not a warded worktree
   fi
   ward_enter "$@"
-}
-
-# Put this shell on the desktop whose owner's runtime folder is $1 (default: ward $WARD_ID's).
-ward_desktop_env() {
-  # shellcheck disable=SC2086
-  unset $WARD_DESKTOP_UNSET
-  . "${1:-$WARD_RUNTIME/$WARD_ID}/desktop/env"
 }
 
 # ward_thread_desktop [CMD...]: the desktop of the calling T3 thread, where there

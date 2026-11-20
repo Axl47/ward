@@ -1,14 +1,94 @@
 #!/bin/bash
 # Root inside the ward's user namespace, still in the host network namespace.
-# Creates the ward's network namespace, connects it to the internet with pasta,
-# starts the ward's Podman API service, then waits; if any part exits, the unit
-# stops and systemd kills the rest.
+# First (as `ward-init-root ID`) it locks down the ward's view of the files the
+# host trusts, then (as `ward-init-root --inner ID`, one user namespace further
+# in) creates the ward's network namespace, connects it to the internet with
+# pasta, starts the ward's Podman API service, then waits; if any part exits,
+# the unit stops and systemd kills the rest. It reports to ward-init on fd 3.
 set -euo pipefail
 [ -n "${WARD_TRACE:-}" ] && set -x
 . "$(dirname -- "$(readlink -f -- "$0")")/ward-lib.sh"
+nested=
+[ "$1" != --inner ] || { nested=1; shift; }
 id=$1
 rt=$WARD_RUNTIME/$id
 st=$WARD_STATE/wards/$id
+
+# 0. The ward's mount namespace, which `ward exec` joins with the rest. Made here,
+# in the outer user namespace, and entered from the inner one below: mounts a
+# namespace inherits from one owned by a more privileged user namespace are
+# locked, so not even the ward's root (Podman's, which any ward command can drive)
+# can unmount or remount them. In it:
+# - Your systemd user manager and raw session bus are gone: `systemd-run --user`
+#   would start a process outside the ward's namespaces and cgroup that outlives
+#   it. The bus is ward-init's proxy, which passes only the keyring.
+# - Ward's own state, config, runtime folder and checkout are read-only, except
+#   the ward's own state folder (TMPDIR, Podman), its desktop's folder and its
+#   Podman socket's folder: the host trusts these files (it runs the checkout,
+#   sources the env file, reads the enable markers that set the host ports).
+# - Credentials are hidden: Ward's config folder except the enable markers (so
+#   its T3 token, even one written after the ward started), and each T3 home's
+#   userdata (T3's keys and its database of every thread) except attachments.
+# Every folder above one of these that you could rename (whose parent is yours)
+# becomes a mount point too, or a ward could move it aside and put a forged copy
+# where the host looks.
+lock_down() {
+  local uid=$WARD_HOST_UID p a held=" " ancestors=() protected=()
+  for p in "$WARD_STATE" "$WARD_CONFIG" "$WARD_RUNTIME" "$WARD_HOME" "$HOME"/.t3*/userdata "$WARD_T3/userdata" \
+           "/run/user/$uid/systemd" "/run/user/$uid/bus" "${XDG_RUNTIME_DIR:-}/systemd" "${XDG_RUNTIME_DIR:-}/bus"; do
+    [ -e "$p" ] && [ ! -L "$p" ] || continue
+    p=$(readlink -f -- "$p")
+    [[ " ${protected[*]} " != *" $p "* ]] || continue
+    protected+=("$p")
+    ancestors=()
+    a=$p
+    while a=$(dirname -- "$a"); [ "$a" != / ] && [ -w "$(dirname -- "$a")" ]; do ancestors=("$a" "${ancestors[@]}"); done
+    for a in "${ancestors[@]}"; do
+      [[ $held == *" $a "* ]] || { mount --rbind "$a" "$a"; held+="$a "; }
+    done
+  done
+  # hide_except DIR ENTRY...: an empty, read-only DIR showing only the ENTRY folders it had.
+  hide_except() {
+    local dir=$1 e owner
+    shift
+    exec 9<"$dir"
+    owner=$(stat -c %u:%g "$dir")
+    mount -t tmpfs -o mode=0755,size=64k tmpfs "$dir"
+    chown "$owner" "$dir"
+    for e in "$@"; do
+      if [ -d "/proc/self/fd/9/$e" ]; then mkdir "$dir/$e"; mount --no-canonicalize --bind "/proc/self/fd/9/$e" "$dir/$e"; fi
+    done
+    exec 9<&-
+    seal "$dir"
+  }
+  ro() { mount --bind "$1" "$1"; }
+  rw() { if [ -d "$1" ]; then mount --bind "$1" "$1"; fi; }
+  seal() { mount -o remount,bind,ro "$1"; }
+  for p in "${protected[@]}"; do
+    case $p in
+      "$(readlink -f "$WARD_STATE")") ro "$p"; rw "$st"; seal "$p" ;;
+      "$(readlink -f "$WARD_RUNTIME")") ro "$p"; rw "$rt/desktop"; rw "$rt/podman"; seal "$p" ;;
+      "$(readlink -f "$WARD_CONFIG")") hide_except "$p" enabled; [ ! -d "$p/enabled" ] || seal "$p/enabled" ;;
+      "$(readlink -f "$WARD_HOME")") ro "$p"; seal "$p" ;;
+      */userdata) hide_except "$p" attachments ;;
+      */bus) if [ -S "$rt/bus" ]; then mount --bind "$rt/bus" "$p"; else mount --bind /dev/null "$p"; fi ;;
+      */systemd) mount -t tmpfs -o ro,mode=0755,size=4k tmpfs "$p" ;;
+    esac
+  done
+}
+
+# The inner user namespace maps every id the outer one does to itself.
+nested_map_args() {
+  local inner outer count
+  while read -r inner outer count; do printf -- '--map-users=%s:%s:%s ' "$inner" "$inner" "$count"; done </proc/self/uid_map
+  while read -r inner outer count; do printf -- '--map-groups=%s:%s:%s ' "$inner" "$inner" "$count"; done </proc/self/gid_map
+}
+
+if [ -z "$nested" ]; then
+  lock_down
+  # shellcheck disable=SC2046 # word splitting of the map flags is intended
+  exec unshare --user --mount $(nested_map_args) --setuid 0 --setgid 0 -- "$0" --inner "$id"
+fi
 
 # 1. Network namespace, held open by a sleep whose pid is the ward's join point.
 # It is made from a throwaway namespace whose tcp_child_ehash_entries gives it a
@@ -98,8 +178,8 @@ done
 chmod 755 "$rt/podman"
 chmod 666 "$rt/podman/podman.sock"
 
-echo "$ns" > "$rt/pid"
-touch "$rt/ready"
+echo "pid=$ns" >&3
+echo ready >&3
 wait -n
 echo "ward: a ward process exited; stopping ward $id" >&2
 exit 1
