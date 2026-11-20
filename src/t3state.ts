@@ -72,6 +72,9 @@ export function threadState(thread: ShellThread): ThreadState | undefined {
 /** How long a ward whose worktree has no active thread (archived, deleted, or none) may sit unused. */
 export const NO_THREAD_GRACE_MS = 30 * 60_000;
 
+/** How long a thread's desktop may run with nothing asking for it, even while its thread is active. */
+export const DESKTOP_IDLE_MS = 2 * 60 * 60_000;
+
 /**
  * Whether the reconciler should stop a running ward, or a thread's desktop
  * (its threads: that one, if T3 knows it). lastActivity is when it

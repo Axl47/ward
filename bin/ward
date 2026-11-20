@@ -73,22 +73,27 @@ ward_desktop_env() {
 
 # ward_thread_desktop [CMD...]: the desktop of the calling T3 thread, where there
 # is no ward: the same desktop in no namespace, as a unit of its own that wardd
-# starts and, once the thread is done, stops. CMD starts it and joins its cgroup,
-# so it stops with the desktop. Printing never starts it (exit 3 until a command
-# has): Puck asks before every call, and a thread that opened nothing on a
-# private desktop is on your screen on purpose.
+# starts and, once the thread is done or it sat unused, stops. CMD starts it and
+# joins its cgroup, so it stops with the desktop. Printing starts it only for a
+# thread that has had one (wardd leaves a marker): until a thread opens something
+# of its own, exit 3 keeps Puck on your screen, where such a thread works on
+# purpose; afterwards a desktop that stopped comes back empty, and Puck never
+# falls back to your screen in the middle of a thread.
 ward_thread_desktop() {
   unset WARD_ID WARD_REPO WARD_ROOT   # ward_resolve's, of a folder that has no ward
-  rt=$WARD_RUNTIME/$(ward_thread_desktop_id "$T3CODE_THREAD_ID")
+  id=$(ward_thread_desktop_id "$T3CODE_THREAD_ID")
+  rt=$WARD_RUNTIME/$id
   pid=$(cat "$rt/desktop/pid" 2>/dev/null || true)
   if [ ! -e "$rt/desktop/env" ] || [ -z "$pid" ] || [ ! -e "/proc/$pid" ]; then
-    [ $# -gt 0 ] || { echo "ward: this thread has no desktop yet; \`ward desktop -- CMD\` starts one" >&2; exit 3; }
+    [ $# -gt 0 ] || [ -e "$WARD_STATE/desktops/$id/thread" ] || { echo "ward: this thread has no desktop yet; \`ward desktop -- CMD\` starts one" >&2; exit 3; }
     (ward_node desktop --thread "$T3CODE_THREAD_ID") >&2 || exit 1
+    pid=$(cat "$rt/desktop/pid")
   fi
-  # The reconciler won't stop a desktop still in use once T3 has forgotten its thread.
+  # The reconciler stops a desktop nothing has asked for in a while.
   : > "$rt/last-exec"
   [ $# -gt 0 ] || exec cat "$rt/desktop/env"
-  echo $$ > "$(cat "$rt/cgroup")/cgroup.procs" || { echo "ward: could not join the cgroup of this thread's desktop" >&2; exit 1; }
+  # The unit's cgroup, read from the desktop's own process: there is no file to wait for.
+  echo $$ > "/sys/fs/cgroup$(cut -d: -f3 "/proc/$pid/cgroup")/cgroup.procs" || { echo "ward: could not join the cgroup of this thread's desktop" >&2; exit 1; }
   set -a; ward_desktop_env "$rt"; set +a
   exec "$@"
 }
@@ -97,8 +102,8 @@ ward_thread_desktop() {
 # on a session bus of its own), started on first use: the ward's, or where there
 # is no ward the calling T3 thread's own (ward_thread_desktop). Prints the
 # desktop's environment, or runs CMD on it, in the ward if there is one; exits 3
-# where there is neither, or no desktop to print, never running CMD on the live
-# session instead. The checks here keep wardd and Node out of every call after
+# where there is neither, or a thread that never opened one asks for it to be
+# printed, never running CMD on the live session instead. The checks here keep wardd and Node out of every call after
 # the first (Puck asks before each tool call).
 ward_desktop() {
   dir= named=

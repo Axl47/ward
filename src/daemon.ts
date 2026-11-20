@@ -33,7 +33,7 @@ import { wardHostPorts } from "./hostports.ts";
 import { listeningPorts } from "./procnet.ts";
 import { mappedServer, splice } from "./splice.ts";
 import { freeSlot, loadRegistry, MAX_SLOTS, saveRegistry, slotPorts, type WardRecord } from "./registry.ts";
-import { idleSince, loadThreads, shouldStop, threadsByWorktree, type ShellThread, type ThreadState } from "./t3state.ts";
+import { DESKTOP_IDLE_MS, idleSince, loadThreads, NO_THREAD_GRACE_MS, shouldStop, threadsByWorktree, type ShellThread, type ThreadState } from "./t3state.ts";
 
 const run = promisify(execFile);
 const { uid, gid } = userInfo();
@@ -384,11 +384,14 @@ async function desktopUp(id: string, name: string, logFile: string, exited: () =
 /** What the desktop's unit gets from wardd: where Ward keeps things, and where its programs are found. */
 const UNIT_ENV = ["PATH", "XDG_RUNTIME_DIR", "XDG_STATE_HOME", "XDG_CONFIG_HOME", "WARD_T3_HOME"] as const;
 
+/** Kept from a thread's first desktop until T3 forgets the thread: the thread's id. bin/ward restarts a stopped desktop only where it exists. */
+const threadMarker = (id: string) => join(desktopStateDir(id), "thread");
+
 /**
  * Start the private desktop of a T3 thread that has no ward, unless it is up:
  * the same libexec/ward-desktop, in no namespace, as a transient unit of its
  * own, so `ward desktop -- CMD` can join its cgroup and stopping the unit stops
- * everything on it. The reconciler stops it when the thread is done.
+ * everything on it. The reconciler stops it when the thread is done or it sat unused.
  */
 function threadDesktop(thread: string, cwd: string): Promise<Record<string, never>> {
   if (typeof thread !== "string" || thread === "" || typeof cwd !== "string") throw new Error("a thread's desktop needs the thread's id and a folder");
@@ -401,7 +404,8 @@ function threadDesktop(thread: string, cwd: string): Promise<Record<string, neve
     await clearThreadDesktop(id); // one whose compositor died, and its app profiles
     mkdirSync(join(state, "tmp"), { recursive: true });
     mkdirSync(rt, { recursive: true });
-    writeFileSync(join(rt, "thread"), thread);
+    writeFileSync(threadMarker(id), thread);
+    writeFileSync(join(rt, "last-exec"), "");
     const logFile = join(state, "desktop.log");
     writeFileSync(logFile, "");
     const active = async () => (await systemctl("is-active", unit).catch(() => ({ stdout: "" }))).stdout.trim();
@@ -429,14 +433,17 @@ function threadDesktop(thread: string, cwd: string): Promise<Record<string, neve
       rmSync(rt, { recursive: true, force: true });
       throw error;
     }
+    // Only for lastActivity, which counts typing in a terminal on the desktop; bin/ward finds the cgroup itself.
     const { stdout } = await systemctl("show", "--property=ControlGroup", "--value", unit);
     writeFileSync(join(rt, "cgroup"), `/sys/fs/cgroup${stdout.trim()}\n`);
-    writeFileSync(join(rt, "last-exec"), "");
     return {};
   });
 }
 
-/** Stop a thread's desktop, if it runs, and remove its folders and its short names. Call it holding the id's lock. */
+/**
+ * Stop a thread's desktop, if it runs, and remove its runtime folder, its short
+ * names and what apps kept there. Its marker and its last log stay. Call it holding the id's lock.
+ */
 async function clearThreadDesktop(id: string): Promise<void> {
   await systemctl("stop", desktopUnitName(id)).catch(() => undefined);
   for (const name of readdirSync(RUNTIME_DIR)) {
@@ -446,28 +453,38 @@ async function clearThreadDesktop(id: string): Promise<void> {
     } catch {}
   }
   rmSync(wardRuntimeDir(id), { recursive: true, force: true });
-  rmSync(desktopStateDir(id), { recursive: true, force: true });
+  rmSync(join(desktopStateDir(id), "tmp"), { recursive: true, force: true });
 }
 
 /**
- * Stop the desktops of threads that are done (shouldStop, with the thread as its
- * one thread, or none when T3 doesn't know it), and clear away those that died.
+ * Thread desktops: stop those whose thread is done (shouldStop, with the thread
+ * as its one thread, or none when T3 doesn't know it) or that nothing asked for
+ * in DESKTOP_IDLE_MS, clear away those that died, and forget the threads T3 has
+ * forgotten. A stopped desktop comes back, empty, when its thread next asks.
  */
 async function reconcileThreadDesktops(threads: readonly ShellThread[] | undefined, now: number): Promise<string[]> {
   const actions: string[] = [];
-  const ids = new Set([...readdirSync(RUNTIME_DIR), ...(existsSync(join(STATE_DIR, "desktops")) ? readdirSync(join(STATE_DIR, "desktops")) : [])]);
+  const kept = join(STATE_DIR, "desktops");
+  const ids = new Set([...readdirSync(RUNTIME_DIR), ...(existsSync(kept) ? readdirSync(kept) : [])]);
   for (const id of ids) {
     // A thread desktop's id has no dot; a ward's (whose repo may be named t-…) has one.
     if (!/^t-[A-Za-z0-9_-]+$/.test(id) || locks.has(id)) continue;
     await serialized(id, async () => {
-      if (!desktopReady(id)) return clearThreadDesktop(id);
-      if (threads === undefined) return; // T3 unreachable: leave it running
-      const thread = readFileSync(join(wardRuntimeDir(id), "thread"), "utf8");
+      const marker = threadMarker(id);
+      const thread = existsSync(marker) ? readFileSync(marker, "utf8") : undefined;
+      const running = thread !== undefined && desktopReady(id);
+      if (!running && (existsSync(wardRuntimeDir(id)) || existsSync(join(desktopStateDir(id), "tmp")))) await clearThreadDesktop(id);
+      if (thread === undefined) return rmSync(desktopStateDir(id), { recursive: true, force: true }); // left by a start that never finished
+      if (threads === undefined) return; // T3 unreachable: leave it as it is
       const known = threads.find((t) => t.id === thread);
-      if (!shouldStop(known ? [{ idleSince: idleSince(known) }] : [], lastActivity(id), now)) return;
-      await clearThreadDesktop(id);
-      actions.push(`stopped the desktop of thread ${thread}: ${known ? "the thread is done" : "unused, and T3 has no such thread"}`);
-    });
+      const used = Math.max(lastActivity(id), statSync(marker).mtimeMs);
+      const done = shouldStop(known ? [{ idleSince: idleSince(known) }] : [], used, now);
+      if (running && (done || now - used > DESKTOP_IDLE_MS)) {
+        await clearThreadDesktop(id);
+        actions.push(`stopped the desktop of thread ${thread}: ${!done ? `unused for ${DESKTOP_IDLE_MS / 3_600_000} h` : known ? "the thread is done" : "unused, and T3 has no such thread"}`);
+      }
+      if (!known && now - used > NO_THREAD_GRACE_MS) rmSync(desktopStateDir(id), { recursive: true, force: true });
+    }).catch((error: unknown) => log(`reconcile: thread desktop ${id}: ${error instanceof Error ? error.message : String(error)}`));
   }
   return actions;
 }
