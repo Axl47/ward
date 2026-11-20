@@ -72,7 +72,11 @@ lock_down() {
   for p in "${protected[@]}"; do
     case $p in
       "$(readlink -f "$WARD_STATE")") hide_except "$p" images "wards/$id"; seal "$p/images" ;;
-      "$(readlink -f "$WARD_RUNTIME")") ro "$p"; rw "$rt/desktop"; rw "$rt/podman"; seal "$p" ;;
+      "$(readlink -f "$WARD_RUNTIME")")
+        ro "$p"; rw "$rt/desktop"; rw "$rt/podman"
+        # Every thread's commands as `ward exec` records them (bin/ward: ward_record_start).
+        [ ! -d "$p/activity" ] || mount -t tmpfs -o ro,mode=0700,size=4k tmpfs "$p/activity"
+        seal "$p" ;;
       "$(readlink -f "$WARD_CONFIG")") hide_except "$p" enabled; [ ! -d "$p/enabled" ] || seal "$p/enabled" ;;
       "$(readlink -f "$WARD_HOME")") ro "$p"; seal "$p" ;;
       */userdata) hide_except "$p" attachments ;;

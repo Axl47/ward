@@ -18,6 +18,11 @@ ward_node() {
 # starting it if needed; with $desktop set, on the ward's desktop.
 ward_enter() {
   rt=$WARD_RUNTIME/$WARD_ID
+  # While a recorder asks for it (ward_recording), this command leaves a record. What
+  # it needs is read now: the time, before a ward that has to start, and the caller's
+  # cgroup (the agent T3 started), before this shell joins the ward's.
+  rec= t0= cg=
+  if ward_recording; then rec=1 t0=$EPOCHREALTIME; read -r cg < /proc/self/cgroup || cg=; fi
   pid=$(cat "$rt/pid" 2>/dev/null || true)
   # The root check keeps two folders whose names sanitize alike out of one ward.
   if [ ! -e "$rt/ready" ] || [ -z "$pid" ] || [ ! -e "/proc/$pid" ] || [ "$(cat "$rt/root" 2>/dev/null)" != "$WARD_ROOT" ]; then
@@ -43,8 +48,70 @@ ward_enter() {
   # command's pid without passing signals on; so the command gets SIGTERM when
   # nsenter dies (a caller killing this pid), and doesn't start if it already has
   # (its parent is then the ward's init).
-  exec nsenter -U -m -n -p -t "$pid" --setuid "$(id -u)" --setgid "$(id -g)" -- setpriv --pdeathsig TERM -- \
-    /bin/sh -c '[ "$PPID" != 1 ] || exit 143; cd -- "$0" || { echo "ward: $0 is not visible inside the ward" >&2; exit 1; }; exec "$@"' "$(pwd)" "$@"
+  here=$(pwd)
+  [ -z "$rec" ] || ward_record_start "$@" || rec=
+  set -- nsenter -U -m -n -p -t "$pid" --setuid "$(id -u)" --setgid "$(id -g)" -- setpriv --pdeathsig TERM -- \
+    /bin/sh -c '[ "$PPID" != 1 ] || exit 143; cd -- "$0" || { echo "ward: $0 is not visible inside the ward" >&2; exit 1; }; exec "$@"' "$here" "$@"
+  [ -n "$rec" ] || exec "$@"
+  ward_record_run "$@"
+}
+
+# Activity records, for a recorder on the host (Miranda's Mneme) that profiles how
+# agents work. The recorder switches them on by keeping $WARD_RUNTIME/activity/on
+# fresh: its first word is the time it was last written, in epoch seconds, and it
+# counts for 30 s. wardd creates the folder and every ward has an empty one in its
+# place (libexec/ward-init-root), so what is written here can't be read or forged
+# from inside a ward. Only commands of a T3 thread are recorded (a terminal of yours
+# has no T3CODE_THREAD_ID), and only by a bash that has $EPOCHREALTIME; with no
+# recorder, `ward exec` runs exactly as before.
+ward_recording() {
+  [ -n "${T3CODE_THREAD_ID:-}" ] && [ -n "${EPOCHREALTIME:-}" ] || return 1
+  _on=
+  { read -r _on _ < "$WARD_RUNTIME/activity/on"; } 2>/dev/null || return 1
+  case $_on in ''|*[!0-9]*) return 1 ;; esac
+  [ $((EPOCHSECONDS - _on)) -le 30 ]
+}
+
+# ward_record_start CMD...: write the start record, activity/exec.<pid>.<time>. Its
+# fields each end in a NUL (no argument can hold one, so nothing needs escaping):
+#   E1, when `ward exec` was called, when the command starts (the difference is a
+#   ward that had to start), the caller's cgroup, its T3 thread, the ward, the
+#   folder, CLAUDE_CODE_SESSION_ID, each argument of CMD cut to 4000 characters, E1.
+# The command's output is never recorded.
+ward_record_start() {
+  rec_file=$WARD_RUNTIME/activity/exec.$$.${t0%[.,]*}${t0#*[.,]}
+  { printf 'E1\0%s\0%s\0%s\0%s\0%s\0%s\0%s\0' "$t0" "$EPOCHREALTIME" "$cg" "$T3CODE_THREAD_ID" "$WARD_ID" "$here" "${CLAUDE_CODE_SESSION_ID:-}" &&
+    printf '%.4000s\0' "$@" && printf 'E1.\0'; } 2>/dev/null > "$rec_file"
+}
+
+# ward_record_run NSENTER...: run the command as a child instead of becoming it, and
+# when it ends write the end record beside the start record (<same name>.end): E2,
+# the exit status, the time, the output of `times` (the CPU time of this shell and of
+# the command's process tree), E2. A command killed with this shell leaves no end
+# record; the recorder closes it when it sees this pid gone.
+#
+# The caller must not notice the difference. The child keeps this shell's stdin
+# (`<&0`: a background command would get /dev/null) and the default SIGINT and
+# SIGQUIT (a background command would ignore them); TERM, INT and HUP sent to this
+# pid are passed on; if this shell is killed outright the child gets SIGTERM
+# (pdeathsig); and a command that died of a signal makes this shell die of the same.
+ward_record_run() {
+  setpriv --pdeathsig TERM -- env --default-signal=INT --default-signal=QUIT "$@" <&0 &
+  child=$!
+  trap 'kill -TERM "$child" 2>/dev/null' TERM
+  trap 'kill -INT "$child" 2>/dev/null' INT
+  trap 'kill -HUP "$child" 2>/dev/null' HUP
+  rc=0
+  while :; do
+    wait "$child" && rc=0 || rc=$?
+    kill -0 "$child" 2>/dev/null || break
+  done
+  { printf 'E2\0%s\0%s\0' "$rc" "$EPOCHREALTIME" && times && printf '\0E2.\0'; } 2>/dev/null > "$rec_file.end" || :
+  if [ "$rc" -gt 128 ] && [ "$rc" -le 192 ]; then
+    trap - TERM INT HUP
+    kill -s "$((rc - 128))" $$ 2>/dev/null || :
+  fi
+  exit "$rc"
 }
 
 # ward exec [--worktree DIR] -- CMD...: run CMD inside DIR's ward, or directly

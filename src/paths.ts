@@ -19,6 +19,11 @@ export const T3_HOME = env.WARD_T3_HOME ?? join(home, ".t3");
 export const DEFAULT_WORKTREES_DIR = join(T3_HOME, "worktrees");
 const T3_SETTINGS = join(T3_HOME, "userdata/settings.json");
 export const CONTROL_SOCKET = join(RUNTIME_DIR, "wardd.sock");
+/**
+ * Where `ward exec` leaves a record of each agent command while a recorder (Miranda) asks for
+ * them (bin/ward: ward_recording). wardd creates it; every ward sees an empty folder in its place.
+ */
+export const ACTIVITY_DIR = join(RUNTIME_DIR, "activity");
 export const REGISTRY_FILE = join(STATE_DIR, "registry.json");
 
 /** Plain decimal TCP ports in a comma-separated list; anything else (hex, exponents, signs) is dropped. */
