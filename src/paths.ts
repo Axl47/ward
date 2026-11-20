@@ -73,7 +73,7 @@ export const wardTrashDir = (id: string, worktree: string) =>
 export const threadDesktopId = (thread: string) => `t-${sanitize(thread)}`;
 /** A thread desktop's caches, app profiles and log, kept only while it runs. */
 export const desktopStateDir = (id: string) => join(STATE_DIR, "desktops", id);
-/** One note per T3 thread that used a ward's desktop (bin/ward: ward_thread_note): the ward's worktree, then the thread's id. */
+/** One note per T3 thread of a warded worktree (bin/ward: ward_thread_note): the worktree, then the thread's id. */
 export const THREAD_WARDS_DIR = join(STATE_DIR, "thread-wards");
 /** The transient unit a thread's desktop runs as. */
 export const desktopUnitName = (id: string) => `${env.WARD_UNIT ?? "ward"}-desktop-${id}.service`;

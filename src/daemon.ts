@@ -406,11 +406,21 @@ const threadMarker = (id: string) => join(desktopStateDir(id), "thread");
  * own, so `ward desktop -- CMD` can join its cgroup and stopping the unit stops
  * everything on it. The reconciler stops it when the thread is done or it sat unused.
  */
-function threadDesktop(thread: string, cwd: string): Promise<Record<string, never>> {
+function threadDesktop(thread: string, cwd: string): Promise<{ ward?: string }> {
   if (typeof thread !== "string" || thread === "" || typeof cwd !== "string") throw new Error("a thread's desktop needs the thread's id and a folder");
   const id = threadDesktopId(thread);
   return serialized(id, async () => {
     if (desktopReady(id)) return {};
+    // A thread of a warded worktree whose shell stands elsewhere: no desktop of its own,
+    // its ward's (asked afresh, since a new thread may call before the next reconcile).
+    const ward = await loadThreads().then(
+      (threads) => {
+        const listed = threads.find((t) => t.id === thread);
+        return listed && noteThreadWard(listed);
+      },
+      () => undefined, // T3 unreachable: its own desktop
+    );
+    if (ward !== undefined) return { ward };
     const unit = desktopUnitName(id);
     const rt = wardRuntimeDir(id);
     const state = desktopStateDir(id);
@@ -473,13 +483,37 @@ async function clearThreadDesktop(id: string): Promise<void> {
   if (used !== undefined) utimesSync(marker, used, used);
 }
 
-/** Forget the notes (bin/ward: ward_thread_note) of threads whose ward's worktree is gone. */
-function pruneThreadNotes(): void {
-  // No worktrees folder at all means it was moved or unmounted, as for wards.
-  if (!existsSync(THREAD_WARDS_DIR) || !existsSync(WORKTREES_DIR)) return;
+/**
+ * Leaves `thread` its note (bin/ward: ward_thread_note) if T3 gave it a worktree
+ * that has a ward, and returns that worktree: the thread then gets the ward's
+ * desktop from any folder its shell stands in.
+ */
+function noteThreadWard(thread: ShellThread): string | undefined {
+  const location = thread.worktreePath ? locate(thread.worktreePath) : undefined;
+  if (location === undefined || !isEnabled(location.repo) || !existsSync(location.root)) return undefined;
+  const note = join(THREAD_WARDS_DIR, threadDesktopId(thread.id));
+  const text = `${location.root}\n${thread.id}\n`;
+  if (!existsSync(note) || readFileSync(note, "utf8") !== text) {
+    mkdirSync(THREAD_WARDS_DIR, { recursive: true });
+    writeFileSync(`${note}.tmp`, text);
+    renameSync(`${note}.tmp`, note); // bin/ward never sees half a note
+  }
+  return location.root;
+}
+
+/**
+ * Thread notes follow T3's list: written for each thread in a warded worktree,
+ * and removed only once T3 has no such thread. One whose ward went away (the
+ * worktree removed, the project disabled) stays, and bin/ward then gives the
+ * thread a desktop of its own instead of the live session.
+ */
+function syncThreadNotes(threads: readonly ShellThread[]): void {
+  const listed = new Set(threads.filter((t) => !t.deletedAt).map((t) => t.id));
+  for (const thread of threads) if (listed.has(thread.id)) noteThreadWard(thread);
+  if (!existsSync(THREAD_WARDS_DIR)) return;
   for (const name of readdirSync(THREAD_WARDS_DIR)) {
     const note = join(THREAD_WARDS_DIR, name);
-    if (!existsSync(readFileSync(note, "utf8").split("\n")[0] ?? "")) rmSync(note, { force: true });
+    if (!listed.has(readFileSync(note, "utf8").split("\n")[1] ?? "")) rmSync(note, { force: true });
   }
 }
 
@@ -984,7 +1018,7 @@ async function reconcile(): Promise<string[]> {
     if (await stop(record.id, record.worktree)) actions.push(`stopped ${record.id}: no active thread needs it`);
   }
   actions.push(...(await reconcileThreadDesktops(allThreads, now)));
-  pruneThreadNotes();
+  if (allThreads !== undefined) syncThreadNotes(allThreads);
   actions.push(...(await purgeOldTrash()));
   return actions;
 }
