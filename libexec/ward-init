@@ -3,7 +3,8 @@
 # unit's cgroup, starts the ward's filtered session bus, then enters a new user
 # and mount namespace as root for ward-init-root. The files the host trusts
 # (pid, ready) are written here, from what ward-init-root reports on fd 3: inside
-# the ward, Ward's runtime folder is read-only.
+# the ward, Ward's runtime folder is read-only, and pids are the ward's own, so
+# the namespace holder's is translated to the host's.
 set -euo pipefail
 . "$(dirname -- "$(readlink -f -- "$0")")/ward-lib.sh"
 id=$1
@@ -38,11 +39,24 @@ else
   echo "ward: warning: xdg-dbus-proxy is not installed; the ward has no session bus, so no keyring" >&2
 fi
 
+# The ward has a PID namespace of its own, with catatonit as its init.
+command -v catatonit >/dev/null || { echo "ward: catatonit is not installed; it is the init of each ward's PID namespace" >&2; exit 1; }
+
+# host_pid PID: the host's pid of the process that is PID in the ward's PID
+# namespace, found among the unit's processes.
+host_pid() {
+  local h
+  for h in $(cat "$(cat "$rt/cgroup")/cgroup.procs"); do
+    awk -v p="$1" '/^NSpid:/ { exit !(NF == 3 && $3 == p) }' "/proc/$h/status" 2>/dev/null && { echo "$h"; return; }
+  done
+  return 1
+}
+
 # shellcheck disable=SC2046 # word splitting of the map flags is intended
 WARD_HOST_UID=$(id -u) unshare $(ward_map_args) --mount --setuid 0 --setgid 0 -- "$WARD_LIBEXEC/ward-init-root" "$id" 3>&1 >&2 |
   while read -r line; do
     case $line in
-      pid=*) echo "${line#pid=}" > "$rt/pid" ;;
+      pid=*) host_pid "${line#pid=}" > "$rt/pid" ;;
       ready) touch "$rt/ready" ;;
     esac
   done

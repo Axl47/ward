@@ -86,8 +86,13 @@ nested_map_args() {
 
 if [ -z "$nested" ]; then
   lock_down
+  # The ward's PID namespace, with its /proc mounted here so it is locked like the
+  # rest: a ward sees and signals only its own processes. catatonit is its init
+  # (pid 1 ignores signals it has no handler for, and must reap orphans); when it
+  # exits, the kernel kills everything left in the namespace.
   # shellcheck disable=SC2046 # word splitting of the map flags is intended
-  exec unshare --user --mount $(nested_map_args) --setuid 0 --setgid 0 -- "$0" --inner "$id"
+  exec unshare --pid --fork --mount-proc -- catatonit -- \
+    unshare --user --mount $(nested_map_args) --setuid 0 --setgid 0 -- "$0" --inner "$id"
 fi
 
 # 1. Network namespace, held open by a sleep whose pid is the ward's join point.
