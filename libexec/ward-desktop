@@ -95,32 +95,32 @@ CONF
 unset $WARD_DESKTOP_UNSET
 # Kept apart from yours, in the ward's own folder: the compositor's log and caches
 # (Umbriel logs to XDG_CACHE_HOME, and would write into your session's log), and
-# the profiles of Chromium-family browsers and Electron apps. Such an app hands
-# a launch to a running copy of its profile, so on your profile its window would
-# open on your screen or another ward's, or yours here. It also keeps a socket
-# under TMPDIR, hence the short name for the ward's.
+# what apps keep in the config folder. A Chromium-family browser or an Electron
+# app hands a launch to a running copy of its profile, so on your profile its
+# window would open on your screen or another ward's, or yours here. It also
+# keeps a socket under TMPDIR, hence the short name for the ward's.
 data=$TMPDIR/desktop
 mkdir -p "$data/config"
 ln -s "$TMPDIR" "$dir/tmp"
-# So the config folder here is yours entry by entry, links to each, minus those
-# profiles: the entries holding a `Local State` file, at most one folder down
-# (BraveSoftware/Brave-Browser). An app makes its own in their place, kept with
-# the ward's data. Entries are looked at again at every start.
+# The config folder here mirrors yours: folders of its own, with a link to each
+# of your files. Programs read your settings, and what they create stays in the
+# ward, so an app that first starts here makes its profile here. Your existing
+# app profiles are left out (folders holding Chromium's `Local State`, at most
+# one folder down, or Firefox's `profiles.ini`), so those apps start fresh too.
+# Redone at every start: new files of yours appear, links to deleted ones go.
 yours=${XDG_CONFIG_HOME:-$HOME/.config}
-for entry in "$yours"/* "$yours"/.[!.]*; do
-  mine=$data/config/${entry##*/}
+find "$data/config" -xtype l -lname "$yours/*" -delete
+for entry in "$yours"/* "$yours"/.[!.]* "$yours"/..?*; do
+  [ -e "$entry" ] || continue
   profile=
-  for state in "$entry/Local State" "$entry"/*/"Local State"; do
-    [ ! -e "$state" ] || profile=1
+  for mark in "$entry/Local State" "$entry"/*/"Local State" "$entry/profiles.ini"; do
+    [ ! -e "$mark" ] || profile=1
   done
-  if [ -n "$profile" ]; then
-    [ ! -L "$mine" ] || unlink "$mine"
-  elif [ -e "$entry" ] && [ ! -e "$mine" ] && [ ! -L "$mine" ]; then
-    ln -s "$entry" "$mine"
-  fi
+  [ -n "$profile" ] || cp -asn "$entry" "$data/config/" || true
 done
+# Named through the short link, like TMPDIR: a shell reads `env`, and the state folder's path may hold spaces.
 export XDG_RUNTIME_DIR="$dir" DBUS_SESSION_BUS_ADDRESS="unix:path=$dir/bus" WLR_BACKENDS=headless WLR_LIBINPUT_NO_DEVICES=1 \
-  TMPDIR="$dir/tmp" XDG_CACHE_HOME="$data/cache" XDG_CONFIG_HOME="$data/config"
+  TMPDIR="$dir/tmp" XDG_CACHE_HOME="$data/cache" XDG_CONFIG_HOME="$dir/tmp/desktop/config"
 dbus-daemon --config-file="$dir/bus.conf" --nofork &
 bus=$!
 # The bus goes with the compositor, however this ends, and the accessibility bus
