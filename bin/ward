@@ -85,7 +85,7 @@ ward_thread_desktop() {
   rt=$WARD_RUNTIME/$id
   pid=$(cat "$rt/desktop/pid" 2>/dev/null || true)
   if [ ! -e "$rt/desktop/env" ] || [ -z "$pid" ] || [ ! -e "/proc/$pid" ]; then
-    [ $# -gt 0 ] || [ -e "$WARD_STATE/desktops/$id/thread" ] || { echo "ward: this thread has no desktop yet; \`ward desktop -- CMD\` starts one" >&2; exit 3; }
+    [ $# -gt 0 ] || [ -e "$WARD_STATE/desktops/$id/thread" ] || [ -n "${_root:-}" ] || { echo "ward: this thread has no desktop yet; \`ward desktop -- CMD\` starts one" >&2; exit 3; }
     (ward_node desktop --thread "$T3CODE_THREAD_ID") >&2 || exit 1
     pid=$(cat "$rt/desktop/pid")
   fi
@@ -98,15 +98,17 @@ ward_thread_desktop() {
   exec "$@"
 }
 
-# The worktree of the running ward whose desktop the calling thread has used, if
-# any. An agent's shell can stand in another folder than its Puck server; without
-# this its window would open on the thread's own desktop while Puck's tools look
-# at the ward's. The note is in the ward's runtime folder and lasts as long as it.
-ward_thread_ward() {
-  for _f in "$WARD_RUNTIME"/*/threads/"$(ward_thread_desktop_id "$T3CODE_THREAD_ID")"; do
-    [ -e "$_f" ] && cat "${_f%/threads/*}/root" 2>/dev/null && return
-  done
-  return 1
+# ward_thread_note: reads the calling thread's note into _note (its file) and
+# _root: the worktree of the ward whose desktop the thread last used from its own
+# folder, or empty. An agent's shell can stand in another folder than its Puck
+# server; without the note its window would open on the thread's own desktop while
+# Puck's tools look at the ward's. The file holds the worktree, then the thread's
+# id (two ids can sanitize alike); wardd removes it once the worktree is gone.
+ward_thread_note() {
+  _note=$WARD_STATE/thread-wards/$(ward_thread_desktop_id "$T3CODE_THREAD_ID")
+  _root= _who=
+  [ ! -r "$_note" ] || { IFS= read -r _root && IFS= read -r _who; } < "$_note" || true
+  [ "$_who" = "$T3CODE_THREAD_ID" ] || _root=
 }
 
 # ward desktop [--worktree DIR] [-- CMD...]: a private desktop (a headless Umbriel
@@ -136,8 +138,10 @@ ward_desktop() {
         echo "ward: $dir is not a warded worktree, and no T3 thread is calling, so there is no desktop" >&2
         exit 3
       fi
-      # A thread that used a ward's desktop keeps it wherever it calls from.
-      root=$(ward_thread_ward) && ward_resolve "$root" && ward_enabled "$WARD_REPO" || ward_thread_desktop "$@"
+      # A thread that used a ward's desktop keeps it wherever it calls from. If that
+      # ward is gone for good, its own desktop starts instead, never the live session.
+      ward_thread_note
+      [ -n "$_root" ] && [ -d "$_root" ] && ward_resolve "$_root" && ward_enabled "$WARD_REPO" || ward_thread_desktop "$@"
     fi
   fi
   d=$WARD_RUNTIME/$WARD_ID/desktop
@@ -147,9 +151,9 @@ ward_desktop() {
     # wardd starts the ward if needed, then the desktop, and answers once it is up.
     if [ -n "$inside" ]; then (ward_node desktop); else (ward_node desktop --worktree "$WARD_ROOT"); fi >&2 || exit 1
   fi
-  if [ -n "${T3CODE_THREAD_ID:-}" ] && [ -z "$named" ]; then   # for ward_thread_ward; a folder named once isn't the thread's own
-    t=$WARD_RUNTIME/$WARD_ID/threads/$(ward_thread_desktop_id "$T3CODE_THREAD_ID")
-    [ -e "$t" ] || { mkdir -p "${t%/*}" && : > "$t"; } || true
+  if [ -n "${T3CODE_THREAD_ID:-}" ] && [ -z "$named" ]; then   # a folder named once isn't the thread's own
+    ward_thread_note
+    [ "$_root" = "$WARD_ROOT" ] || { mkdir -p "${_note%/*}" && printf '%s\n%s\n' "$WARD_ROOT" "$T3CODE_THREAD_ID" > "$_note.$$" && mv -f "$_note.$$" "$_note"; } || true
   fi
   [ $# -gt 0 ] || exec cat "$d/env"
   if [ -n "$inside" ]; then

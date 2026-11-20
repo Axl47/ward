@@ -12,6 +12,7 @@ import type { BrokerReply, BrokerRequest, PortInfo, Route, Routes, UpResult, War
 import {
   CONTROL_SOCKET,
   desktopStateDir,
+  THREAD_WARDS_DIR,
   desktopUnitName,
   HOST_PORTS,
   isEnabled,
@@ -470,6 +471,16 @@ async function clearThreadDesktop(id: string): Promise<void> {
   rmSync(wardRuntimeDir(id), { recursive: true, force: true });
   rmSync(join(desktopStateDir(id), "tmp"), { recursive: true, force: true });
   if (used !== undefined) utimesSync(marker, used, used);
+}
+
+/** Forget the notes (bin/ward: ward_thread_note) of threads whose ward's worktree is gone. */
+function pruneThreadNotes(): void {
+  // No worktrees folder at all means it was moved or unmounted, as for wards.
+  if (!existsSync(THREAD_WARDS_DIR) || !existsSync(WORKTREES_DIR)) return;
+  for (const name of readdirSync(THREAD_WARDS_DIR)) {
+    const note = join(THREAD_WARDS_DIR, name);
+    if (!existsSync(readFileSync(note, "utf8").split("\n")[0] ?? "")) rmSync(note, { force: true });
+  }
 }
 
 /**
@@ -973,6 +984,7 @@ async function reconcile(): Promise<string[]> {
     if (await stop(record.id, record.worktree)) actions.push(`stopped ${record.id}: no active thread needs it`);
   }
   actions.push(...(await reconcileThreadDesktops(allThreads, now)));
+  pruneThreadNotes();
   actions.push(...(await purgeOldTrash()));
   return actions;
 }
