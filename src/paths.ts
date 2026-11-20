@@ -85,10 +85,17 @@ export function projectHostPorts(repo: string): number[] {
   }
 }
 
+/** Your Gradle home, as wardd runs: each ward gets a clone of it mounted over it (src/gradle.ts). */
+export const GRADLE_SOURCE_HOME = env.GRADLE_USER_HOME ?? join(home, ".gradle");
+/** The build cache wardd serves to wards: one folder per project, of entries named by key. */
+export const BUILD_CACHE_DIR = join(STATE_DIR, "build-cache");
+
 export const wardRuntimeDir = (id: string) => join(RUNTIME_DIR, id);
 /** The ward desktop's own XDG_RUNTIME_DIR: its Wayland, Umbriel and session bus sockets, and `env` once it is up. */
 export const wardDesktopDir = (id: string) => join(RUNTIME_DIR, id, "desktop");
 export const wardStateDir = (id: string) => join(STATE_DIR, "wards", id);
+/** The ward's own Gradle home, which libexec/ward-init-root mounts over GRADLE_SOURCE_HOME in the ward. */
+export const wardGradleHome = (id: string) => join(STATE_DIR, "wards", id, "gradle");
 /** Where a removed ward's data waits before it is purged, keyed by worktree so colliding ids can't clash. */
 export const wardTrashDir = (id: string, worktree: string) =>
   join(STATE_DIR, "trash", `${id}.${createHash("sha256").update(worktree).digest("hex").slice(0, 8)}`);

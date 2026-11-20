@@ -38,6 +38,7 @@ st=$WARD_STATE/wards/$id
 #   except its `shell` folder, where the bash hook in a ward's terminal leaves
 #   the commands typed there. Miranda's MCP server runs on the host and still
 #   reads the store; its CLI inside a ward doesn't.
+# - Your Gradle home is the ward's own, so wards share no Gradle locks or daemons.
 # Every folder above one of these that you could rename (whose parent is yours)
 # becomes a mount point too, or a ward could move it aside and put a forged copy
 # where the host looks.
@@ -92,6 +93,12 @@ lock_down() {
       */systemd) mount -t tmpfs -o ro,mode=0755,size=4k tmpfs "$p" ;;
     esac
   done
+  # The ward's own Gradle home over yours, at the same path (wardd wrote it to
+  # gradle-home; src/gradle.ts made the home): its daemons, locks and caches are
+  # its own, and paths under it are the same in every ward and on the host.
+  local gradle
+  gradle=$(cat "$rt/gradle-home" 2>/dev/null) || gradle=
+  if [ -n "$gradle" ] && [ -d "$gradle" ] && [ -d "$st/gradle" ]; then mount --bind "$st/gradle" "$gradle"; fi
 }
 
 # The inner user namespace maps every id the outer one does to itself.

@@ -1,6 +1,7 @@
 // wardd: the user daemon behind every ward. It starts and stops ward units,
 // maps each port a ward listens on to a host port in the ward's slot, and runs
-// the reconciler that stops or removes wards when T3 is done with them.
+// the reconciler that stops or removes wards when T3 is done with them, and
+// serves the Gradle build cache a project's wards share (src/gradle.ts).
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { closeSync, existsSync, fstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, readSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, watch, writeFileSync, type FSWatcher } from "node:fs";
 import { createServer as createHttpServer, request as httpRequest, type ClientRequest, type IncomingMessage, type ServerResponse } from "node:http";
@@ -16,6 +17,7 @@ import {
   desktopStateDir,
   THREAD_WARDS_DIR,
   desktopUnitName,
+  GRADLE_SOURCE_HOME,
   HOST_PORTS,
   isEnabled,
   parsePorts,
@@ -28,10 +30,12 @@ import {
   unitName,
   WARD_HOME,
   wardDesktopDir,
+  wardGradleHome,
   wardRuntimeDir,
   wardStateDir,
   wardTrashDir,
 } from "./paths.ts";
+import { acceptBuildCache, BUILD_CACHE_PORT, cloneGradleHome, ensureProjectStore, projectStore, sweepBuildCache, writeGradleSettings } from "./gradle.ts";
 import { wardHostPorts } from "./hostports.ts";
 import { listeningPorts } from "./procnet.ts";
 import { mappedServer, relayToHost, splice } from "./splice.ts";
@@ -176,6 +180,21 @@ function writeHostPorts(record: WardRecord): void {
   writeFileSync(join(wardRuntimeDir(record.id), "host-ports"), wardHostPorts(projectHostPorts(record.repo)).join(","));
 }
 
+/**
+ * The ward's Gradle home (src/gradle.ts): cloned from yours the first time, its
+ * settings from yours every time; and its project's build cache store. Before the
+ * ward starts, the path ward-init-root mounts it over, which must exist.
+ */
+async function prepareGradle(record: WardRecord, starting: boolean): Promise<void> {
+  const failure = await cloneGradleHome(wardGradleHome(record.id));
+  if (failure !== undefined) log(`ward ${record.id}: ${failure}`);
+  writeGradleSettings(wardGradleHome(record.id));
+  await ensureProjectStore(projectStore(record.repo));
+  if (!starting) return;
+  mkdirSync(GRADLE_SOURCE_HOME, { recursive: true });
+  writeFileSync(join(wardRuntimeDir(record.id), "gradle-home"), GRADLE_SOURCE_HOME);
+}
+
 /** The env `ward exec` loads; rewritten on every `up` so env changes reach running wards. */
 function writeEnvFile(record: WardRecord): void {
   const rt = wardRuntimeDir(record.id);
@@ -247,6 +266,7 @@ async function up(worktree: string): Promise<UpResult> {
     const starting = !isReady(record.id);
     if (starting) writeHostPorts(record);
     writeEnvFile(record);
+    await prepareGradle(record, starting);
     if (starting) {
       await systemctl("start", unitName(record.id));
       await waitReady(record.id);
@@ -774,15 +794,19 @@ function attach(record: WardRecord): void {
       ward.scanTimer = setInterval(() => void scan(record.id), 1000);
       watchContainers(record.id, ward);
       relayDeviceDaemon(ward);
+      broker.send({ t: "relay", port: BUILD_CACHE_PORT } satisfies BrokerRequest);
       return void scan(record.id);
     }
     const upstream = socket instanceof Object && "pipe" in socket ? (socket as Socket) : undefined;
     if (reply.t === "accepted") {
       if (upstream === undefined) return;
-      return relayToHost(upstream, reply.port, (s) => {
+      const track = (s: Socket) => {
         ward.connections.add(s);
         s.once("close", () => ward.connections.delete(s));
-      });
+      };
+      if (reply.port !== BUILD_CACHE_PORT) return relayToHost(upstream, reply.port, track);
+      track(upstream);
+      return acceptBuildCache(upstream, projectStore(record.repo));
     }
     const callback = ward.pending.get(reply.req);
     ward.pending.delete(reply.req);
@@ -842,7 +866,7 @@ function scan(id: string): Promise<unknown> {
       return Promise.resolve(); // broker gone; its exit handler detaches the ward
     }
     for (const [port, hosts] of listeningPorts(text)) {
-      if (!ward.hostPorts.has(port) && port !== ward.relayPort) found.set(port, [...new Set([...(found.get(port) ?? []), ...hosts])]);
+      if (!ward.hostPorts.has(port) && port !== ward.relayPort && port !== BUILD_CACHE_PORT) found.set(port, [...new Set([...(found.get(port) ?? []), ...hosts])]);
     }
   }
   for (const port of ward.containerPorts) if (!found.has(port)) found.set(port, ["127.0.0.1"]);
@@ -1343,6 +1367,9 @@ function main(): void {
   watchWorktreeParents();
   void runReconcile();
   setInterval(() => void runReconcile(), RECONCILE_MS);
+  const sweep = () => void sweepBuildCache().then((n) => n > 0 && log(`build cache: deleted ${n} files`), (e: unknown) => log(`build cache sweep: ${String(e)}`));
+  sweep();
+  setInterval(sweep, 3_600_000);
   const shutdown = () => {
     // Wards keep running; a restarted wardd re-attaches to them.
     for (const id of [...live.keys()]) detach(id);
