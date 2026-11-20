@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { idleSince, isSettled, NO_THREAD_GRACE_MS, shouldStop, threadState } from "../src/t3state.ts";
+import { DESKTOP_IDLE_MS, idleSince, isSettled, NO_THREAD_GRACE_MS, shouldStop, threadDesktopStep, threadState } from "../src/t3state.ts";
 
 const t1 = "2026-11-19T10:00:00.000Z";
 const t2 = "2026-11-19T11:00:00.000Z";
@@ -48,4 +48,19 @@ test("a thread's desktop stops once its thread, worktree or not, went idle after
   assert.equal(settled.idleSince, t2);
   assert.equal(shouldStop([settled], Date.parse(t1), Date.parse(t2) + 1000), true);
   assert.equal(shouldStop([{ idleSince: idleSince({ id: "a" }) }], Date.parse(t1), Date.parse(t2) + NO_THREAD_GRACE_MS * 2), false);
+});
+
+test("a thread's desktop stops when idle, but the thread is never forgotten, listed by T3 or not", () => {
+  const used = Date.parse(t1);
+  const active = { id: "a" };
+  // T3 doesn't list the thread: the desktop stops after 30 minutes unused, and afterwards only its log goes.
+  assert.equal(threadDesktopStep(undefined, true, false, used, used + NO_THREAD_GRACE_MS - 1), undefined);
+  assert.equal(threadDesktopStep(undefined, true, false, used, used + NO_THREAD_GRACE_MS + 1), "unused, and T3 has no such thread");
+  assert.equal(threadDesktopStep(undefined, false, true, used, used + NO_THREAD_GRACE_MS + 1), undefined);
+  assert.equal(threadDesktopStep(undefined, false, false, used, used + NO_THREAD_GRACE_MS + 1), "drop log");
+  // An active thread T3 lists: 2 hours unused stops it, and nothing more happens once it is down.
+  assert.equal(threadDesktopStep(active, true, false, used, used + DESKTOP_IDLE_MS + 1), "unused for 2 h");
+  assert.equal(threadDesktopStep(active, false, false, used, used + DESKTOP_IDLE_MS * 10), undefined);
+  // A thread settled after the last use: stopped at once.
+  assert.equal(threadDesktopStep({ id: "a", settledAt: t2 }, true, false, used, Date.parse(t2) + 1), "the thread is done");
 });
