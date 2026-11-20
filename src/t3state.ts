@@ -90,6 +90,31 @@ export function shouldStop(threads: readonly Pick<ThreadState, "idleSince">[], l
   return !idle.some(Number.isNaN) && (Math.max(...idle) > lastActivity || unused);
 }
 
+/**
+ * What the reconciler does with a thread's desktop (`thread`: the thread in T3's
+ * list, if it is there; `used`: the desktop's last use, ms). It stops a running
+ * desktop once shouldStop says so, with the thread as its one thread (none when
+ * T3 doesn't list it), or after DESKTOP_IDLE_MS unused; and once T3 doesn't list
+ * the thread and NO_THREAD_GRACE_MS passed, drops the last log, never in the pass
+ * that stopped or cleared it (`died`): a call that raced that pass has one to come
+ * back. Nothing here forgets the thread: a thread missing from T3's list may be
+ * served by another T3 or listed again later, and forgetting it would send its
+ * next Puck call to the user's screen.
+ */
+export function threadDesktopStep(
+  thread: ShellThread | undefined,
+  running: boolean,
+  died: boolean,
+  used: number,
+  now: number,
+): "the thread is done" | "unused, and T3 has no such thread" | `unused for ${number} h` | "drop log" | undefined {
+  const done = shouldStop(thread ? [{ idleSince: idleSince(thread) }] : [], used, now);
+  if (running && done) return thread ? "the thread is done" : "unused, and T3 has no such thread";
+  if (running && now - used > DESKTOP_IDLE_MS) return `unused for ${DESKTOP_IDLE_MS / 3_600_000} h`;
+  if (!running && !died && !thread && now - used > NO_THREAD_GRACE_MS) return "drop log";
+  return undefined;
+}
+
 export function isSettled(thread: Pick<ShellThread, "settledOverride" | "settledAt" | "unsettledAt">): boolean {
   if (thread.settledOverride === "settled") return Boolean(thread.settledAt);
   if (thread.settledOverride === "active" || !thread.settledAt) return false;

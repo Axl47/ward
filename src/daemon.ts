@@ -34,7 +34,7 @@ import { wardHostPorts } from "./hostports.ts";
 import { listeningPorts } from "./procnet.ts";
 import { mappedServer, relayToHost, splice } from "./splice.ts";
 import { freeSlot, loadRegistry, MAX_SLOTS, saveRegistry, slotPorts, type WardRecord } from "./registry.ts";
-import { DESKTOP_IDLE_MS, idleSince, loadThreads, NO_THREAD_GRACE_MS, shouldStop, threadsByWorktree, type ShellThread, type ThreadState } from "./t3state.ts";
+import { loadThreads, shouldStop, threadDesktopStep, threadsByWorktree, type ShellThread, type ThreadState } from "./t3state.ts";
 
 const run = promisify(execFile);
 const { uid, gid } = userInfo();
@@ -399,7 +399,11 @@ async function desktopUp(id: string, name: string, logFile: string, exited: () =
 /** What the desktop's unit gets from wardd: where Ward keeps things, and where its programs are found. */
 const UNIT_ENV = ["PATH", "XDG_RUNTIME_DIR", "XDG_STATE_HOME", "XDG_CONFIG_HOME", "WARD_T3_HOME"] as const;
 
-/** Kept from a thread's first desktop until T3 forgets the thread: the thread's id. bin/ward restarts a stopped desktop only where it exists. */
+/**
+ * Left by a thread's first desktop and never removed: the thread's id. bin/ward
+ * restarts a stopped desktop only where it exists, so a thread that once had a
+ * private desktop never answers "none" again, whatever T3 lists.
+ */
 const threadMarker = (id: string) => join(desktopStateDir(id), "thread");
 
 /**
@@ -514,9 +518,8 @@ function noteThreadWard(thread: ShellThread): string | undefined {
  * ward went away (the worktree removed, the project disabled, the thread
  * deleted but still listed) stays, and bin/ward then gives the thread a desktop
  * of its own. A thread T3 moved off its worktree, or no longer lists, gets the
- * marker of a thread desktop in the note's place, which the reconciler forgets
- * by the thread desktops' rule. So a thread that was private doesn't fall to the
- * live session at once.
+ * marker of a thread desktop in the note's place, which stays. So a thread that
+ * was private never falls to the live session.
  */
 function syncThreadNotes(threads: readonly ShellThread[]): void {
   const failed = (what: string, error: unknown) => log(`reconcile: thread note ${what}: ${error instanceof Error ? error.message : String(error)}`);
@@ -538,7 +541,7 @@ function syncThreadNotes(threads: readonly ShellThread[]): void {
       }
       const [root, thread] = readFileSync(note, "utf8").split("\n");
       if (thread !== undefined && roots.get(thread) === root) continue;
-      // The marker keeps its plain asks private; the reconciler forgets it as it does any thread's desktop.
+      // The marker keeps its plain asks private from now on, as it does for any thread that had a desktop.
       if (thread !== undefined && !existsSync(threadMarker(name))) {
         mkdirSync(desktopStateDir(name), { recursive: true });
         writeFileSync(threadMarker(name), thread);
@@ -589,10 +592,9 @@ async function fetchThreads(): Promise<void> {
 }
 
 /**
- * Thread desktops: stop those whose thread is done (shouldStop, with the thread
- * as its one thread, or none when T3 doesn't know it) or that nothing asked for
- * in DESKTOP_IDLE_MS, clear away those that died, and forget the threads T3 has
- * forgotten. A stopped desktop comes back, empty, when its thread next asks.
+ * Thread desktops: stop or tidy each as threadDesktopStep says, and clear away
+ * those that died. A stopped desktop comes back, empty, when its thread next
+ * asks. The marker always stays (threadMarker).
  */
 async function reconcileThreadDesktops(threads: readonly ShellThread[] | undefined, now: number): Promise<string[]> {
   const actions: string[] = [];
@@ -609,17 +611,11 @@ async function reconcileThreadDesktops(threads: readonly ShellThread[] | undefin
       if (died) await clearThreadDesktop(id);
       if (thread === undefined) return rmSync(desktopStateDir(id), { recursive: true, force: true }); // left by a start that never finished
       if (threads === undefined) return; // T3 unreachable: leave it as it is
-      const known = threads.find((t) => t.id === thread);
-      const used = Math.max(lastActivity(id), statSync(marker).mtimeMs);
-      const done = shouldStop(known ? [{ idleSince: idleSince(known) }] : [], used, now);
-      if (running && (done || now - used > DESKTOP_IDLE_MS)) {
-        await clearThreadDesktop(id);
-        actions.push(`stopped the desktop of thread ${thread}: ${!done ? `unused for ${DESKTOP_IDLE_MS / 3_600_000} h` : known ? "the thread is done" : "unused, and T3 has no such thread"}`);
-      } else if (!died && !known && now - used > NO_THREAD_GRACE_MS) {
-        // Never in the pass that stopped or cleared it: the marker now holds the last use, with
-        // any call that came in meanwhile, and a call that raced it has a pass to come back.
-        rmSync(desktopStateDir(id), { recursive: true, force: true });
-      }
+      const step = threadDesktopStep(threads.find((t) => t.id === thread), running, died, Math.max(lastActivity(id), statSync(marker).mtimeMs), now);
+      if (step === undefined) return;
+      if (step === "drop log") return rmSync(join(desktopStateDir(id), "desktop.log"), { force: true });
+      await clearThreadDesktop(id);
+      actions.push(`stopped the desktop of thread ${thread}: ${step}`);
     }).catch((error: unknown) => log(`reconcile: thread desktop ${id}: ${error instanceof Error ? error.message : String(error)}`));
   }
   return actions;
