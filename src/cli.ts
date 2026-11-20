@@ -193,7 +193,8 @@ async function main(): Promise<void> {
     case "desktop":
       // From bin/ward, when the desktop isn't up; it prints the environment itself.
       await ensureDaemon();
-      await call("POST /desktop", flag("thread") === undefined ? target() : { thread: flag("thread")!, cwd: process.cwd() });
+      // 4: the thread belongs to a warded worktree, and bin/ward starts over with the note wardd left.
+      if ((await call("POST /desktop", flag("thread") === undefined ? target() : { thread: flag("thread")!, cwd: process.cwd() })).ward !== undefined) process.exitCode = 4;
       return;
     case "env":
       process.stdout.write(readFileSync(join(wardRuntimeDir(currentId()), "env"), "utf8"));

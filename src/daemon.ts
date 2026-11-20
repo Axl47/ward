@@ -12,6 +12,7 @@ import type { BrokerReply, BrokerRequest, PortInfo, Route, Routes, UpResult, War
 import {
   CONTROL_SOCKET,
   desktopStateDir,
+  THREAD_WARDS_DIR,
   desktopUnitName,
   HOST_PORTS,
   isEnabled,
@@ -405,11 +406,26 @@ const threadMarker = (id: string) => join(desktopStateDir(id), "thread");
  * own, so `ward desktop -- CMD` can join its cgroup and stopping the unit stops
  * everything on it. The reconciler stops it when the thread is done or it sat unused.
  */
-function threadDesktop(thread: string, cwd: string): Promise<Record<string, never>> {
+function threadDesktop(thread: string, cwd: string): Promise<{ ward?: string }> {
   if (typeof thread !== "string" || thread === "" || typeof cwd !== "string") throw new Error("a thread's desktop needs the thread's id and a folder");
   const id = threadDesktopId(thread);
   return serialized(id, async () => {
     if (desktopReady(id)) return {};
+    // A thread of a warded worktree whose shell stands elsewhere: no desktop of its own,
+    // its ward's (asked afresh, since a new thread may call before the next reconcile).
+    let unwritten: unknown;
+    const ward = await withThreads((threads) => {
+      const listed = threads.find((t) => t.id === thread);
+      try {
+        return listed && noteThreadWard(listed);
+      } catch (error) {
+        unwritten = error;
+        return undefined;
+      }
+    }).catch(() => undefined); // T3 unreachable: its own desktop
+    // T3 named its ward but the note couldn't be left: no desktop of its own beside the one Puck looks at.
+    if (unwritten !== undefined) throw unwritten;
+    if (ward !== undefined) return { ward };
     const unit = desktopUnitName(id);
     const rt = wardRuntimeDir(id);
     const state = desktopStateDir(id);
@@ -470,6 +486,104 @@ async function clearThreadDesktop(id: string): Promise<void> {
   rmSync(wardRuntimeDir(id), { recursive: true, force: true });
   rmSync(join(desktopStateDir(id), "tmp"), { recursive: true, force: true });
   if (used !== undefined) utimesSync(marker, used, used);
+}
+
+/**
+ * Leaves `thread` its note (bin/ward: ward_thread_note) if T3 gave it a worktree
+ * that has a ward, and returns that worktree: the thread then gets the ward's
+ * desktop from any folder its shell stands in.
+ */
+function noteThreadWard(thread: ShellThread): string | undefined {
+  const location = thread.worktreePath ? locate(thread.worktreePath) : undefined;
+  if (thread.deletedAt || location === undefined || !isEnabled(location.repo) || !existsSync(location.root)) return undefined;
+  const note = join(THREAD_WARDS_DIR, threadDesktopId(thread.id));
+  const text = `${location.root}\n${thread.id}\n`;
+  if (!existsSync(note) || readFileSync(note, "utf8") !== text) {
+    mkdirSync(THREAD_WARDS_DIR, { recursive: true });
+    writeFileSync(`${note}.tmp`, text);
+    renameSync(`${note}.tmp`, note); // bin/ward never sees half a note
+  }
+  return location.root;
+}
+
+/**
+ * Thread notes follow T3's list: written for each thread in a warded worktree,
+ * and removed once T3 no longer lists the thread with that worktree. One whose
+ * ward went away (the worktree removed, the project disabled, the thread
+ * deleted but still listed) stays, and bin/ward then gives the thread a desktop
+ * of its own. A thread T3 moved off its worktree, or no longer lists, gets the
+ * marker of a thread desktop in the note's place, which the reconciler forgets
+ * by the thread desktops' rule. So a thread that was private doesn't fall to the
+ * live session at once.
+ */
+function syncThreadNotes(threads: readonly ShellThread[]): void {
+  const failed = (what: string, error: unknown) => log(`reconcile: thread note ${what}: ${error instanceof Error ? error.message : String(error)}`);
+  for (const thread of threads) {
+    try {
+      noteThreadWard(thread);
+    } catch (error) {
+      failed(thread.id, error); // the others still get theirs
+    }
+  }
+  if (!existsSync(THREAD_WARDS_DIR)) return;
+  const roots = new Map(threads.map((t) => [t.id, t.worktreePath ? locate(t.worktreePath)?.root : undefined]));
+  for (const name of readdirSync(THREAD_WARDS_DIR)) {
+    const note = join(THREAD_WARDS_DIR, name);
+    try {
+      if (name.endsWith(".tmp")) {
+        rmSync(note, { force: true }); // left by a write that was cut off; none is under way now
+        continue;
+      }
+      const [root, thread] = readFileSync(note, "utf8").split("\n");
+      if (thread !== undefined && roots.get(thread) === root) continue;
+      // The marker keeps its plain asks private; the reconciler forgets it as it does any thread's desktop.
+      if (thread !== undefined && !existsSync(threadMarker(name))) {
+        mkdirSync(desktopStateDir(name), { recursive: true });
+        writeFileSync(threadMarker(name), thread);
+      }
+      rmSync(note, { force: true });
+    } catch (error) {
+      failed(name, error); // it stays for the next pass; the others still get their turn
+    }
+  }
+}
+
+let waiting: { got: (threads: readonly ShellThread[]) => void; failed: (error: unknown) => void }[] = [];
+let fetching = false;
+/**
+ * T3's thread list, one fetch at a time: everyone who asks while a fetch runs
+ * shares the next one, and each answer is handed to its callers (`use`) before
+ * the next fetch starts. Notes are written and removed only in `use`, so a list
+ * fetched earlier never undoes what a later one wrote, and a stalled T3 costs a
+ * caller two timeouts at most.
+ */
+function withThreads<T>(use: (threads: readonly ShellThread[]) => T): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    waiting.push({
+      got: (threads) => {
+        try {
+          resolve(use(threads));
+        } catch (error) {
+          reject(error);
+        }
+      },
+      failed: reject,
+    });
+    if (!fetching) void fetchThreads();
+  });
+}
+
+async function fetchThreads(): Promise<void> {
+  fetching = true;
+  while (waiting.length > 0) {
+    const callers = waiting;
+    waiting = [];
+    await loadThreads().then(
+      (threads) => callers.forEach((caller) => caller.got(threads)),
+      (error: unknown) => callers.forEach((caller) => caller.failed(error)),
+    );
+  }
+  fetching = false;
 }
 
 /**
@@ -951,7 +1065,14 @@ async function reconcile(): Promise<string[]> {
   let threads: Map<string, ThreadState[]> | undefined;
   let allThreads: readonly ShellThread[] | undefined;
   try {
-    allThreads = await loadThreads();
+    allThreads = await withThreads((list) => {
+      try {
+        syncThreadNotes(list);
+      } catch (error) {
+        log(`reconcile: thread notes: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      return list;
+    });
     threads = lastThreads = threadsByWorktree(allThreads);
   } catch (error) {
     log(`reconcile: cannot read T3 thread state: ${error instanceof Error ? error.message : String(error)}`);

@@ -36,9 +36,10 @@ export interface Routes {
   "POST /port": { body: { id: string; port: number }; result: { host: number } };
   /**
    * Starts the ward if needed, then its desktop; with `thread`, the desktop of a
-   * T3 thread that has no ward, whose programs start in `cwd`. Answers once the desktop is up.
+   * T3 thread that has no ward, whose programs start in `cwd`. Answers once the desktop is up,
+   * or with `ward`, the thread's warded worktree, whose desktop it should use instead.
    */
-  "POST /desktop": { body: { id: string; worktree?: string } | { thread: string; cwd: string }; result: Record<string, never> };
+  "POST /desktop": { body: { id: string; worktree?: string } | { thread: string; cwd: string }; result: { ward?: string } };
   "POST /gc": { body: Record<string, never>; result: { actions: string[] } };
   "GET /ls": { body: Record<string, never>; result: WardInfo[] };
 }

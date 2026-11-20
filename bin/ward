@@ -85,8 +85,14 @@ ward_thread_desktop() {
   rt=$WARD_RUNTIME/$id
   pid=$(cat "$rt/desktop/pid" 2>/dev/null || true)
   if [ ! -e "$rt/desktop/env" ] || [ -z "$pid" ] || [ ! -e "/proc/$pid" ]; then
-    [ $# -gt 0 ] || [ -e "$WARD_STATE/desktops/$id/thread" ] || { echo "ward: this thread has no desktop yet; \`ward desktop -- CMD\` starts one" >&2; exit 3; }
-    (ward_node desktop --thread "$T3CODE_THREAD_ID") >&2 || exit 1
+    [ $# -gt 0 ] || [ -e "$WARD_STATE/desktops/$id/thread" ] || [ -n "${_root:-}" ] || { echo "ward: this thread has no desktop yet; \`ward desktop -- CMD\` starts one" >&2; exit 3; }
+    rc=0; (ward_node desktop --thread "$T3CODE_THREAD_ID") >&2 || rc=$?
+    if [ $rc = 4 ] && [ -z "$noted" ]; then   # wardd found the thread's ward and left its note: start over, once
+      export WARD_NOTED=1
+      [ $# -gt 0 ] || exec "$WARD_HOME/bin/ward" desktop
+      exec "$WARD_HOME/bin/ward" desktop -- "$@"
+    fi
+    [ $rc = 0 ] || exit 1
     pid=$(cat "$rt/desktop/pid")
   fi
   # The reconciler stops a desktop nothing has asked for in a while.
@@ -96,6 +102,19 @@ ward_thread_desktop() {
   echo $$ > "/sys/fs/cgroup$(cut -d: -f3 "/proc/$pid/cgroup")/cgroup.procs" || { echo "ward: could not join the cgroup of this thread's desktop" >&2; exit 1; }
   set -a; ward_desktop_env "$rt"; set +a
   exec "$@"
+}
+
+# ward_thread_note: reads the calling thread's note into _root: the worktree T3
+# gave the thread, if it has a ward, else empty. An agent's shell can stand in
+# another folder than its Puck server; without the note its window would open on
+# the thread's own desktop while Puck's tools look at the ward's. wardd writes the
+# notes from T3's thread list (src/daemon.ts: noteThreadWard): the worktree, then
+# the thread's id, since two ids can sanitize alike.
+ward_thread_note() {
+  _note=$WARD_STATE/thread-wards/$(ward_thread_desktop_id "$T3CODE_THREAD_ID")
+  _root= _who=
+  [ ! -r "$_note" ] || { IFS= read -r _root && IFS= read -r _who; } < "$_note" 2>/dev/null || true
+  [ "$_who" = "$T3CODE_THREAD_ID" ] || _root=
 }
 
 # ward desktop [--worktree DIR] [-- CMD...]: a private desktop (a headless Umbriel
@@ -116,6 +135,7 @@ ward_desktop() {
     esac
   done
   inside=${WARD_ID:+1}
+  noted=${WARD_NOTED:-}; unset WARD_NOTED   # ward_thread_desktop's, on its second run
   if [ -z "$inside" ]; then
     [ -n "$dir" ] || dir=$(pwd -P)
     dir=$(readlink -f -- "$dir" 2>/dev/null || printf '%s' "$dir")
@@ -125,7 +145,10 @@ ward_desktop() {
         echo "ward: $dir is not a warded worktree, and no T3 thread is calling, so there is no desktop" >&2
         exit 3
       fi
-      ward_thread_desktop "$@"
+      # A thread of a warded worktree gets that ward's desktop wherever it calls from. If
+      # the ward is gone for good, its own desktop starts instead, never the live session.
+      ward_thread_note
+      [ -n "$_root" ] && [ -d "$_root" ] && ward_resolve "$_root" && ward_enabled "$WARD_REPO" || ward_thread_desktop "$@"
     fi
   fi
   d=$WARD_RUNTIME/$WARD_ID/desktop
