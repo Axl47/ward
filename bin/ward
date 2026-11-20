@@ -35,7 +35,7 @@ ward_enter() {
   echo $$ > "$(cat "$rt/cgroup")/cgroup.procs" || { echo "ward: could not join the cgroup of ward $WARD_ID" >&2; exit 1; }
   # The reconciler won't stop a ward used after its threads went idle.
   : > "$rt/last-exec"
-  set -a; . "$rt/env"; [ -z "${desktop:-}" ] || ward_desktop_env; set +a
+  set -a; . "$rt/env"; set +a; [ -z "${desktop:-}" ] || ward_desktop_env
   # Joining the mount namespace moves the command to its root, so it goes back to
   # this folder by path, inside: a directory carried in from outside would let
   # relative paths reach what the ward's namespace hides (libexec/ward-init-root).
@@ -84,8 +84,8 @@ ward_thread_desktop() {
   unset WARD_ID WARD_REPO WARD_ROOT   # ward_resolve's, of a folder that has no ward
   id=$(ward_thread_desktop_id "$T3CODE_THREAD_ID")
   rt=$WARD_RUNTIME/$id
-  pid=$(cat "$rt/desktop/pid" 2>/dev/null || true)
-  if [ ! -e "$rt/desktop/env" ] || [ -z "$pid" ] || [ ! -e "/proc/$pid" ]; then
+  unit=${WARD_UNIT:-ward}-desktop-$id.service
+  if ! ward_desktop_read "$id" "$unit"; then
     [ $# -gt 0 ] || [ -e "$WARD_STATE/desktops/$id/thread" ] || [ -n "${_root:-}" ] || { echo "ward: this thread has no desktop yet; \`ward desktop -- CMD\` starts one" >&2; exit 3; }
     rc=0; (ward_node desktop --thread "$T3CODE_THREAD_ID") >&2 || rc=$?
     if [ $rc = 4 ] && [ -z "$noted" ]; then   # wardd found the thread's ward and left its note: start over, once
@@ -94,14 +94,14 @@ ward_thread_desktop() {
       exec "$WARD_HOME/bin/ward" desktop -- "$@"
     fi
     [ $rc = 0 ] || exit 1
-    pid=$(cat "$rt/desktop/pid")
+    ward_desktop_read "$id" "$unit" || { echo "ward: the files of this thread's desktop under $rt aren't its compositor's; not using them" >&2; exit 1; }
   fi
   # The reconciler stops a desktop nothing has asked for in a while.
   : > "$rt/last-exec"
-  [ $# -gt 0 ] || exec cat "$rt/desktop/env"
+  [ $# -gt 0 ] || { printf '%s' "$_denv"; exit 0; }
   # The unit's cgroup, read from the desktop's own process: there is no file to wait for.
-  echo $$ > "/sys/fs/cgroup$(cut -d: -f3 "/proc/$pid/cgroup")/cgroup.procs" || { echo "ward: could not join the cgroup of this thread's desktop" >&2; exit 1; }
-  set -a; ward_desktop_env "$rt"; set +a
+  echo $$ > "$_dcgroup/cgroup.procs" || { echo "ward: could not join the cgroup of this thread's desktop" >&2; exit 1; }
+  ward_desktop_env
   exec "$@"
 }
 
@@ -152,19 +152,22 @@ ward_desktop() {
       [ -n "$_root" ] && [ -d "$_root" ] && ward_resolve "$_root" && ward_enabled "$WARD_REPO" || ward_thread_desktop "$@"
     fi
   fi
-  d=$WARD_RUNTIME/$WARD_ID/desktop
-  pid=$(cat "$d/pid" 2>/dev/null || true)
-  # The desktop's pid is the ward's own: seen through the ward's /proc from outside it.
-  proc=/proc
-  [ -n "$inside" ] || proc=/proc/$(cat "$WARD_RUNTIME/$WARD_ID/pid" 2>/dev/null)/root/proc
+  # The desktop runs in the ward's unit, so a WARD_ID naming a thread's desktop finds none here.
+  # Its pid is the ward's own, so from outside the ward it is looked up through the
+  # ward's namespace holder; inside, /proc is the ward's.
+  unit=${WARD_UNIT:-ward}@$WARD_ID.service
+  holder=
+  [ -n "$inside" ] || holder=$(cat "$WARD_RUNTIME/$WARD_ID/pid" 2>/dev/null) || holder=0
   # The root check: as in ward_enter.
-  if [ ! -e "$d/env" ] || [ -z "$pid" ] || [ ! -e "$proc/$pid" ] || [ "$(cat "$WARD_RUNTIME/$WARD_ID/root" 2>/dev/null)" != "$WARD_ROOT" ]; then
+  if ! ward_desktop_read "$WARD_ID" "$unit" "$holder" || [ "$(cat "$WARD_RUNTIME/$WARD_ID/root" 2>/dev/null)" != "$WARD_ROOT" ]; then
     # wardd starts the ward if needed, then the desktop, and answers once it is up.
     if [ -n "$inside" ]; then (ward_node desktop); else (ward_node desktop --worktree "$WARD_ROOT"); fi >&2 || exit 1
+    [ -n "$inside" ] || holder=$(cat "$WARD_RUNTIME/$WARD_ID/pid" 2>/dev/null) || holder=0   # the ward may have just started
+    ward_desktop_read "$WARD_ID" "$unit" "$holder" || { echo "ward: the files of ward $WARD_ID's desktop aren't its compositor's; not using them" >&2; exit 1; }
   fi
-  [ $# -gt 0 ] || exec cat "$d/env"
+  [ $# -gt 0 ] || { printf '%s' "$_denv"; exit 0; }
   if [ -n "$inside" ]; then
-    set -a; ward_desktop_env; set +a
+    ward_desktop_env
     exec "$@"
   fi
   desktop=1

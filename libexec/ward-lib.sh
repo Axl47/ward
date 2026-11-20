@@ -19,18 +19,17 @@ WARD_HOST_PORTS=${WARD_HOST_PORTS:-3773,5037}
 # its display, its accessibility bus, and where it would look for the sound servers.
 WARD_DESKTOP_UNSET="WAYLAND_DISPLAY WAYLAND_SOCKET DISPLAY UMBRIEL_SOCKET AT_SPI_BUS_ADDRESS PULSE_SERVER PULSE_RUNTIME_PATH PIPEWIRE_RUNTIME_DIR PIPEWIRE_REMOTE"
 
-# Put this shell on the desktop whose owner's runtime folder is $1 (default: ward $WARD_ID's).
-# The env file is written inside the ward, so it is read as data, never sourced:
-# only the variables ward-desktop writes, each taken verbatim.
+# Put this shell on the desktop ward_desktop_read checked last: its checked lines
+# (_denv), not its `env` file, which is written inside the ward and could have
+# changed since. Each line is exported verbatim, never run.
 ward_desktop_env() {
   # shellcheck disable=SC2086
   unset $WARD_DESKTOP_UNSET
   while IFS= read -r _line; do
-    case ${_line%%=*} in
-      XDG_RUNTIME_DIR|WAYLAND_DISPLAY|UMBRIEL_SOCKET|DBUS_SESSION_BUS_ADDRESS|XDG_CURRENT_DESKTOP|XDG_SESSION_DESKTOP|XDG_SESSION_TYPE|TMPDIR|XDG_CONFIG_HOME|DISPLAY)
-        export "$_line" ;;
-    esac
-  done < "${1:-$WARD_RUNTIME/$WARD_ID}/desktop/env"
+    [ -z "$_line" ] || export "$_line"
+  done <<ENV
+$_denv
+ENV
 }
 
 # ID map for every ward's user namespace: your uid/gid stays itself (1000 → 1000),
@@ -82,6 +81,65 @@ ward_resolve() {
 # The id of the desktop of T3 thread $1 where there is no ward (src/paths.ts: threadDesktopId).
 ward_thread_desktop_id() {
   printf 't-%s' "$(ward_sanitize "$1")"
+}
+
+# ward_desktop_read ID UNIT [HOLDER]: whether desktop ID (a ward's, or a
+# thread's) is up and its files are its own, setting _denv to its environment
+# (the checked lines of its `env`) and _dcgroup to its unit's cgroup. Its folder
+# is under the runtime folder every program of yours can write, so nothing there
+# is taken on trust: `pid` must name a live process of UNIT (the ward's unit, or
+# the thread desktop's own), `env` may hold only the names libexec/ward-desktop
+# writes, all pointing into ID's own desktop folder through a short name d<digits>,
+# and the sockets it names must be sockets of that folder, neither links nor hard
+# links, which would reach another server: your live session's.
+# A ward's desktop writes its pid as the ward's PID namespace sees it. From the
+# host, HOLDER is the ward's namespace holder (`pid` in the ward's runtime folder,
+# a host pid), and the desktop's pid is looked up in the ward's /proc through it,
+# once HOLDER is shown to be a process of UNIT in another PID namespace than this
+# one; inside the ward (no HOLDER), /proc is the ward's own.
+ward_desktop_read() {
+  _d=$WARD_RUNTIME/$1/desktop _denv= _dcgroup= _proc=/proc
+  [ -d "$_d" ] && [ ! -L "$WARD_RUNTIME/$1" ] && [ ! -L "$_d" ] || return 1
+  if [ -n "${3:-}" ]; then
+    case $3 in *[!0-9]*) return 1 ;; esac
+    { IFS= read -r _hcg < "/proc/$3/cgroup"; } 2>/dev/null || return 1
+    case $_hcg in 0::/*/"$2") ;; *) return 1 ;; esac
+    [ ! "/proc/$3/ns/pid" -ef "/proc/$$/ns/pid" ] || return 1
+    _proc=/proc/$3/root/proc
+  fi
+  { IFS= read -r _dpid < "$_d/pid"; } 2>/dev/null || return 1
+  case $_dpid in '' | *[!0-9]*) return 1 ;; esac
+  { IFS= read -r _dcgroup < "$_proc/$_dpid/cgroup"; } 2>/dev/null || return 1
+  case $_dcgroup in 0::/*/"$2") _dcgroup=/sys/fs/cgroup${_dcgroup#0::} ;; *) return 1 ;; esac
+  _xrd= _wd= _us= _bus= _tmp= _cfg=
+  while IFS= read -r _line || [ -n "$_line" ]; do
+    _v=${_line#*=}
+    case $_line in
+      XDG_RUNTIME_DIR=*) _xrd=$_v ;;
+      WAYLAND_DISPLAY=*) _wd=$_v ;;
+      UMBRIEL_SOCKET=*) _us=$_v ;;
+      DBUS_SESSION_BUS_ADDRESS=*) _bus=$_v ;;
+      TMPDIR=*) _tmp=$_v ;;
+      XDG_CONFIG_HOME=*) _cfg=$_v ;;
+      XDG_CURRENT_DESKTOP=* | XDG_SESSION_DESKTOP=* | XDG_SESSION_TYPE=*) case $_v in *[!A-Za-z0-9:_-]*) return 1 ;; esac ;;
+      DISPLAY=) ;;
+      *) return 1 ;;
+    esac
+    _denv="$_denv$_line
+"
+  done < "$_d/env" 2>/dev/null || return 1
+  case $_wd in wayland-[0-9]*) case $_wd in *[!a-z0-9-]*) return 1 ;; esac ;; *) return 1 ;; esac
+  case ${_xrd##*/} in d | d*[!0-9]*) return 1 ;; d*) ;; *) return 1 ;; esac
+  [ "$_xrd" -ef "$_d" ] || return 1
+  [ "$_us" = "$_xrd/umbriel-$_wd.sock" ] && [ "$_bus" = "unix:path=$_xrd/bus" ] || return 1
+  [ -z "$_tmp" ] || [ "$_tmp" = "$_xrd/tmp" ] || return 1
+  [ -z "$_cfg" ] || [ "$_cfg" = "$_xrd/tmp/desktop/config" ] || return 1
+  for _s in "$_xrd/$_wd" "$_us" "$_xrd/bus"; do
+    [ -S "$_s" ] && [ ! -L "$_s" ] || return 1
+  done
+  [ "$(stat -c %h -- "$_xrd/$_wd" "$_us" "$_xrd/bus" 2>/dev/null)" = "1
+1
+1" ]
 }
 
 ward_enabled() {

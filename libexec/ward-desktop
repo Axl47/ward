@@ -5,7 +5,9 @@
 # notifications, portals or sound server (with Caliban installed, it gets a
 # sound server of its own). wardd runs `ward-desktop ID NAME` through
 # `ward exec`, inside the ward, or `ward-desktop ID` as a thread's desktop unit;
-# it is up once $rt/desktop/env exists (see docs/DESIGN.md, "Desktops").
+# it is up once $rt/desktop/env exists, and bin/ward uses it only while `pid`
+# names this process and `env` names this desktop's own folder (see
+# docs/DESIGN.md, "Desktops"); keep ward_desktop_read in step with what is written here.
 set -eu
 . "$(dirname -- "$(readlink -f -- "$0")")/ward-lib.sh"
 

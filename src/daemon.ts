@@ -319,15 +319,21 @@ async function stopContainers(id: string): Promise<void> {
 }
 
 /**
- * Whether the desktop is up; bin/ward makes the same check. A ward's desktop
- * writes its pid as the ward's PID namespace sees it, so it is looked up in the
- * ward's /proc, through the namespace holder; a thread's desktop runs on the host.
+ * Whether desktop `id` (a ward's, or a thread's) is up: its `env` written, and its
+ * `pid` naming a live process of the desktop's own unit, so files anyone could
+ * leave in the shared runtime folder don't pass for a desktop that needn't start.
+ * bin/ward (ward_desktop_read) also checks what `env` names before using it. A
+ * ward's desktop writes its pid as the ward's PID namespace sees it, so it is
+ * looked up in the ward's /proc, through the namespace holder; a thread's
+ * desktop runs on the host.
  */
 function desktopReady(id: string): boolean {
   const dir = wardDesktopDir(id);
+  const unit = wards.has(id) ? unitName(id) : desktopUnitName(id);
   try {
     const proc = wards.has(id) ? `/proc/${readPid(id) ?? 0}/root/proc` : "/proc";
-    return existsSync(join(dir, "env")) && existsSync(`${proc}/${Number(readFileSync(join(dir, "pid"), "utf8"))}`);
+    const pid = readFileSync(join(dir, "pid"), "utf8").trim();
+    return /^\d+$/.test(pid) && existsSync(join(dir, "env")) && readFileSync(`${proc}/${pid}/cgroup`, "utf8").trim().endsWith(`/${unit}`);
   } catch {
     return false;
   }
