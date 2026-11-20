@@ -6,7 +6,7 @@ Gives every T3 Code worktree on gaia-arch its own network namespace, Podman and 
 
 ## Setup
 
-Needs Linux with unprivileged user namespaces, Node 24+, `podman`, `passt`, `crun`, and subuid/subgid ranges for your user (`/etc/subuid`, `/etc/subgid`). Desktops also need `umbriel`, `dbus-daemon`, `at-spi2-core` for apps' text, and `wtype` for typing into them.
+Needs Linux with unprivileged user namespaces, Node 24+, `podman`, `passt`, `crun`, and subuid/subgid ranges for your user (`/etc/subuid`, `/etc/subgid`). Desktops also need `umbriel`, `dbus-daemon`, `at-spi2-core` for apps' text, and `wtype` for typing into them; with [Caliban](https://github.com/Axl47/caliban) installed they also get a sound server of their own.
 
 ```sh
 pnpm install
@@ -33,11 +33,11 @@ Wards start on the first command in a worktree. They stop once every thread on i
 
 ### Desktops
 
-`ward desktop -- CMD` runs `CMD` in the ward on a desktop of its own: a headless Umbriel with one 1280×720 output, its own session bus and no shell. It starts on the first `ward desktop` and stops with the ward. It shares no compositor, session bus, notifications, portals or sound with your session, and apps get a profile of their own there: its config folder mirrors `~/.config` with links to your files, minus browser and Electron profiles, and what an app creates stays in the ward. [Puck](https://github.com/Axl47/puck) acts on it by default for an agent in a ward; `ward desktop` alone prints its environment (`WAYLAND_DISPLAY` and the rest) for anything else that should. Its log is `desktop.log` in the ward's data folder.
+`ward desktop -- CMD` runs `CMD` in the ward on a desktop of its own: a headless Umbriel with one 1280×720 output, its own session bus and no shell. It starts on the first `ward desktop` and stops with the ward. It shares no compositor, session bus, notifications, portals or sound server with your session (apps on it play nothing, or into a sink of its own when Caliban is installed), and apps get a profile of their own there: its config folder mirrors `~/.config` with links to your files, minus browser and Electron profiles, and what an app creates stays in the ward. [Puck](https://github.com/Axl47/puck) acts on it by default for an agent in a ward; `ward desktop` alone prints its environment (`WAYLAND_DISPLAY` and the rest) for anything else that should. Its log is `desktop.log` in the ward's data folder.
 
 Where a T3 thread has no ward, the same command gives the thread a desktop of its own: the same desktop without the network namespace, so apps on it reach the thread's `localhost` ports directly. It starts with the first `ward desktop -- CMD` (plain `ward desktop` prints nothing until then, and exits 3). It stops when the thread settles or after 2 hours unused, keeping nothing, and the thread's next call starts it again, empty. Agents open things through Puck's `puck open CMD`, which runs this, waits for the window and prints it.
 
-Only the prefixed command is on that desktop: a GUI app started without it opens on your screen, and outside both a ward and a T3 thread the prefixed command fails rather than opening there. The prefixed command has no keyring, `systemctl --user` or sound, so build, commit and push without it. X11-only apps don't run there. The rest of your home folder is shared, so an app that finds its running copy through files there still reaches the one on your screen: a Firefox with its profile in `~/.mozilla` refuses to start beside it (give it `--profile DIR`), and Zed keeps a socket in `~/.local/share/zed`.
+Only the prefixed command is on that desktop: a GUI app started without it opens on your screen, and outside both a ward and a T3 thread the prefixed command fails rather than opening there. The prefixed command has no keyring or `systemctl --user`, so build, commit and push without it. A plain `ward exec` command still plays sound through your session's PipeWire, out of your speakers. X11-only apps don't run there. The rest of your home folder is shared, so an app that finds its running copy through files there still reaches the one on your screen: a Firefox with its profile in `~/.mozilla` refuses to start beside it (give it `--profile DIR`), and Zed keeps a socket in `~/.local/share/zed`.
 
 ### Limits
 
