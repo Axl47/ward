@@ -9,6 +9,7 @@ import { homedir, userInfo } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { promisify } from "node:util";
 import type { BrokerReply, BrokerRequest, PortInfo, Route, Routes, UpResult, WardInfo } from "./api.ts";
+import { identify, type Caller } from "./caller.ts";
 import {
   CONTROL_SOCKET,
   desktopStateDir,
@@ -1214,6 +1215,28 @@ const handlers: Handlers = {
   },
 };
 
+/**
+ * What a caller inside a ward may ask, always about its own ward (`id`, from
+ * its network namespace): map a port, start its desktop, start the host's adb
+ * server (bin/ward, shims/adb), and list itself (`ward ports`). Everything
+ * else, and any other ward's id, is the host's alone.
+ */
+const wardHandlers: { [R in Route]?: (id: string, body: Routes[R]["body"]) => Promise<Routes[R]["result"]> } = {
+  "POST /port": (id, body) => {
+    if (body.id !== id) throw new Forbidden(`a ward can map only its own ports, not ${body.id}'s`);
+    return handlers["POST /port"](body);
+  },
+  "POST /desktop": (id, body) => {
+    if ("thread" in body || body.id !== id || (body.worktree !== undefined && body.worktree !== wards.get(id)?.worktree))
+      throw new Forbidden("a ward can start only its own desktop");
+    return handlers["POST /desktop"]({ id });
+  },
+  "POST /adb-server": (_id, body) => handlers["POST /adb-server"](body),
+  "GET /ls": async (id, body) => (await handlers["GET /ls"](body)).filter((w) => w.id === id),
+};
+
+class Forbidden extends Error {}
+
 function readBody(req: IncomingMessage): Promise<unknown> {
   return new Promise((resolve, reject) => {
     let data = "";
@@ -1230,6 +1253,13 @@ function readBody(req: IncomingMessage): Promise<unknown> {
   });
 }
 
+/** Each connection's caller, looked up once: a keep-alive client sends several requests on one. */
+const callers = new WeakMap<object, Caller | undefined>();
+function callerOf(req: IncomingMessage): Caller | undefined {
+  if (!callers.has(req.socket)) callers.set(req.socket, identify(req.socket, [...wards.keys()].map((id) => [id, readPid(id)] as const)));
+  return callers.get(req.socket);
+}
+
 async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const route = `${req.method} ${req.url}`;
   const reply = (status: number, body: unknown) => {
@@ -1237,11 +1267,19 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     res.end(JSON.stringify(body));
   };
   if (!(route in handlers)) return reply(404, { error: `unknown route ${route}` });
+  const caller = callerOf(req);
+  if (caller === undefined) return reply(403, { error: "wardd answers only the host and its wards" });
+  let handler: (body: unknown) => Promise<unknown>;
+  if (caller.kind === "host") handler = handlers[route as Route] as (body: unknown) => Promise<unknown>;
+  else {
+    const forWard = wardHandlers[route as Route] as ((id: string, body: unknown) => Promise<unknown>) | undefined;
+    if (forWard === undefined) return reply(403, { error: `${route} is not available inside a ward` });
+    handler = (body) => forWard(caller.id, body);
+  }
   try {
-    const handler = handlers[route as Route] as (body: unknown) => Promise<unknown>;
     reply(200, await handler(await readBody(req)));
   } catch (error) {
-    reply(500, { error: error instanceof Error ? error.message : String(error) });
+    reply(error instanceof Forbidden ? 403 : 500, { error: error instanceof Error ? error.message : String(error) });
   }
 }
 
