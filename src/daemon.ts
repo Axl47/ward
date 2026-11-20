@@ -197,9 +197,15 @@ async function prepareGradle(record: WardRecord, starting: boolean): Promise<str
     if (!starting) return source;
     rmSync(join(rt, "own-homes"), { force: true });
     // The ward owns its state folder: write there only while none of its processes can run.
-    const { stdout } = await systemctl("show", "--property=ActiveState", "--value", unitName(record.id));
-    if (stdout.trim() !== "inactive" && stdout.trim() !== "failed") throw new Error(`its unit is ${stdout.trim()}`);
+    // A failed unit can have processes left, so its cgroup must be empty or gone as well.
+    const { stdout } = await systemctl("show", "--property=ActiveState,ControlGroup", unitName(record.id));
+    const unit = Object.fromEntries(stdout.split("\n").map((line) => line.split(/=(.*)/s)));
+    if (unit.ActiveState !== "inactive" && unit.ActiveState !== "failed") throw new Error(`its unit is ${unit.ActiveState}`);
+    if (unit.ControlGroup && readFileSync(join("/sys/fs/cgroup", unit.ControlGroup, "cgroup.procs"), "utf8").trim() !== "")
+      throw new Error("its unit still has processes");
     const kotlin = realFolder(KOTLIN_DAEMON_DIR);
+    // own-homes is NAME PATH lines that ward-init-root reads word by word.
+    if ([source, kotlin].some((path) => /\n|^\s|\s$/.test(path))) throw new Error("a path starts or ends with a space, or has a line break");
     const failure = await ownFolder(join(wardStateDir(record.id), "gradle"), hasGradleBuild(record.worktree) ? source : undefined);
     if (failure !== undefined) log(`ward ${record.id}: ${failure}`);
     await ownFolder(join(wardStateDir(record.id), "kotlin-daemon"));
@@ -826,7 +832,7 @@ function attach(record: WardRecord): void {
       };
       if (reply.port !== BUILD_CACHE_PORT) return relayToHost(upstream, reply.port, track);
       track(upstream);
-      return acceptBuildCache(upstream, projectStore(record.repo));
+      return acceptBuildCache(upstream, projectStore(record.repo), record.id);
     }
     const callback = ward.pending.get(reply.req);
     ward.pending.delete(reply.req);
@@ -1177,7 +1183,7 @@ function readDevicePort(): number | undefined {
 
 /** Point a ward's relay at the device daemon's current port; ports pasta already forwards need none. */
 function relayDeviceDaemon(ward: LiveWard): void {
-  const port = devicePort !== undefined && !ward.hostPorts.has(devicePort) ? devicePort : undefined;
+  const port = devicePort !== undefined && devicePort !== BUILD_CACHE_PORT && !ward.hostPorts.has(devicePort) ? devicePort : undefined;
   if (ward.scanTimer === undefined || ward.relayPort === port) return;
   if (ward.relayPort !== undefined) ward.broker.send({ t: "unrelay", port: ward.relayPort } satisfies BrokerRequest);
   ward.relayPort = port;

@@ -9,8 +9,8 @@
 // can't write.
 import { execFile } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { copyFileSync, createWriteStream, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { mkdir, open, readdir, rename, rm, stat, unlink } from "node:fs/promises";
+import { createWriteStream, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { mkdir, open, readdir, rm, stat, unlink } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { Socket } from "node:net";
 import { dirname, join } from "node:path";
@@ -64,6 +64,15 @@ export function hasGradleBuild(worktree: string): boolean {
   );
 }
 
+/** Get what a ward left at `path` out of the way: deleted, or moved aside when it can't be (a folder the ward made unreadable). */
+function clear(path: string): void {
+  try {
+    rmSync(path, { recursive: true, force: true });
+  } catch {
+    renameSync(path, `${path}.left-${Date.now()}`);
+  }
+}
+
 /**
  * Make `path`, in a ward's state folder, a real folder of the ward's own. Anything
  * else there (a link the ward left, a file) is removed without being followed, and
@@ -74,11 +83,11 @@ export function hasGradleBuild(worktree: string): boolean {
  */
 export async function ownFolder(path: string, source?: string): Promise<string | undefined> {
   if (lstatSync(path, { throwIfNoEntry: false })?.isDirectory()) return;
-  rmSync(path, { recursive: true, force: true });
+  clear(path);
   mkdirSync(dirname(path), { recursive: true });
   if (source === undefined) return void mkdirSync(path);
   const tmp = `${path}.tmp`;
-  rmSync(tmp, { recursive: true, force: true });
+  clear(tmp);
   try {
     mkdirSync(join(tmp, "caches"), { recursive: true });
     const caches = children(join(source, "caches"))
@@ -99,8 +108,9 @@ export async function ownFolder(path: string, source?: string): Promise<string |
  * Write the settings ward-init-root mounts read-only over a ward's Gradle home, into
  * `dir` in the ward's runtime folder: your gradle.properties, plus a 10-minute daemon
  * idle timeout unless it sets one, and init.d with your regular *.gradle and
- * *.gradle.kts files plus Ward's build cache script. Called on every `up`; files are
- * rewritten in place, so a running ward's mounts show the new ones.
+ * *.gradle.kts files plus Ward's build cache script. Called on every `up`, and a
+ * running ward's mounts show the new ones: gradle.properties is rewritten in place
+ * (its mount is of the file) and only when it changed; a script is replaced whole.
  */
 export function writeGradleSettings(dir: string, source: string): void {
   let properties = "";
@@ -111,12 +121,17 @@ export function writeGradleSettings(dir: string, source: string): void {
     properties += `${properties === "" || properties.endsWith("\n") ? "" : "\n"}# Added by Ward: idle daemons in a ward stop after 10 minutes.\norg.gradle.daemon.idletimeout=600000\n`;
   const initD = join(dir, "init.d");
   mkdirSync(initD, { recursive: true });
-  writeFileSync(join(dir, "gradle.properties"), properties);
+  const current = join(dir, "gradle.properties");
+  if (!existsSync(current) || readFileSync(current, "utf8") !== properties) writeFileSync(current, properties);
+  const put = (name: string, text: string | Buffer) => {
+    writeFileSync(join(initD, `.${name}.tmp`), text);
+    renameSync(join(initD, `.${name}.tmp`), join(initD, name));
+  };
   const yours = children(join(source, "init.d"))
     .filter((e) => e.isFile() && /\.gradle(\.kts)?$/.test(e.name) && e.name !== INIT_SCRIPT_NAME)
     .map((e) => e.name);
-  for (const name of yours) copyFileSync(join(source, "init.d", name), join(initD, name));
-  writeFileSync(join(initD, INIT_SCRIPT_NAME), INIT_SCRIPT);
+  for (const name of yours) put(name, readFileSync(join(source, "init.d", name)));
+  put(INIT_SCRIPT_NAME, INIT_SCRIPT);
   for (const { name } of children(initD)) if (name !== INIT_SCRIPT_NAME && !yours.includes(name)) rmSync(join(initD, name), { recursive: true, force: true });
 }
 
@@ -132,8 +147,23 @@ const cacheServer = createServer((req, res) => void serve(projectStores.get(req.
 cacheServer.timeout = 300_000;
 cacheServer.keepAliveTimeout = 120_000;
 
-/** Serve the build cache on a connection a ward's broker accepted on BUILD_CACHE_PORT, from that ward's project's store. */
-export function acceptBuildCache(socket: Socket, store: string): void {
+/** Connections one ward may hold to the cache; Gradle keeps a handful. wardd's file descriptors are every ward's. */
+const WARD_CONNECTIONS_MAX = 64;
+const openConnections = new Map<string, number>();
+
+/**
+ * Serve the build cache on a connection ward `id`'s broker accepted on BUILD_CACHE_PORT,
+ * from its project's store. Past WARD_CONNECTIONS_MAX the connection is closed.
+ */
+export function acceptBuildCache(socket: Socket, store: string, id: string): void {
+  const open = openConnections.get(id) ?? 0;
+  if (open >= WARD_CONNECTIONS_MAX) return void socket.destroy();
+  openConnections.set(id, open + 1);
+  socket.once("close", () => {
+    const left = (openConnections.get(id) ?? 1) - 1;
+    if (left > 0) openConnections.set(id, left);
+    else openConnections.delete(id);
+  });
   projectStores.set(socket, store);
   cacheServer.emit("connection", socket);
   socket.resume(); // the broker hands sockets over paused
@@ -176,7 +206,7 @@ export async function serve(store: string | undefined, req: IncomingMessage, res
           await rm(tmp);
           return status(size === 0 ? 400 : 413);
         }
-        await rename(tmp, file);
+        renameSync(tmp, file); // synchronous, as the sweep's check and delete are: neither lands inside the other
       } catch (error) {
         await rm(tmp, { force: true });
         throw error;
@@ -228,8 +258,14 @@ export async function sweepBuildCache(dir = BUILD_CACHE_DIR, max = BUILD_CACHE_M
   let total = entries.reduce((sum, e) => sum + e.size, 0);
   for (const entry of entries.sort((a, b) => a.used - b.used)) {
     if (total <= max) break;
-    if ((await stat(entry.path).catch(() => undefined))?.mtimeMs !== entry.used) continue;
-    if (await remove(entry.path)) total -= entry.size;
+    try {
+      if (statSync(entry.path).mtimeMs !== entry.used) continue;
+      unlinkSync(entry.path);
+    } catch {
+      continue;
+    }
+    deleted++;
+    total -= entry.size;
   }
   return deleted;
 }
@@ -248,5 +284,8 @@ export function sweepSoon(): void {
   storedSinceSweep = 0;
   void sweepBuildCache()
     .then((n) => n > 0 && console.log(`build cache: deleted ${n} files`), (e: unknown) => console.log(`build cache sweep: ${String(e)}`))
-    .finally(() => (sweeping = false));
+    .finally(() => {
+      sweeping = false;
+      if (storedSinceSweep > BUILD_CACHE_MAX / 10) sweepSoon(); // uploads that came in meanwhile
+    });
 }

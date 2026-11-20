@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -61,6 +61,17 @@ test("links a ward left where its home goes are removed, never followed", async 
   assert.ok(lstatSync(join(state, "gradle")).isDirectory());
   assert.ok(!existsSync(join(state, "gradle.tmp")));
   assert.deepEqual([readdirSync(join(decoy, "home")), readdirSync(join(decoy, "tmp"))], [["keep"], ["keep"]]);
+});
+
+test("what a ward left that can't be deleted is moved aside, and its home is still its own", async () => {
+  const state = fresh();
+  put(join(state, "gradle.tmp/sealed/file"));
+  chmodSync(join(state, "gradle.tmp/sealed"), 0);
+  const source = fresh();
+  put(join(source, "caches/modules-2/files-2.1/a.jar"));
+  await ownFolder(join(state, "gradle"), source);
+  assert.ok(lstatSync(join(state, "gradle")).isDirectory());
+  for (const name of readdirSync(state)) if (name.startsWith("gradle.tmp.left-")) chmodSync(join(state, name, "sealed"), 0o700);
 });
 
 test("a ward's home is cloned only for a worktree with a Gradle build at its root or one folder down", () => {
