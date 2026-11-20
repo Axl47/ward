@@ -1,8 +1,9 @@
 #!/bin/sh
-# A ward's private desktop: a session bus of its own and a headless Umbriel on
-# it, with a runtime folder of their own as XDG_RUNTIME_DIR, so nothing on it
-# reaches the live session's compositor, bus names, notifications, portals or
-# audio. wardd runs `ward-desktop ID` through `ward exec`, inside the ward;
+# ward-desktop ID [NAME]: a private desktop, a session bus of its own and a
+# headless Umbriel on it, with a runtime folder of their own as XDG_RUNTIME_DIR,
+# so nothing on it reaches the live session's compositor, bus names,
+# notifications, portals or audio. wardd runs `ward-desktop ID NAME` through
+# `ward exec`, inside the ward, or `ward-desktop ID` as a thread's desktop unit;
 # it is up once $rt/desktop/env exists (see docs/DESIGN.md, "Desktops").
 set -eu
 . "$(dirname -- "$(readlink -f -- "$0")")/ward-lib.sh"
@@ -46,17 +47,27 @@ if [ "$1" = --session ]; then
 fi
 
 # Sockets live in XDG_RUNTIME_DIR and their paths must fit in 108 bytes, the
-# compositor's and every app's, so it is a short name for $rt/desktop: d<this
-# process's id>, new at every start, so a command still holding the name of an
-# earlier desktop, this ward's or another's, can't act on this one. This ward's
-# earlier names go here, and the last one with the ward (units/ward@.service).
-for old in "$WARD_RUNTIME"/d[0-9]*; do
-  [ "$(readlink "$old" 2>/dev/null)" != "$1/desktop" ] || rm -f "$old"
-done
-dir=$WARD_RUNTIME/d$$
+# compositor's and every app's, so it is a short name for $rt/desktop, new at
+# every start, so a command still holding the name of an earlier desktop, this
+# ward's or another's, can't act on this one. A ward's desktop is given its name
+# (NAME, a link wardd made: Ward's runtime folder is read-only inside the ward);
+# a thread's desktop, which runs in no ward, names itself d<this process's id>.
+# Earlier names go here or with wardd, and the last one with the ward
+# (units/ward@.service) or the thread's desktop.
 umask 077
-mkdir -p "$WARD_RUNTIME/$1/desktop/services"
-ln -sfn "$1/desktop" "$dir"
+own_link=
+if [ -n "${2:-}" ]; then
+  dir=$WARD_RUNTIME/$2
+else
+  for old in "$WARD_RUNTIME"/d[0-9]*; do
+    [ "$(readlink "$old" 2>/dev/null)" != "$1/desktop" ] || rm -f "$old"
+  done
+  dir=$WARD_RUNTIME/d$$
+  mkdir -p "$WARD_RUNTIME/$1/desktop"
+  ln -sfn "$1/desktop" "$dir"
+  own_link=$dir
+fi
+mkdir -p "$dir/services"
 # `ward desktop` treats the desktop as up while this process lives; it waits for
 # the compositor below.
 echo $$ > "$dir/pid"
@@ -128,7 +139,7 @@ bus=$!
 # with the bus; the registry is only on the latter, so it is stopped by pid. So
 # do `env`, which says the desktop is up, and the desktop's name.
 # shellcheck disable=SC2046 # no registry.pid, no second pid
-trap 'kill "$bus" $(cat "$dir/registry.pid" 2>/dev/null) 2>/dev/null; rm -f "$dir/env" "$dir"' EXIT
+trap 'kill "$bus" $(cat "$dir/registry.pid" 2>/dev/null) 2>/dev/null; rm -f "$dir/env" $own_link' EXIT
 for _ in $(seq 100); do
   [ -S "$dir/bus" ] && break
   sleep 0.02

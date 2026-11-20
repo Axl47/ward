@@ -358,13 +358,17 @@ async function desktop(id: string, worktree?: string): Promise<Record<string, ne
     // plain `ward exec` would start the ward again, waiting on this very lock, or
     // run the desktop outside any ward once the project is disabled.
     if (!isReady(ward)) throw new Error(`ward ${ward} was stopped while its desktop was starting; try again`);
-    rmSync(wardDesktopDir(ward), { recursive: true, force: true });
+    // Emptied, not replaced: the folder is bind-mounted into the ward (libexec/ward-init-root).
+    const dir = wardDesktopDir(ward);
+    mkdirSync(dir, { recursive: true });
+    for (const entry of readdirSync(dir)) rmSync(join(dir, entry), { recursive: true, force: true });
+    const name = desktopName(ward);
     // In a file, as init.log is: journald drops what is written from inside the ward's
     // user namespace. With the ward's data and not its runtime folder, because
     // every program the compositor starts writes here, for as long as the ward exists.
     const logFile = join(wardStateDir(ward), "desktop.log");
     const out = openSync(logFile, "a");
-    const child = spawn(join(WARD_HOME, "bin/ward"), ["exec", "--running", "--worktree", root, "--", join(WARD_HOME, "libexec/ward-desktop"), ward], {
+    const child = spawn(join(WARD_HOME, "bin/ward"), ["exec", "--running", "--worktree", root, "--", join(WARD_HOME, "libexec/ward-desktop"), ward, name], {
       cwd: root, // where programs the compositor starts (Puck's launch_app) start
       detached: true,
       stdio: ["ignore", out, out],
@@ -372,13 +376,44 @@ async function desktop(id: string, worktree?: string): Promise<Record<string, ne
     closeSync(out);
     child.unref();
     let exited = false;
-    child.once("exit", () => (exited = true)).once("error", () => (exited = true));
+    const gone = () => {
+      exited = true;
+      dropDesktopName(name, ward);
+    };
+    child.once("exit", gone).once("error", gone);
     await desktopUp(ward, `ward ${ward}'s desktop`, logFile, async () => exited, () => {
       // Its own process group (detached), so this takes the bus and compositor with it.
       if (!exited && child.pid !== undefined) process.kill(-child.pid, "SIGKILL");
     });
     return {};
   });
+}
+
+/**
+ * A new short name for ward `id`'s desktop folder (see libexec/ward-desktop), as a
+ * link in Ward's runtime folder, which the ward itself can't write. Its earlier
+ * names go first. The number is random and above any pid, so it never meets the
+ * d<pid> name a thread's desktop gives itself, and a command holding an earlier
+ * desktop's name can't reach this one.
+ */
+function desktopName(id: string): string {
+  for (const entry of readdirSync(RUNTIME_DIR)) if (/^d\d+$/.test(entry)) dropDesktopName(entry, id);
+  for (;;) {
+    const name = `d9${String(Math.floor(Math.random() * 1e9)).padStart(9, "0")}`;
+    try {
+      symlinkSync(`${id}/desktop`, join(RUNTIME_DIR, name));
+      return name;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    }
+  }
+}
+
+/** Remove the short name `name` if it still names ward `id`'s desktop. */
+function dropDesktopName(name: string, id: string): void {
+  try {
+    if (readlinkSync(join(RUNTIME_DIR, name)) === `${id}/desktop`) unlinkSync(join(RUNTIME_DIR, name));
+  } catch {}
 }
 
 /** Wait until desktop `id` is up. If it exits first or takes too long, stop it and throw with the end of its log. */
