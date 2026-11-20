@@ -7,7 +7,8 @@ StopWhenUnneeded=no
 [Service]
 Type=simple
 ExecStart=@WARD_HOME@/libexec/ward-init %i
-ExecStopPost=/bin/sh -c 'rm -rf "$XDG_RUNTIME_DIR/ward/%i/ready" "$XDG_RUNTIME_DIR/ward/%i/pid"'
+# The d<pid> link is the short name of the ward's desktop (libexec/ward-desktop); $$ is a literal $ here.
+ExecStopPost=/bin/sh -c 'cd "$XDG_RUNTIME_DIR/ward" || exit 0; for l in d[0-9]*; do [ "$$(readlink "$$l")" != "%i/desktop" ] || rm -f "$$l"; done; rm -rf "%i/ready" "%i/pid" "%i/desktop"'
 KillMode=control-group
 TimeoutStopSec=15
 Restart=no

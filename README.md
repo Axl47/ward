@@ -2,11 +2,11 @@
 
 # Ward
 
-Gives every T3 Code worktree on gaia-arch its own network namespace, Podman and `TMPDIR`, so parallel agent threads can all run a dev server on 5173 and Postgres on 5432 without colliding. [docs/DESIGN.md](docs/DESIGN.md) explains how, and [docs/PROFILE.md](docs/PROFILE.md) what it costs.
+Gives every T3 Code worktree on gaia-arch its own network namespace, Podman and `TMPDIR`, so parallel agent threads can all run a dev server on 5173 and Postgres on 5432 without colliding, and a private headless desktop on demand, so they can each drive a GUI app without sharing your screen. [docs/DESIGN.md](docs/DESIGN.md) explains how, and [docs/PROFILE.md](docs/PROFILE.md) what it costs.
 
 ## Setup
 
-Needs Linux with unprivileged user namespaces, Node 24+, `podman`, `passt`, `crun`, and subuid/subgid ranges for your user (`/etc/subuid`, `/etc/subgid`).
+Needs Linux with unprivileged user namespaces, Node 24+, `podman`, `passt`, `crun`, and subuid/subgid ranges for your user (`/etc/subuid`, `/etc/subgid`). Desktops also need `umbriel`, `dbus-daemon`, `at-spi2-core` for apps' text, and `wtype` for typing into them.
 
 ```sh
 pnpm install
@@ -24,11 +24,20 @@ Inside a ward, services are at their usual `localhost` ports. From the host:
 ward ls                 # wards, slots and port mappings
 ward ports              # this worktree's ward port → host port
 ward exec -- CMD        # run CMD in the current worktree's ward
+ward desktop -- CMD     # run a GUI app on the ward's private desktop
 ward stop | ward rm     # stop (keeps data) or remove a ward
 ward images pull IMAGE  # pull into the image store every ward shares
 ```
 
 Wards start on the first command in a worktree. They stop once every thread on it has settled, or 30 minutes after the last command when it has no active thread. When the worktree is deleted, the ward's data goes to a trash for 7 days.
+
+### Desktops
+
+`ward desktop -- CMD` runs `CMD` in the ward on a desktop of its own: a headless Umbriel with one 1280×720 output, its own session bus and no shell. It starts on the first `ward desktop` and stops with the ward. It shares no compositor, session bus, notifications, portals or sound with your session, and apps get a profile of their own there: its config folder mirrors `~/.config` with links to your files, minus browser and Electron profiles, and what an app creates stays in the ward. [Puck](https://github.com/Axl47/puck) acts on it by default for an agent in a ward; `ward desktop` alone prints its environment (`WAYLAND_DISPLAY` and the rest) for anything else that should. Its log is `desktop.log` in the ward's data folder.
+
+Only the prefixed command is on that desktop: a GUI app started without it opens on your screen, as outside a ward, and where there is no ward the prefixed command fails rather than opening there. The prefixed command has no keyring, `systemctl --user` or sound, so build, commit and push without it. X11-only apps don't run there. The rest of your home folder is shared, so an app that finds its running copy through files there still reaches the one on your screen: a Firefox with its profile in `~/.mozilla` refuses to start beside it (give it `--profile DIR`), and Zed keeps a socket in `~/.local/share/zed`.
+
+### Limits
 
 Inside a ward, `sudo` doesn't work, and host services are reachable only on the ports in `WARD_HOST_PORTS` (default `3773,5037`, plus DNS) and the project's own, set with `ward enable <repo> --host-ports 39003,…`. The flag replaces the project's list, and a ward picks up a new list only when it next starts: `ward enable` names the running wards still on the old one (`ward stop` them to apply it now). A forwarded host port is taken inside the ward, so a server in the ward can't listen on it (`EADDRINUSE`). Port 53, Ward's own host ports (20100–29999) and lists over 200 ports in all are refused. In a ward, `WARD_FORWARDED_PORTS` lists what it reaches. `/tmp` and `XDG_RUNTIME_DIR` are the host's, shared by every ward, so keep per-worktree pid files and sockets in `TMPDIR`.
 
@@ -36,7 +45,7 @@ Connections through a mapped port end with a reset when their ward stops or `war
 
 ## Upgrade
 
-`git pull`, then `systemctl --user restart wardd`. The restart resets connections open through mapped ports; wards and what runs in them carry on. Running wards keep the settings they started with (their TCP table size, host ports) until they next start.
+`git pull`, then `systemctl --user restart wardd`, and `bin/ward install` again when `units/` changed. The restart resets connections open through mapped ports; wards and what runs in them carry on. Running wards keep the settings they started with (their TCP table size, host ports) until they next start.
 
 ## Develop
 

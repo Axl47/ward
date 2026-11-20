@@ -60,6 +60,8 @@ export function projectHostPorts(repo: string): number[] {
 }
 
 export const wardRuntimeDir = (id: string) => join(RUNTIME_DIR, id);
+/** The ward desktop's own XDG_RUNTIME_DIR: its Wayland, Umbriel and session bus sockets, and `env` once it is up. */
+export const wardDesktopDir = (id: string) => join(RUNTIME_DIR, id, "desktop");
 export const wardStateDir = (id: string) => join(STATE_DIR, "wards", id);
 /** Where a removed ward's data waits before it is purged, keyed by worktree so colliding ids can't clash. */
 export const wardTrashDir = (id: string, worktree: string) =>

@@ -2,7 +2,7 @@
 // maps each port a ward listens on to a host port in the ward's slot, and runs
 // the reconciler that stops or removes wards when T3 is done with them.
 import { execFile, spawn, type ChildProcess } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, watch, writeFileSync, type FSWatcher } from "node:fs";
+import { closeSync, existsSync, fstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, readSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, watch, writeFileSync, type FSWatcher } from "node:fs";
 import { createServer as createHttpServer, request as httpRequest, type ClientRequest, type IncomingMessage, type ServerResponse } from "node:http";
 import { type Server, type Socket } from "node:net";
 import { userInfo } from "node:os";
@@ -19,6 +19,7 @@ import {
   STATE_DIR,
   unitName,
   WARD_HOME,
+  wardDesktopDir,
   wardRuntimeDir,
   wardStateDir,
   wardTrashDir,
@@ -36,6 +37,8 @@ const RECONCILE_MS = 60_000;
 const READY_TIMEOUT_MS = 60_000;
 const CONNECT_TIMEOUT_MS = 10_000;
 const TRASH_DAYS = 7;
+// With READY_TIMEOUT_MS, inside the 70 s a client waits for an answer.
+const DESKTOP_TIMEOUT_MS = 8_000;
 
 /** A running ward's in-memory plumbing. */
 interface LiveWard {
@@ -293,6 +296,77 @@ async function stopContainers(id: string): Promise<void> {
   await run("podman", ["--url", `unix://${join(wardRuntimeDir(id), "podman/podman.sock")}`, "stop", "--all", "--time", "10"], { timeout: 20_000 }).catch(
     (e: unknown) => log(`ward ${id}: stopping its containers: ${e instanceof Error ? e.message.split("\n")[0] : String(e)}`),
   );
+}
+
+/** Whether the ward's desktop is up; bin/ward makes the same check. */
+function desktopReady(id: string): boolean {
+  const dir = wardDesktopDir(id);
+  try {
+    return existsSync(join(dir, "env")) && existsSync(`/proc/${Number(readFileSync(join(dir, "pid"), "utf8"))}`);
+  } catch {
+    return false;
+  }
+}
+
+/** The end of a ward's desktop log. Every program on the desktop writes to it, so only its last 4 KB are read. */
+function logTail(file: string): string {
+  const fd = openSync(file, "r");
+  try {
+    const { size } = fstatSync(fd);
+    const end = Buffer.alloc(Math.min(size, 4096));
+    readSync(fd, end, 0, end.length, size - end.length);
+    return end.toString("utf8").split("\n").filter(Boolean).slice(-15).join("\n");
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/**
+ * Start the ward's private desktop (libexec/ward-desktop) unless it is up,
+ * starting the ward first if needed. It runs through `ward exec`, so it lives in
+ * the ward's namespaces and cgroup and stops with the ward; nothing here stops it.
+ */
+async function desktop(id: string, worktree?: string): Promise<Record<string, never>> {
+  const root = worktree ?? requireRecord(id).worktree;
+  const result = await up(root);
+  if (!result.enabled) throw new Error(result.reason);
+  const ward = result.ward.id;
+  return serialized(ward, async () => {
+    // Between `up` and here the ward may have been removed, and its id taken by a folder whose name sanitizes alike.
+    if (wards.get(ward)?.worktree !== result.ward.worktree) throw new Error(`ward ${ward} changed hands while its desktop was starting; try again`);
+    if (desktopReady(ward)) return {};
+    // Stopped since `up` answered. `--running` below covers a stop from here on:
+    // plain `ward exec` would start the ward again, waiting on this very lock, or
+    // run the desktop outside any ward once the project is disabled.
+    if (!isReady(ward)) throw new Error(`ward ${ward} was stopped while its desktop was starting; try again`);
+    rmSync(wardDesktopDir(ward), { recursive: true, force: true });
+    // In a file, as init.log is: journald drops what is written from inside the ward's
+    // user namespace. With the ward's data and not its runtime folder, because
+    // every program the compositor starts writes here, for as long as the ward exists.
+    const logFile = join(wardStateDir(ward), "desktop.log");
+    const out = openSync(logFile, "a");
+    const child = spawn(join(WARD_HOME, "bin/ward"), ["exec", "--running", "--worktree", root, "--", join(WARD_HOME, "libexec/ward-desktop"), ward], {
+      cwd: root, // where programs the compositor starts (Puck's launch_app) start
+      detached: true,
+      stdio: ["ignore", out, out],
+    });
+    closeSync(out);
+    child.unref();
+    let exited = false;
+    child.once("exit", () => (exited = true)).once("error", () => (exited = true));
+    const deadline = Date.now() + DESKTOP_TIMEOUT_MS;
+    while (!desktopReady(ward)) {
+      if (exited || Date.now() > deadline) {
+        // Its own process group (detached), so this takes the bus and compositor with it.
+        if (!exited && child.pid !== undefined) process.kill(-child.pid, "SIGKILL");
+        const tail = logTail(logFile);
+        throw new Error(`ward ${ward}'s desktop ${exited ? "failed to start" : `did not start within ${DESKTOP_TIMEOUT_MS / 1000}s`}${tail ? `:\n${tail}` : ""}`);
+      }
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    log(`started ward ${ward}'s desktop`);
+    return {};
+  });
 }
 
 /** A free slot, else the slot of the stopped ward unused the longest. */
@@ -809,6 +883,7 @@ const handlers: Handlers = {
     requireRecord(id);
     return { host: await ensureListener(id, port) };
   },
+  "POST /desktop": ({ id, worktree }) => desktop(id, worktree).finally(watchWorktreeParents),
   "POST /gc": async () => ({ actions: await runReconcile() }),
   "GET /ls": async () => {
     await Promise.all([...live.keys()].map(scan)); // what listens now, not at the last scan

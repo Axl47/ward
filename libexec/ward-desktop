@@ -1,0 +1,137 @@
+#!/bin/sh
+# A ward's private desktop: a session bus of its own and a headless Umbriel on
+# it, with a runtime folder of their own as XDG_RUNTIME_DIR, so nothing on it
+# reaches the live session's compositor, bus names, notifications, portals or
+# audio. wardd runs `ward-desktop ID` through `ward exec`, inside the ward;
+# it is up once $rt/desktop/env exists (see docs/DESIGN.md, "Desktops").
+set -eu
+. "$(dirname -- "$(readlink -f -- "$0")")/ward-lib.sh"
+
+# ward-desktop --session: started by the compositor once it is up, with the
+# desktop's environment. Publishes that environment as the `env` file.
+if [ "$1" = --session ]; then
+  dir=$XDG_RUNTIME_DIR
+  # Accessibility on from the start (the launcher's --a11y=1 flag is broken in
+  # at-spi2-core 2.62), so apps expose their text from launch. The registry is
+  # started here, not on demand: the accessibility bus may be a dbus-broker,
+  # which starts services through systemd, and there is none on this desktop.
+  registry=$(sed -n 's/^Exec=\([^ ]*\).*/\1/p' /usr/share/dbus-1/accessibility-services/org.a11y.atspi.Registry.service 2>/dev/null || true)
+  up=
+  if [ -n "$registry" ] && busctl --user set-property org.a11y.Bus /org/a11y/bus org.a11y.Status IsEnabled b true; then
+    "$registry" &
+    echo $! > "$dir/registry.pid"
+    # Apps that start before the registry is on the bus never register with it.
+    for _ in $(seq 30); do
+      bus=$(busctl --user call org.a11y.Bus /org/a11y/bus org.a11y.Bus GetAddress 2>/dev/null | sed -n 's/^s "\(.*\)"$/\1/p') || true
+      if [ -n "$bus" ] && busctl --address="$bus" status org.a11y.atspi.Registry >/dev/null 2>&1; then up=1; break; fi
+      sleep 0.1
+    done
+  fi
+  [ -n "$up" ] || echo "ward: warning: accessibility did not start; apps on this desktop expose no text" >&2
+  # A keyboard for the seat. A headless compositor has none, and an app only
+  # listens for keys while the seat has one, so keys from a tool that brings its
+  # own keyboard for each press (wtype, which Puck types with) reach the app
+  # only if it notices in time. wtype holds its keyboard while it sleeps: 67
+  # minutes a round, the longest it can, and it goes with the compositor.
+  if command -v wtype >/dev/null; then
+    while wtype -s 4000000 2>/dev/null; do :; done &
+  fi
+  {
+    env | grep -E '^(XDG_RUNTIME_DIR|WAYLAND_DISPLAY|UMBRIEL_SOCKET|DBUS_SESSION_BUS_ADDRESS|XDG_CURRENT_DESKTOP|XDG_SESSION_DESKTOP|XDG_SESSION_TYPE|TMPDIR|XDG_CONFIG_HOME)='
+    # No X server here (see below); empty, so an X11 app can't fall back to the live session's.
+    echo DISPLAY=
+  } > "$dir/env.tmp"
+  mv "$dir/env.tmp" "$dir/env"
+  exit 0
+fi
+
+# Sockets live in XDG_RUNTIME_DIR and their paths must fit in 108 bytes, the
+# compositor's and every app's, so it is a short name for $rt/desktop: d<this
+# process's id>, new at every start, so a command still holding the name of an
+# earlier desktop, this ward's or another's, can't act on this one. This ward's
+# earlier names go here, and the last one with the ward (units/ward@.service).
+for old in "$WARD_RUNTIME"/d[0-9]*; do
+  [ "$(readlink "$old" 2>/dev/null)" != "$1/desktop" ] || rm -f "$old"
+done
+dir=$WARD_RUNTIME/d$$
+umask 077
+mkdir -p "$WARD_RUNTIME/$1/desktop/services"
+ln -sfn "$1/desktop" "$dir"
+# `ward desktop` treats the desktop as up while this process lives; it waits for
+# the compositor below.
+echo $$ > "$dir/pid"
+# Ward's own commands look for wardd under XDG_RUNTIME_DIR, which is $dir on this desktop.
+ln -s "$WARD_RUNTIME" "$dir/ward"
+
+# The only service the bus can start is the accessibility bus: no portals,
+# keyring or notifications.
+launcher=$(sed -n 's/^Exec=\([^ ]*\).*/\1/p' /usr/share/dbus-1/services/org.a11y.Bus.service 2>/dev/null || true)
+[ -z "$launcher" ] || printf '[D-BUS Service]\nName=org.a11y.Bus\nExec=%s\n' "$launcher" > "$dir/services/org.a11y.Bus.service"
+cat > "$dir/bus.conf" <<CONF
+<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN" "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig>
+  <type>session</type>
+  <listen>unix:path=$dir/bus</listen>
+  <servicedir>$dir/services</servicedir>
+  <policy context="default">
+    <allow send_destination="*" eavesdrop="true"/>
+    <allow eavesdrop="true"/>
+    <allow own="*"/>
+  </policy>
+</busconfig>
+CONF
+# Not your config: no autostart (the Noctalia shell), keybinds or window rules.
+# No Xwayland either: it refuses /tmp/.X11-unix, whose owner (the host's root)
+# is nobody in the ward's user namespace.
+cat > "$dir/umbriel.toml" <<CONF
+[general]
+autostart = []
+show_cheatsheet = false
+xwayland = false
+CONF
+
+# $WARD_DESKTOP_UNSET: what could still point a program here at the live session.
+# shellcheck disable=SC2086
+unset $WARD_DESKTOP_UNSET
+# Kept apart from yours, in the ward's own folder: the compositor's log and caches
+# (Umbriel logs to XDG_CACHE_HOME, and would write into your session's log), and
+# what apps keep in the config folder. A Chromium-family browser or an Electron
+# app hands a launch to a running copy of its profile, so on your profile its
+# window would open on your screen or another ward's, or yours here. It also
+# keeps a socket under TMPDIR, hence the short name for the ward's.
+data=$TMPDIR/desktop
+mkdir -p "$data/config"
+ln -s "$TMPDIR" "$dir/tmp"
+# The config folder here mirrors yours: folders of its own, with a link to each
+# of your files. Programs read your settings, and what they create stays in the
+# ward, so an app that first starts here makes its profile here. Your existing
+# app profiles are left out (folders holding Chromium's `Local State` or
+# Firefox's `profiles.ini`, at most one folder down), so those apps start fresh too.
+# Redone at every start: new files of yours appear, links to deleted ones go.
+yours=${XDG_CONFIG_HOME:-$HOME/.config}
+find "$data/config" -xtype l -lname "$yours/*" -delete
+for entry in "$yours"/* "$yours"/.[!.]* "$yours"/..?*; do
+  [ -e "$entry" ] || continue
+  profile=
+  for mark in "$entry/Local State" "$entry"/*/"Local State" "$entry/profiles.ini" "$entry"/*/profiles.ini; do
+    [ ! -e "$mark" ] || profile=1
+  done
+  # -H: an entry that is itself a link to a folder (dotfiles kept elsewhere) is mirrored like any folder.
+  [ -n "$profile" ] || cp -asHn "$entry" "$data/config/" || true
+done
+# Named through the short link, like TMPDIR: a shell reads `env`, and the state folder's path may hold spaces.
+export XDG_RUNTIME_DIR="$dir" DBUS_SESSION_BUS_ADDRESS="unix:path=$dir/bus" WLR_BACKENDS=headless WLR_LIBINPUT_NO_DEVICES=1 \
+  TMPDIR="$dir/tmp" XDG_CACHE_HOME="$data/cache" XDG_CONFIG_HOME="$dir/tmp/desktop/config"
+dbus-daemon --config-file="$dir/bus.conf" --nofork &
+bus=$!
+# The bus goes with the compositor, however this ends, and the accessibility bus
+# with the bus; the registry is only on the latter, so it is stopped by pid. So
+# do `env`, which says the desktop is up, and the desktop's name.
+# shellcheck disable=SC2046 # no registry.pid, no second pid
+trap 'kill "$bus" $(cat "$dir/registry.pid" 2>/dev/null) 2>/dev/null; rm -f "$dir/env" "$dir"' EXIT
+for _ in $(seq 100); do
+  [ -S "$dir/bus" ] && break
+  sleep 0.02
+done
+[ -S "$dir/bus" ] || { echo "ward: the desktop's session bus did not start" >&2; exit 1; }
+umbriel -c "$dir/umbriel.toml" -s "'$WARD_LIBEXEC/ward-desktop' --session"

@@ -14,6 +14,10 @@ WARD_WORKTREES=${WARD_T3_HOME:-$HOME/.t3}/worktrees
 # ward's list, with its project's ports, to $rt/host-ports.
 WARD_HOST_PORTS=${WARD_HOST_PORTS:-3773,5037}
 
+# What could point a program on a ward's desktop at the live session instead:
+# its display, its accessibility bus, and where it would look for the sound servers.
+WARD_DESKTOP_UNSET="WAYLAND_DISPLAY WAYLAND_SOCKET DISPLAY UMBRIEL_SOCKET AT_SPI_BUS_ADDRESS PULSE_SERVER PULSE_RUNTIME_PATH PIPEWIRE_RUNTIME_DIR PIPEWIRE_REMOTE"
+
 # ID map for every ward's user namespace: your uid/gid stays itself (1000 → 1000),
 # root and the other ids come from your subuid/subgid range.
 ward_map_args() {
