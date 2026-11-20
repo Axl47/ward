@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { isSettled, NO_THREAD_GRACE_MS, shouldStop, threadState } from "../src/t3state.ts";
+import { idleSince, isSettled, NO_THREAD_GRACE_MS, shouldStop, threadState } from "../src/t3state.ts";
 
 const t1 = "2026-11-19T10:00:00.000Z";
 const t2 = "2026-11-19T11:00:00.000Z";
@@ -41,4 +41,11 @@ test("shouldStop stops a settled worktree that was used after settling once it s
   const settled = [{ threadId: "t", worktree: "/w", idleSince: t1 }];
   assert.equal(shouldStop(settled, at(t2), at(t2) + NO_THREAD_GRACE_MS - 1), false);
   assert.equal(shouldStop(settled, at(t2), at(t2) + NO_THREAD_GRACE_MS + 1), true);
+});
+
+test("a thread's desktop stops once its thread, worktree or not, went idle after the last use", () => {
+  const settled = { idleSince: idleSince({ id: "a", worktreePath: null, settledAt: t2 }) };
+  assert.equal(settled.idleSince, t2);
+  assert.equal(shouldStop([settled], Date.parse(t1), Date.parse(t2) + 1000), true);
+  assert.equal(shouldStop([{ idleSince: idleSince({ id: "a" }) }], Date.parse(t1), Date.parse(t2) + NO_THREAD_GRACE_MS * 2), false);
 });

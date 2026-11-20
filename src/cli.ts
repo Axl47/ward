@@ -15,7 +15,8 @@ const USAGE = `usage: ward <command>
 
   exec [--worktree DIR] -- CMD...   run CMD in the worktree's ward
   desktop [--worktree DIR] [-- CMD...]
-                                    start the ward's private desktop; print its environment, or run CMD on it
+                                    run CMD on a private desktop, the ward's or, with no ward, the T3 thread's own;
+                                    without CMD, print its environment
   up [--worktree DIR]               start the worktree's ward
   stop [ID|--worktree DIR]          stop a ward, keeping its data
   rm [ID|--worktree DIR] [--now]    remove a ward; its data stays in the trash for 7 days (--now: delete it)
@@ -34,6 +35,7 @@ const { positionals, values } = parseArgs({
   strict: false,
   options: {
     worktree: { type: "string" },
+    thread: { type: "string" },
     json: { type: "boolean" },
     quiet: { type: "boolean" },
     now: { type: "boolean" },
@@ -41,7 +43,7 @@ const { positionals, values } = parseArgs({
   },
 });
 const [command, ...args] = positionals;
-const flag = (name: "worktree") => (typeof values[name] === "string" ? (values[name] as string) : undefined);
+const flag = (name: "worktree" | "thread") => (typeof values[name] === "string" ? (values[name] as string) : undefined);
 
 /**
  * The ward this command is about: explicit id, --worktree, $WARD_ID, or the
@@ -191,7 +193,7 @@ async function main(): Promise<void> {
     case "desktop":
       // From bin/ward, when the desktop isn't up; it prints the environment itself.
       await ensureDaemon();
-      await call("POST /desktop", target());
+      await call("POST /desktop", flag("thread") === undefined ? target() : { thread: flag("thread")!, cwd: process.cwd() });
       return;
     case "env":
       process.stdout.write(readFileSync(join(wardRuntimeDir(currentId()), "env"), "utf8"));

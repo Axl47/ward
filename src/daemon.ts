@@ -11,12 +11,16 @@ import { promisify } from "node:util";
 import type { BrokerReply, BrokerRequest, PortInfo, Route, Routes, UpResult, WardInfo } from "./api.ts";
 import {
   CONTROL_SOCKET,
+  desktopStateDir,
+  desktopUnitName,
   HOST_PORTS,
   isEnabled,
   parsePorts,
   projectHostPorts,
   locate,
+  RUNTIME_DIR,
   STATE_DIR,
+  threadDesktopId,
   unitName,
   WARD_HOME,
   wardDesktopDir,
@@ -29,7 +33,7 @@ import { wardHostPorts } from "./hostports.ts";
 import { listeningPorts } from "./procnet.ts";
 import { mappedServer, splice } from "./splice.ts";
 import { freeSlot, loadRegistry, MAX_SLOTS, saveRegistry, slotPorts, type WardRecord } from "./registry.ts";
-import { shouldStop, threadsByWorktree, type ThreadState } from "./t3state.ts";
+import { idleSince, loadThreads, shouldStop, threadsByWorktree, type ShellThread, type ThreadState } from "./t3state.ts";
 
 const run = promisify(execFile);
 const { uid, gid } = userInfo();
@@ -354,19 +358,118 @@ async function desktop(id: string, worktree?: string): Promise<Record<string, ne
     child.unref();
     let exited = false;
     child.once("exit", () => (exited = true)).once("error", () => (exited = true));
-    const deadline = Date.now() + DESKTOP_TIMEOUT_MS;
-    while (!desktopReady(ward)) {
-      if (exited || Date.now() > deadline) {
-        // Its own process group (detached), so this takes the bus and compositor with it.
-        if (!exited && child.pid !== undefined) process.kill(-child.pid, "SIGKILL");
-        const tail = logTail(logFile);
-        throw new Error(`ward ${ward}'s desktop ${exited ? "failed to start" : `did not start within ${DESKTOP_TIMEOUT_MS / 1000}s`}${tail ? `:\n${tail}` : ""}`);
-      }
-      await new Promise((r) => setTimeout(r, 50));
-    }
-    log(`started ward ${ward}'s desktop`);
+    await desktopUp(ward, `ward ${ward}'s desktop`, logFile, async () => exited, () => {
+      // Its own process group (detached), so this takes the bus and compositor with it.
+      if (!exited && child.pid !== undefined) process.kill(-child.pid, "SIGKILL");
+    });
     return {};
   });
+}
+
+/** Wait until desktop `id` is up. If it exits first or takes too long, stop it and throw with the end of its log. */
+async function desktopUp(id: string, name: string, logFile: string, exited: () => Promise<boolean>, stopIt: () => void | Promise<unknown>): Promise<void> {
+  const deadline = Date.now() + DESKTOP_TIMEOUT_MS;
+  while (!desktopReady(id)) {
+    const gone = await exited();
+    if (gone || Date.now() > deadline) {
+      await stopIt();
+      const tail = logTail(logFile);
+      throw new Error(`${name} ${gone ? "failed to start" : `did not start within ${DESKTOP_TIMEOUT_MS / 1000}s`}${tail ? `:\n${tail}` : ""}`);
+    }
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  log(`started ${name}`);
+}
+
+/** What the desktop's unit gets from wardd: where Ward keeps things, and where its programs are found. */
+const UNIT_ENV = ["PATH", "XDG_RUNTIME_DIR", "XDG_STATE_HOME", "XDG_CONFIG_HOME", "WARD_T3_HOME"] as const;
+
+/**
+ * Start the private desktop of a T3 thread that has no ward, unless it is up:
+ * the same libexec/ward-desktop, in no namespace, as a transient unit of its
+ * own, so `ward desktop -- CMD` can join its cgroup and stopping the unit stops
+ * everything on it. The reconciler stops it when the thread is done.
+ */
+function threadDesktop(thread: string, cwd: string): Promise<Record<string, never>> {
+  if (typeof thread !== "string" || thread === "" || typeof cwd !== "string") throw new Error("a thread's desktop needs the thread's id and a folder");
+  const id = threadDesktopId(thread);
+  return serialized(id, async () => {
+    if (desktopReady(id)) return {};
+    const unit = desktopUnitName(id);
+    const rt = wardRuntimeDir(id);
+    const state = desktopStateDir(id);
+    await clearThreadDesktop(id); // one whose compositor died, and its app profiles
+    mkdirSync(join(state, "tmp"), { recursive: true });
+    mkdirSync(rt, { recursive: true });
+    writeFileSync(join(rt, "thread"), thread);
+    const logFile = join(state, "desktop.log");
+    writeFileSync(logFile, "");
+    const active = async () => (await systemctl("is-active", unit).catch(() => ({ stdout: "" }))).stdout.trim();
+    await run("systemd-run", [
+      "--user",
+      "--quiet",
+      "--collect",
+      `--unit=${unit}`,
+      `--description=Ward desktop of T3 thread ${thread}`,
+      // With the wards, under T3's agents slice: what runs here shares the agents' memory limit.
+      "--slice=app-t3code-agents-wards.slice",
+      "--property=KillMode=control-group",
+      "--property=TimeoutStopSec=15",
+      `--property=StandardOutput=append:${logFile}`,
+      `--property=StandardError=append:${logFile}`,
+      `--working-directory=${existsSync(cwd) ? cwd : "/"}`, // where programs the compositor starts (Puck's launch_app) start
+      `--setenv=TMPDIR=${join(state, "tmp")}`,
+      ...UNIT_ENV.flatMap((name) => (process.env[name] === undefined ? [] : [`--setenv=${name}=${process.env[name]}`])),
+      join(WARD_HOME, "libexec/ward-desktop"),
+      id,
+    ]);
+    try {
+      await desktopUp(id, `the desktop of thread ${thread}`, logFile, async () => !["active", "activating"].includes(await active()), () => systemctl("stop", unit).catch(() => undefined));
+    } catch (error) {
+      rmSync(rt, { recursive: true, force: true });
+      throw error;
+    }
+    const { stdout } = await systemctl("show", "--property=ControlGroup", "--value", unit);
+    writeFileSync(join(rt, "cgroup"), `/sys/fs/cgroup${stdout.trim()}\n`);
+    writeFileSync(join(rt, "last-exec"), "");
+    return {};
+  });
+}
+
+/** Stop a thread's desktop, if it runs, and remove its folders and its short names. Call it holding the id's lock. */
+async function clearThreadDesktop(id: string): Promise<void> {
+  await systemctl("stop", desktopUnitName(id)).catch(() => undefined);
+  for (const name of readdirSync(RUNTIME_DIR)) {
+    if (!/^d\d+$/.test(name)) continue;
+    try {
+      if (readlinkSync(join(RUNTIME_DIR, name)) === `${id}/desktop`) unlinkSync(join(RUNTIME_DIR, name));
+    } catch {}
+  }
+  rmSync(wardRuntimeDir(id), { recursive: true, force: true });
+  rmSync(desktopStateDir(id), { recursive: true, force: true });
+}
+
+/**
+ * Stop the desktops of threads that are done (shouldStop, with the thread as its
+ * one thread, or none when T3 doesn't know it), and clear away those that died.
+ */
+async function reconcileThreadDesktops(threads: readonly ShellThread[] | undefined, now: number): Promise<string[]> {
+  const actions: string[] = [];
+  const ids = new Set([...readdirSync(RUNTIME_DIR), ...(existsSync(join(STATE_DIR, "desktops")) ? readdirSync(join(STATE_DIR, "desktops")) : [])]);
+  for (const id of ids) {
+    // A thread desktop's id has no dot; a ward's (whose repo may be named t-…) has one.
+    if (!/^t-[A-Za-z0-9_-]+$/.test(id) || locks.has(id)) continue;
+    await serialized(id, async () => {
+      if (!desktopReady(id)) return clearThreadDesktop(id);
+      if (threads === undefined) return; // T3 unreachable: leave it running
+      const thread = readFileSync(join(wardRuntimeDir(id), "thread"), "utf8");
+      const known = threads.find((t) => t.id === thread);
+      if (!shouldStop(known ? [{ idleSince: idleSince(known) }] : [], lastActivity(id), now)) return;
+      await clearThreadDesktop(id);
+      actions.push(`stopped the desktop of thread ${thread}: ${known ? "the thread is done" : "unused, and T3 has no such thread"}`);
+    });
+  }
+  return actions;
 }
 
 /** A free slot, else the slot of the stopped ward unused the longest. */
@@ -809,8 +912,10 @@ function forward(id: string, wardPort: number, client: Socket): void {
 async function reconcile(): Promise<string[]> {
   const actions: string[] = [];
   let threads: Map<string, ThreadState[]> | undefined;
+  let allThreads: readonly ShellThread[] | undefined;
   try {
-    threads = lastThreads = await threadsByWorktree();
+    allThreads = await loadThreads();
+    threads = lastThreads = threadsByWorktree(allThreads);
   } catch (error) {
     log(`reconcile: cannot read T3 thread state: ${error instanceof Error ? error.message : String(error)}`);
   }
@@ -830,6 +935,7 @@ async function reconcile(): Promise<string[]> {
     if (threads === undefined || !shouldStop(threads.get(record.worktree) ?? [], lastActivity(record.id), now)) continue;
     if (await stop(record.id, record.worktree)) actions.push(`stopped ${record.id}: no active thread needs it`);
   }
+  actions.push(...(await reconcileThreadDesktops(allThreads, now)));
   actions.push(...(await purgeOldTrash()));
   return actions;
 }
@@ -883,7 +989,7 @@ const handlers: Handlers = {
     requireRecord(id);
     return { host: await ensureListener(id, port) };
   },
-  "POST /desktop": ({ id, worktree }) => desktop(id, worktree).finally(watchWorktreeParents),
+  "POST /desktop": (body) => ("thread" in body ? threadDesktop(body.thread, body.cwd) : desktop(body.id, body.worktree).finally(watchWorktreeParents)),
   "POST /gc": async () => ({ actions: await runReconcile() }),
   "GET /ls": async () => {
     await Promise.all([...live.keys()].map(scan)); // what listens now, not at the last scan

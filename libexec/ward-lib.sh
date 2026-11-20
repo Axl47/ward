@@ -54,6 +54,11 @@ ward_resolve() {
   WARD_ID=$(ward_sanitize "$WARD_REPO").$(ward_sanitize "$_name")
 }
 
+# The id of the desktop of T3 thread $1 where there is no ward (src/paths.ts: threadDesktopId).
+ward_thread_desktop_id() {
+  printf 't-%s' "$(ward_sanitize "$1")"
+}
+
 ward_enabled() {
   [ -e "$WARD_CONFIG/enabled/$1" ]
 }
