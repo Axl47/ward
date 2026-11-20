@@ -4,7 +4,7 @@ import { once } from "node:events";
 import { connect, createServer, type AddressInfo, type Server, type Socket } from "node:net";
 import { after, test } from "node:test";
 import type { BrokerReply, BrokerRequest } from "../src/api.ts";
-import { mappedServer, splice } from "../src/splice.ts";
+import { mappedServer, relayToHost, splice } from "../src/splice.ts";
 
 // The mapped-port path as wardd runs it, minus the namespace: a host listener asks
 // the broker to dial a port, receives the socket over IPC and splices the two.
@@ -17,8 +17,11 @@ after(() => {
   for (const s of servers) s.close();
 });
 const pending = new Map<number, (socket: Socket | undefined) => void>();
+/** Relay port → what wardd does with a connection the broker accepted on it. */
+const accepted = new Map<number, (socket: Socket) => void>();
 broker.on("message", (reply: BrokerReply, socket: unknown) => {
-  if (reply.t !== "ready") pending.get(reply.req)?.(socket as Socket | undefined);
+  if (reply.t === "accepted") accepted.get(reply.port)?.(socket as Socket);
+  else if (reply.t !== "ready") pending.get(reply.req)?.(socket as Socket | undefined);
 });
 let nextReq = 1;
 
@@ -84,4 +87,36 @@ test("a server's half-close passes through and what the client sends after it ar
   await once(s, "close");
   assert.equal(received, "BYE");
   assert.equal(await got, 6);
+});
+
+/** Resolves once something accepts on the port, or with false after `ms`. */
+async function accepting(port: number, ms = 2000): Promise<boolean> {
+  for (const end = Date.now() + ms; Date.now() < end; await new Promise((r) => setTimeout(r, 20))) {
+    const s = connect({ host: "127.0.0.1", port });
+    const ok = await new Promise<boolean>((r) => s.once("connect", () => r(true)).once("error", () => r(false)));
+    s.destroy();
+    if (ok) return true;
+  }
+  return false;
+}
+
+// T3's device daemon the other way round: the broker listens on a relay port and
+// wardd connects what it accepts to the host's port. Without a namespace both
+// sides share a loopback, so the test relays a free port to the service's.
+test("a relay port reaches the host service, half-close included, until it is unrelayed", async () => {
+  const echo = createServer({ allowHalfOpen: true }, (s) => {
+    let n = 0;
+    s.on("data", (d: Buffer) => (n += d.length)).on("end", () => s.end(`GOT ${n}`));
+  });
+  const hostPort = await listen(echo);
+  const free = createServer();
+  const relayPort = await listen(free);
+  free.close();
+  accepted.set(relayPort, (s) => relayToHost(s, hostPort));
+  broker.send({ t: "relay", port: relayPort } satisfies BrokerRequest);
+  assert.ok(await accepting(relayPort));
+  assert.equal(await exchange(relayPort, (s) => s.end("abcdef")), "GOT 6");
+  broker.send({ t: "unrelay", port: relayPort } satisfies BrokerRequest);
+  await new Promise((r) => setTimeout(r, 100));
+  assert.equal(await accepting(relayPort, 100), false);
 });

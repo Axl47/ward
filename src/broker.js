@@ -2,11 +2,12 @@
 // Runs inside a ward's network namespace as a child of wardd, over Node IPC.
 // It opens TCP connections to the ward's own loopback and hands the connected
 // sockets to wardd, which copies bytes between them and host-side connections.
+// The other way, it listens on relay ports and hands wardd what connects to them.
 // Plain JavaScript (type-checked through JSDoc): one runs per ward, and Node's
 // TypeScript support would double its memory.
-import { connect } from "node:net";
+import { connect, createServer } from "node:net";
 
-/** @import { Socket } from "node:net" */
+/** @import { Server, Socket } from "node:net" */
 /** @import { BrokerReply, BrokerRequest } from "./api.ts" */
 
 const send = process.send?.bind(process);
@@ -39,8 +40,29 @@ function tryConnect(hosts, port) {
   });
 }
 
+/** Relay listeners by port: a host service on a port that changes, reached at the same port in the ward. */
+/** @type {Map<number, Server>} */
+const relays = new Map();
+
+/** @param {number} port */
+function relay(port) {
+  if (relays.has(port)) return;
+  const server = createServer({ pauseOnConnect: true }, (socket) => {
+    /** @type {BrokerReply} */
+    const reply = { t: "accepted", port };
+    send(reply, socket, { keepOpen: false });
+  });
+  server.on("error", (error) => {
+    console.error(`ward broker: cannot relay port ${port}: ${String(error)}`);
+    if (relays.get(port) === server) relays.delete(port);
+  });
+  server.listen(port, "127.0.0.1");
+  relays.set(port, server);
+}
+
 process.on("message", (/** @type {BrokerRequest} */ message) => {
-  if (message.t !== "connect") return;
+  if (message.t === "relay") return relay(message.port);
+  if (message.t === "unrelay") return void (relays.get(message.port)?.close(), relays.delete(message.port));
   tryConnect(message.hosts, message.port).then(
     (socket) => {
       /** @type {BrokerReply} */

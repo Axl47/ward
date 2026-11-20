@@ -1,6 +1,6 @@
 // The byte copy between a host-side connection and the ward-side socket the
 // broker dialed. wardd runs one per connection through a mapped port.
-import { createServer, type Server, type Socket } from "node:net";
+import { connect, createServer, type Server, type Socket } from "node:net";
 
 /** The host-side listener of a mapped port: paused until the broker's socket arrives, half-close kept for splice. */
 export const mappedServer = (onConnection: (client: Socket) => void): Server =>
@@ -22,4 +22,22 @@ export function splice(client: Socket, upstream: Socket): void {
   client.on("error", drop).on("close", () => upstream.destroySoon());
   upstream.on("error", drop).on("close", () => client.destroySoon());
   client.resume();
+}
+
+/**
+ * Connect a socket the broker accepted on a relay port inside a ward to the
+ * same port on the host's loopback; `track` sees both sockets.
+ */
+export function relayToHost(accepted: Socket, port: number, track: (socket: Socket) => void = () => {}): void {
+  const host = connect({ host: "127.0.0.1", port, allowHalfOpen: true });
+  const fail = () => {
+    host.destroy();
+    accepted.destroy();
+  };
+  track(host);
+  track(accepted);
+  host.once("error", fail).once("connect", () => {
+    host.off("error", fail);
+    splice(host, accepted);
+  });
 }

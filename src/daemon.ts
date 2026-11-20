@@ -5,7 +5,7 @@ import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { closeSync, existsSync, fstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, readSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, watch, writeFileSync, type FSWatcher } from "node:fs";
 import { createServer as createHttpServer, request as httpRequest, type ClientRequest, type IncomingMessage, type ServerResponse } from "node:http";
 import { type Server, type Socket } from "node:net";
-import { userInfo } from "node:os";
+import { homedir, userInfo } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { promisify } from "node:util";
 import type { BrokerReply, BrokerRequest, PortInfo, Route, Routes, UpResult, WardInfo } from "./api.ts";
@@ -21,6 +21,7 @@ import {
   locate,
   RUNTIME_DIR,
   STATE_DIR,
+  T3_HOME,
   threadDesktopId,
   unitName,
   WARD_HOME,
@@ -31,7 +32,7 @@ import {
 } from "./paths.ts";
 import { wardHostPorts } from "./hostports.ts";
 import { listeningPorts } from "./procnet.ts";
-import { mappedServer, splice } from "./splice.ts";
+import { mappedServer, relayToHost, splice } from "./splice.ts";
 import { freeSlot, loadRegistry, MAX_SLOTS, saveRegistry, slotPorts, type WardRecord } from "./registry.ts";
 import { DESKTOP_IDLE_MS, idleSince, loadThreads, NO_THREAD_GRACE_MS, shouldStop, threadsByWorktree, type ShellThread, type ThreadState } from "./t3state.ts";
 
@@ -72,6 +73,8 @@ interface LiveWard {
   nextReq: number;
   /** Host ports pasta forwards into the ward; they listen inside it but aren't the ward's own. */
   readonly hostPorts: ReadonlySet<number>;
+  /** The host port the broker relays (T3's device daemon), listening inside the ward but not the ward's own. */
+  relayPort: number | undefined;
 }
 
 const wards = loadRegistry();
@@ -718,6 +721,7 @@ function attach(record: WardRecord): void {
     connections: new Set(),
     nextReq: 1,
     hostPorts: new Set([53, ...readHostPorts(record.id)]),
+    relayPort: undefined,
   };
   live.set(record.id, ward);
   broker.on("message", (reply: BrokerReply, socket: unknown) => {
@@ -725,9 +729,17 @@ function attach(record: WardRecord): void {
       if (ward.scanTimer !== undefined) return;
       ward.scanTimer = setInterval(() => void scan(record.id), 1000);
       watchContainers(record.id, ward);
+      relayDeviceDaemon(ward);
       return void scan(record.id);
     }
     const upstream = socket instanceof Object && "pipe" in socket ? (socket as Socket) : undefined;
+    if (reply.t === "accepted") {
+      if (upstream === undefined) return;
+      return relayToHost(upstream, reply.port, (s) => {
+        ward.connections.add(s);
+        s.once("close", () => ward.connections.delete(s));
+      });
+    }
     const callback = ward.pending.get(reply.req);
     ward.pending.delete(reply.req);
     if (callback === undefined) return void upstream?.destroy(); // its client timed out meanwhile
@@ -786,7 +798,7 @@ function scan(id: string): Promise<unknown> {
       return Promise.resolve(); // broker gone; its exit handler detaches the ward
     }
     for (const [port, hosts] of listeningPorts(text)) {
-      if (!ward.hostPorts.has(port)) found.set(port, [...new Set([...(found.get(port) ?? []), ...hosts])]);
+      if (!ward.hostPorts.has(port) && port !== ward.relayPort) found.set(port, [...new Set([...(found.get(port) ?? []), ...hosts])]);
     }
   }
   for (const port of ward.containerPorts) if (!found.has(port)) found.set(port, ["127.0.0.1"]);
@@ -1052,6 +1064,56 @@ function forward(id: string, wardPort: number, client: Socket): void {
   ward.broker.send(message);
 }
 
+// ── T3's device daemon ───────────────────────────────────────────────────────
+
+/**
+ * T3's device daemon (agent-device) listens on a new random port each time it
+ * starts, and its CLI dials 127.0.0.1 at the port daemon.json names. pasta's
+ * forwards are fixed when a ward starts, so the broker relays that port instead,
+ * moved whenever daemon.json changes.
+ */
+const DEVICE_DAEMON_FILE = join(T3_HOME, "userdata/device/agent-device/daemon.json");
+let devicePort = readDevicePort();
+let deviceWatcher: FSWatcher | undefined;
+
+function readDevicePort(): number | undefined {
+  try {
+    const { httpPort } = JSON.parse(readFileSync(DEVICE_DAEMON_FILE, "utf8")) as { httpPort?: unknown };
+    return typeof httpPort === "number" && Number.isInteger(httpPort) && httpPort > 0 && httpPort < 65536 ? httpPort : undefined;
+  } catch {
+    return undefined; // no daemon yet, or T3 is mid-write; the watcher reads it again
+  }
+}
+
+/** Point a ward's relay at the device daemon's current port; ports pasta already forwards need none. */
+function relayDeviceDaemon(ward: LiveWard): void {
+  const port = devicePort !== undefined && !ward.hostPorts.has(devicePort) ? devicePort : undefined;
+  if (ward.scanTimer === undefined || ward.relayPort === port) return;
+  if (ward.relayPort !== undefined) ward.broker.send({ t: "unrelay", port: ward.relayPort } satisfies BrokerRequest);
+  ward.relayPort = port;
+  if (port !== undefined) ward.broker.send({ t: "relay", port } satisfies BrokerRequest);
+}
+
+/** Follow daemon.json; called on every reconcile, so a folder that appears later is watched too. */
+function watchDeviceDaemon(): void {
+  const refresh = () => {
+    devicePort = readDevicePort();
+    for (const ward of live.values()) relayDeviceDaemon(ward);
+  };
+  refresh();
+  if (deviceWatcher !== undefined || !existsSync(dirname(DEVICE_DAEMON_FILE))) return;
+  let soon: NodeJS.Timeout | undefined;
+  deviceWatcher = watch(dirname(DEVICE_DAEMON_FILE), (_event, name) => {
+    if (name !== basename(DEVICE_DAEMON_FILE)) return;
+    clearTimeout(soon);
+    soon = setTimeout(refresh, 100);
+  });
+  deviceWatcher.on("error", () => (deviceWatcher?.close(), (deviceWatcher = undefined)));
+}
+
+/** The host's adb, which T3's device tools use too: the server must be the same version as every client. */
+const HOST_ADB = join(process.env.ANDROID_HOME ?? join(homedir(), "Android/Sdk"), "platform-tools/adb");
+
 // ── Reconciler ───────────────────────────────────────────────────────────────
 
 /**
@@ -1060,6 +1122,7 @@ function forward(id: string, wardPort: number, client: Socket): void {
  * shouldStop).
  */
 async function reconcile(): Promise<string[]> {
+  watchDeviceDaemon();
   const actions: string[] = [];
   let threads: Map<string, ThreadState[]> | undefined;
   let allThreads: readonly ShellThread[] | undefined;
@@ -1148,6 +1211,7 @@ const handlers: Handlers = {
   },
   "POST /desktop": (body) => ("thread" in body ? threadDesktop(body.thread, body.cwd) : desktop(body.id, body.worktree).finally(watchWorktreeParents)),
   "POST /gc": async () => ({ actions: await runReconcile() }),
+  "POST /adb-server": async () => ({ ok: await run(HOST_ADB, ["start-server"], { timeout: 30_000 }).then(() => true, () => false) }),
   "GET /ls": async () => {
     await Promise.all([...live.keys()].map(scan)); // what listens now, not at the last scan
     return [...wards.values()].map(info).sort((a, b) => a.slot - b.slot);
