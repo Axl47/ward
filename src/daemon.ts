@@ -489,7 +489,8 @@ async function reconcileThreadDesktops(threads: readonly ShellThread[] | undefin
       const marker = threadMarker(id);
       const thread = existsSync(marker) ? readFileSync(marker, "utf8") : undefined;
       const running = thread !== undefined && desktopReady(id);
-      if (!running && (existsSync(wardRuntimeDir(id)) || existsSync(join(desktopStateDir(id), "tmp")))) await clearThreadDesktop(id);
+      const died = !running && (existsSync(wardRuntimeDir(id)) || existsSync(join(desktopStateDir(id), "tmp")));
+      if (died) await clearThreadDesktop(id);
       if (thread === undefined) return rmSync(desktopStateDir(id), { recursive: true, force: true }); // left by a start that never finished
       if (threads === undefined) return; // T3 unreachable: leave it as it is
       const known = threads.find((t) => t.id === thread);
@@ -498,9 +499,9 @@ async function reconcileThreadDesktops(threads: readonly ShellThread[] | undefin
       if (running && (done || now - used > DESKTOP_IDLE_MS)) {
         await clearThreadDesktop(id);
         actions.push(`stopped the desktop of thread ${thread}: ${!done ? `unused for ${DESKTOP_IDLE_MS / 3_600_000} h` : known ? "the thread is done" : "unused, and T3 has no such thread"}`);
-      } else if (!known && now - used > NO_THREAD_GRACE_MS) {
-        // Never in the pass that stopped it: the marker now holds the last use, with any
-        // call that came in during the stop, and a call that raced it has a pass to come back.
+      } else if (!died && !known && now - used > NO_THREAD_GRACE_MS) {
+        // Never in the pass that stopped or cleared it: the marker now holds the last use, with
+        // any call that came in meanwhile, and a call that raced it has a pass to come back.
         rmSync(desktopStateDir(id), { recursive: true, force: true });
       }
     }).catch((error: unknown) => log(`reconcile: thread desktop ${id}: ${error instanceof Error ? error.message : String(error)}`));
