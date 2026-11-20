@@ -37,7 +37,7 @@ if [ "$1" = --session ]; then
     while wtype -s 4000000 2>/dev/null; do :; done &
   fi
   {
-    env | grep -E '^(XDG_RUNTIME_DIR|WAYLAND_DISPLAY|UMBRIEL_SOCKET|DBUS_SESSION_BUS_ADDRESS|XDG_CURRENT_DESKTOP|XDG_SESSION_DESKTOP|XDG_SESSION_TYPE|TMPDIR|CHROME_USER_DATA_DIR)='
+    env | grep -E '^(XDG_RUNTIME_DIR|WAYLAND_DISPLAY|UMBRIEL_SOCKET|DBUS_SESSION_BUS_ADDRESS|XDG_CURRENT_DESKTOP|XDG_SESSION_DESKTOP|XDG_SESSION_TYPE|TMPDIR|XDG_CONFIG_HOME)='
     # No X server here (see below); empty, so an X11 app can't fall back to the live session's.
     echo DISPLAY=
   } > "$dir/env.tmp"
@@ -95,15 +95,32 @@ CONF
 unset $WARD_DESKTOP_UNSET
 # Kept apart from yours, in the ward's own folder: the compositor's log and caches
 # (Umbriel logs to XDG_CACHE_HOME, and would write into your session's log), and
-# the profile of Chromium-family browsers. Such a browser hands a launch to a
-# running copy of its profile, so with your profile its window would open on
-# your screen, or yours on this desktop. It also keeps a socket under TMPDIR,
-# hence the short name for the ward's.
+# the profiles of Chromium-family browsers and Electron apps. Such an app hands
+# a launch to a running copy of its profile, so on your profile its window would
+# open on your screen or another ward's, or yours here. It also keeps a socket
+# under TMPDIR, hence the short name for the ward's.
 data=$TMPDIR/desktop
-mkdir -p "$data"
+mkdir -p "$data/config"
 ln -s "$TMPDIR" "$dir/tmp"
+# So the config folder here is yours entry by entry, links to each, minus those
+# profiles: the entries holding a `Local State` file, at most one folder down
+# (BraveSoftware/Brave-Browser). An app makes its own in their place, kept with
+# the ward's data. Entries are looked at again at every start.
+yours=${XDG_CONFIG_HOME:-$HOME/.config}
+for entry in "$yours"/* "$yours"/.[!.]*; do
+  mine=$data/config/${entry##*/}
+  profile=
+  for state in "$entry/Local State" "$entry"/*/"Local State"; do
+    [ ! -e "$state" ] || profile=1
+  done
+  if [ -n "$profile" ]; then
+    [ ! -L "$mine" ] || unlink "$mine"
+  elif [ -e "$entry" ] && [ ! -e "$mine" ] && [ ! -L "$mine" ]; then
+    ln -s "$entry" "$mine"
+  fi
+done
 export XDG_RUNTIME_DIR="$dir" DBUS_SESSION_BUS_ADDRESS="unix:path=$dir/bus" WLR_BACKENDS=headless WLR_LIBINPUT_NO_DEVICES=1 \
-  TMPDIR="$dir/tmp" XDG_CACHE_HOME="$data/cache" CHROME_USER_DATA_DIR="$data/chrome"
+  TMPDIR="$dir/tmp" XDG_CACHE_HOME="$data/cache" XDG_CONFIG_HOME="$data/config"
 dbus-daemon --config-file="$dir/bus.conf" --nofork &
 bus=$!
 # The bus goes with the compositor, however this ends, and the accessibility bus
