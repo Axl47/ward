@@ -69,7 +69,8 @@ ward_recording() {
   _on=
   { read -r _on _ < "$WARD_RUNTIME/activity/on"; } 2>/dev/null || return 1
   case $_on in ''|*[!0-9]*) return 1 ;; esac
-  [ $((EPOCHSECONDS - _on)) -le 30 ]
+  _age=$((EPOCHSECONDS - _on))
+  [ "$_age" -le 30 ] && [ "$_age" -ge -5 ]
 }
 
 # ward_record_start CMD...: write the start record, activity/exec.<pid>.<time>. Its
@@ -94,7 +95,10 @@ ward_record_start() {
 # (`<&0`: a background command would get /dev/null) and the default SIGINT and
 # SIGQUIT (a background command would ignore them); TERM, INT and HUP sent to this
 # pid are passed on; if this shell is killed outright the child gets SIGTERM
-# (pdeathsig); and a command that died of a signal makes this shell die of the same.
+# (pdeathsig). One difference remains: a command that died of signal N ends this shell
+# with exit status 128+N, as any shell reports it, where `exec` would have died of N
+# itself. A shell can't tell that from a command that exited 128+N, and turning an
+# honest `exit 141` into a signal would be the worse mistake.
 ward_record_run() {
   setpriv --pdeathsig TERM -- env --default-signal=INT --default-signal=QUIT "$@" <&0 &
   child=$!
@@ -107,10 +111,6 @@ ward_record_run() {
     kill -0 "$child" 2>/dev/null || break
   done
   { printf 'E2\0%s\0%s\0' "$rc" "$EPOCHREALTIME" && times && printf '\0E2.\0'; } 2>/dev/null > "$rec_file.end" || :
-  if [ "$rc" -gt 128 ] && [ "$rc" -le 192 ]; then
-    trap - TERM INT HUP
-    kill -s "$((rc - 128))" $$ 2>/dev/null || :
-  fi
   exit "$rc"
 }
 

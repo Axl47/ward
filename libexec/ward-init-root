@@ -75,7 +75,9 @@ lock_down() {
       "$(readlink -f "$WARD_RUNTIME")")
         ro "$p"; rw "$rt/desktop"; rw "$rt/podman"
         # Every thread's commands as `ward exec` records them (bin/ward: ward_record_start).
-        [ ! -d "$p/activity" ] || mount -t tmpfs -o ro,mode=0700,size=4k tmpfs "$p/activity"
+        # Reported to ward-init, which notes it where the ward can't write: a recorder only
+        # records while every running ward has this (wardd's /ls: activityHidden).
+        if [ -d "$p/activity" ]; then mount -t tmpfs -o ro,mode=0700,size=4k tmpfs "$p/activity"; echo activity-hidden >&3; fi
         seal "$p" ;;
       "$(readlink -f "$WARD_CONFIG")") hide_except "$p" enabled; [ ! -d "$p/enabled" ] || seal "$p/enabled" ;;
       "$(readlink -f "$WARD_HOME")") ro "$p"; seal "$p" ;;

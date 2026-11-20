@@ -15,7 +15,7 @@ mkdir -p "$rt"
 # stderr goes to a file; wardd shows its tail when a ward fails to start.
 exec 2>"$rt/init.log"
 mkdir -p "$rt/podman" "$st/storage" "$st/home" "$st/tmp" "$st/net" "$st/resolve" "$st/sock" "$WARD_STATE/images"
-rm -f "$rt/ready" "$rt/pid" "$rt/bus"
+rm -f "$rt/ready" "$rt/pid" "$rt/bus" "$rt/activity-hidden"
 # The shared image store is read-only inside the ward, and Podman must find its
 # lock files there, so an empty store is set up here first.
 [ -e "$WARD_STATE/images/overlay-layers" ] || "$WARD_LIBEXEC/ward-images" images -q >/dev/null
@@ -57,6 +57,7 @@ WARD_HOST_UID=$(id -u) unshare $(ward_map_args) --mount --setuid 0 --setgid 0 --
   while read -r line; do
     case $line in
       pid=*) host_pid "${line#pid=}" > "$rt/pid" ;;
+      activity-hidden) touch "$rt/activity-hidden" ;;
       ready) touch "$rt/ready" ;;
     esac
   done
