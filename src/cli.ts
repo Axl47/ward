@@ -217,6 +217,12 @@ async function main(): Promise<void> {
       if (given !== undefined) await reportStaleWards(repo, forwarded);
       return;
     }
+    case "adb-server": {
+      // From shims/adb, when the host's adb server isn't answering.
+      await ensureDaemon();
+      if (!(await call("POST /adb-server", {})).ok) throw new WardError("could not start the host's adb server");
+      return;
+    }
     case "gc": {
       await ensureDaemon();
       const { actions } = await call("POST /gc", {});

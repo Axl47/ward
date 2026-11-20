@@ -3,6 +3,18 @@
 # `adb reverse DEVICE tcp:PORT` the local side must be the ward's host-mapped
 # port for PORT; everything else goes to the real adb unchanged.
 real=${WARD_REAL_ADB:-${ANDROID_HOME:-$HOME/Android/Sdk}/platform-tools/adb}
+
+# Outside a ward, adb starts the host's server when it isn't running. Here the
+# server's port is pasta's forward, which accepts and then resets, and a server
+# started in the ward couldn't see the emulators; so wardd starts it on the host.
+server_up() {
+  timeout 2 bash -c 'exec 3<>"/dev/tcp/127.0.0.1/$1" && printf 000chost:version >&3 && IFS= read -r -n 4 r <&3 && [ "$r" = OKAY ]' \
+    bash "${ANDROID_ADB_SERVER_PORT:-5037}" 2>/dev/null
+}
+case "${1:-}" in
+  version|--version|help|--help|kill-server) ;;
+  *) server_up || ward adb-server >&2 || true ;;
+esac
 seen_reverse=0 specs=0
 for a in "$@"; do
   [ "$a" = reverse ] && seen_reverse=1

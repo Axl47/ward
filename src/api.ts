@@ -41,25 +41,32 @@ export interface Routes {
    */
   "POST /desktop": { body: { id: string; worktree?: string } | { thread: string; cwd: string }; result: { ward?: string } };
   "POST /gc": { body: Record<string, never>; result: { actions: string[] } };
+  /** Starts the host's adb server, which a ward's adb can reach but not start (bin/ward adb-server). */
+  "POST /adb-server": { body: Record<string, never>; result: { ok: boolean } };
   "GET /ls": { body: Record<string, never>; result: WardInfo[] };
 }
 
 export type Route = keyof Routes;
 
 /** wardd → broker (src/broker.js), over Node IPC. */
-export type BrokerRequest = {
-  readonly t: "connect";
-  readonly req: number;
-  /** Addresses to try in order, e.g. ["127.0.0.1", "::1"]. */
-  readonly hosts: readonly string[];
-  readonly port: number;
-};
+export type BrokerRequest =
+  | {
+      readonly t: "connect";
+      readonly req: number;
+      /** Addresses to try in order, e.g. ["127.0.0.1", "::1"]. */
+      readonly hosts: readonly string[];
+      readonly port: number;
+    }
+  /** Listen on the ward's 127.0.0.1:port and hand each connection to wardd ("accepted"), which relays it to the host's. */
+  | { readonly t: "relay"; readonly port: number }
+  | { readonly t: "unrelay"; readonly port: number };
 
-/** broker → wardd; "connected" comes with the connected socket. */
+/** broker → wardd; "connected" and "accepted" come with the socket. */
 export type BrokerReply =
   | { readonly t: "ready" }
   | { readonly t: "connected"; readonly req: number }
-  | { readonly t: "failed"; readonly req: number; readonly message: string };
+  | { readonly t: "failed"; readonly req: number; readonly message: string }
+  | { readonly t: "accepted"; readonly port: number };
 
 export class WardError extends Error {}
 
