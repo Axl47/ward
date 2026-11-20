@@ -34,8 +34,11 @@ export interface Routes {
   /** Moves the ward's data to the trash, or deletes it now with `now`. */
   "POST /rm": { body: { id: string; worktree?: string; now?: boolean }; result: { removed: boolean } };
   "POST /port": { body: { id: string; port: number }; result: { host: number } };
-  /** Starts the ward if needed, then its desktop; answers once the desktop is up. */
-  "POST /desktop": { body: { id: string; worktree?: string }; result: Record<string, never> };
+  /**
+   * Starts the ward if needed, then its desktop; with `thread`, the desktop of a
+   * T3 thread that has no ward, whose programs start in `cwd`. Answers once the desktop is up.
+   */
+  "POST /desktop": { body: { id: string; worktree?: string } | { thread: string; cwd: string }; result: Record<string, never> };
   "POST /gc": { body: Record<string, never>; result: { actions: string[] } };
   "GET /ls": { body: Record<string, never>; result: WardInfo[] };
 }

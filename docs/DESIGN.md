@@ -90,9 +90,9 @@ ward "indexio/t3-d7059d66…"                         host
 
 ### How a command gets on it
 
-One rule, the usual Wayland one: a process is on the desktop its environment names (`XDG_RUNTIME_DIR`, `WAYLAND_DISPLAY`, `UMBRIEL_SOCKET`, `DBUS_SESSION_BUS_ADDRESS`). `ward desktop` prints the ward desktop's, and `ward desktop -- CMD` runs `CMD` in the ward with it, after unsetting what could still point at your session (`WAYLAND_SOCKET`, `AT_SPI_BUS_ADDRESS`, PulseAudio's and PipeWire's overrides). Where there is no ward it exits 3 and runs nothing: `ward exec` falls back to running the command unwarded, but a command sent to a ward's desktop must not open on yours instead.
+One rule, the usual Wayland one: a process is on the desktop its environment names (`XDG_RUNTIME_DIR`, `WAYLAND_DISPLAY`, `UMBRIEL_SOCKET`, `DBUS_SESSION_BUS_ADDRESS`). `ward desktop` prints the ward desktop's, and `ward desktop -- CMD` runs `CMD` in the ward with it, after unsetting what could still point at your session (`WAYLAND_SOCKET`, `AT_SPI_BUS_ADDRESS`, PulseAudio's and PipeWire's overrides). Where there is no ward, the desktop is the calling T3 thread's own (below); with neither it exits 3 and runs nothing: `ward exec` falls back to running the command unwarded, but a command sent to a private desktop must not open on yours instead.
 
-Puck is the one program that picks for itself, because driving your screen by accident is the collision this exists to end. Its MCP server (one process outside the ward for the whole thread) and its CLI inside a ward both ask `ward desktop` and act on the answer; `desktop_state` with `desktop: "live"`, or `PUCK_DESKTOP=live` for the CLI, moves them to your screen. Each tool call is given its desktop once, when it starts, so a switch made by another call can't move half of it. If `ward desktop` fails, Puck reports that and never falls back to your session.
+Puck is the one program that picks for itself, because driving your screen by accident is the collision this exists to end. Its MCP server (one process outside the ward for the whole thread) and its CLI in an agent's shell both ask `ward desktop` and act on the answer; `desktop_state` with `desktop: "live"`, or `PUCK_DESKTOP=live` for the CLI, moves them to your screen. Each tool call is given its desktop once, when it starts, so a switch made by another call can't move half of it. If `ward desktop` fails, Puck reports that and never falls back to your session.
 
 Decided against:
 
@@ -107,6 +107,44 @@ Limits:
 - No Xwayland: it refuses `/tmp/.X11-unix`, whose owner (the host's root) is nobody inside the ward's user namespace. X11-only apps don't run on a ward's desktop, and `DISPLAY` is empty there so they can't reach your session's instead.
 - Programs the compositor starts (`launch_app`) get Ward's service environment, not your shell's: a program that needs your shell's `PATH` starts with `ward desktop -- CMD`.
 - Typing needs `wtype` installed, for the keyboard above.
+
+### Threads without a ward
+
+Goal, in the words of the request (2026-11-19): "add a way to launch test applications or windows […] in a way that gets routed to silent space so I don't see it. […] some agents using the tools that we have right now, even with this update, they sometimes make the window visible for me. So having a standard way of opening things for testing that is handled maybe in one command […]. If a thread is running without a ward, like projects in omarchy-config, that simple open command can just take care of that setup and giving the agent their own test desktop […] instead of having to think about that isolation themselves", and the command should give "a quick way to interact with the things in their desktop […] they wouldn't need to know ahead of time the window ID, the place where they are at, the desktop ID."
+
+Only projects enabled for Ward have wards (one, when this was written), so every other thread's GUI checks landed on your screen. Now `ward desktop -- CMD` works in any T3 thread: where the folder has no ward, the desktop belongs to the calling thread.
+
+```
+                          in a warded worktree            anywhere else in a T3 thread
+ward desktop -- CMD       the ward's desktop,             the thread's desktop, started if needed;
+                          started if needed; CMD          CMD runs in no namespace, in the
+                          runs in the ward                desktop's cgroup
+ward desktop  (prints)    starts it, prints               exit 3 until the thread's first command
+                                                          on it; from then on starts it, prints
+stops                     with the ward                   when the thread settles, is archived or
+                                                          deleted, or after 2 h unused; unknown
+                                                          to T3: 30 min unused. The next call
+                                                          starts it again, empty
+```
+
+- **Whose it is.** T3 gives every agent's shell and MCP servers `T3CODE_THREAD_ID`. The desktop's id is `t-<that id, sanitized>`: no dot, which every ward's id has, so the two never share a folder under `$XDG_RUNTIME_DIR/ward`. A delegated child is its own thread and gets its own desktop; subagents inside one thread share one. The folder is not the key, as it is for wards: threads without a worktree share their project's folder, and a second thread there, working on your real desktop on purpose, would find Puck on the first one's.
+- **The same desktop, in no namespace.** `wardd` runs the same `libexec/ward-desktop` as a transient unit, `ward-desktop-<id>.service`, under the wards' slice: its own session bus, headless Umbriel, accessibility, keyboard, short socket names and mirrored config folder, all as above. Its caches, app profiles and log are in `~/.local/state/ward/desktops/<id>` and go when it stops. There is no network namespace, because the thread's dev servers aren't in one: a browser on the desktop reaches `localhost:5173` as the thread does.
+- **A command starts it; asking does only afterwards.** `ward desktop -- CMD` starts the desktop (0.4 s) and runs `CMD` after moving it into the unit's cgroup, so stopping the desktop stops what was opened on it. The cgroup is read from the desktop's own process (`/proc/<pid>/cgroup`), so there is no second file a command could arrive before. Plain `ward desktop` exits 3 for a thread that never ran a command on its desktop: Puck asks before every call, and such a thread is on your screen on purpose (a task about your real desktop). The first start leaves a marker, `~/.local/state/ward/desktops/<id>/thread`, and from then on plain `ward desktop` starts the desktop again whenever it is down. Without that (the first build), a desktop that stopped or crashed made the next ask answer "none", and Puck went back to your screen in the middle of the thread's test, silently; three reviews found it.
+- **Stops with the thread, or when idle.** The reconciler applies the wards' rule (`shouldStop`) with the one thread as the desktop's threads: it stops once the thread is settled, archived or deleted and wasn't used since, or 30 minutes unused when T3 doesn't know the thread. An active thread's desktop also stops after 2 hours with no call and no typing in a terminal on it (`DESKTOP_IDLE_MS`), since long threads otherwise keep one for days; unlike a ward, it holds no services worth keeping up. Stopping removes what apps kept there; the marker and the last log stay until T3 has forgotten the thread, so the next call brings back an empty desktop, which `desktop_state` shows. The marker's time is set to the desktop's last use as its runtime folder goes, so a thread T3 doesn't list is forgotten 30 minutes after its last use, not after its first start, and never in the pass that stopped its desktop or cleared a dead one: a call that arrived meanwhile has updated the marker by the next pass. Once a thread is forgotten, plain `ward desktop` exits 3 for it again, so Puck's looking and arranging tools are back on your screen there until its next open (opening and input stay refused); only a thread T3 doesn't list gets there. Desktops are found by their folders, so there is no registry entry and no slot, and a restarted `wardd` picks them up. One whose compositor died is cleared away on the next pass, and a failure on one doesn't stop the pass for the others.
+- **One command for agents.** Puck's `puck open CMD` is the agent-facing form: it runs `ward desktop -- CMD` detached, waits for the command's window and prints it (id, app, title, geometry) with the command's pid and log. That is the "one command": the agent needs no desktop or window id beforehand, and doesn't have to background the command itself. Puck's `launch_app` starts the desktop the same way (`ward desktop -- true`).
+
+Decided against:
+
+- **A private desktop by default in every thread.** Threads in projects like omarchy-config are often about your real desktop; Puck there must keep looking at it until the agent opens something of its own. It is one condition in `ward_thread_desktop` (drop the marker test) if that default should flip.
+- **Starting it from plain `ward desktop`.** Puck's MCP server asks on every call in every thread; each would then get a compositor it never uses.
+- **A network namespace for the opened app,** as in a ward: it couldn't reach the unwarded thread's own `localhost` ports.
+- **Making GUI launches on your session fail for agents.** Nothing here can stop an agent that sets `WAYLAND_DISPLAY` itself, and some tasks need your screen. Puck covers its own door: `launch_app` opens on the private desktop unless the agent asked for the live session. The global agent instructions name `puck open` as the way to open anything for a check.
+- **Guessing the thread from the folder** where a caller has no `T3CODE_THREAD_ID`: several threads share a folder, and a wrong guess hands one thread another's windows.
+- **Listing thread desktops in `ward ls`.** T3 polls that list for wards. `systemctl --user list-units 'ward-desktop-*'` shows them, and the idle stop bounds what a missed one costs.
+
+Limits: all those of a ward's desktop. Outside T3 (no `T3CODE_THREAD_ID`) and outside a ward there is no private desktop. Codex gives its MCP servers no `T3CODE_THREAD_ID` (measured 2026-11-19: one `codex` process serves several threads), so Puck's MCP tools there stay on the live session, where they refuse to open or press anything, and the thread's shell drives its desktop with the `puck` CLI; passing the id to MCP servers is a change for T3. Thread ids are sanitized into the desktop's id, so two ids differing only in characters outside `[A-Za-z0-9_-]` would share one; T3's are UUIDs or `mcp:`-prefixed hex.
+
+Verified in a second Ward instance (2026-11-19): a thread's first `ward desktop -- true` took 0.39 s; `puck open foot` returned the window in 0.8 s; two threads' desktops each showed only their own windows; the opened program was in the desktop unit's cgroup; a reconcile pass stopped the desktop of a settled thread and of an unknown thread unused for 31 minutes, removed their folders and short names, and kept an active thread's.
 
 ## Lifecycle and teardown
 

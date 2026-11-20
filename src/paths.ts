@@ -66,5 +66,14 @@ export const wardStateDir = (id: string) => join(STATE_DIR, "wards", id);
 /** Where a removed ward's data waits before it is purged, keyed by worktree so colliding ids can't clash. */
 export const wardTrashDir = (id: string, worktree: string) =>
   join(STATE_DIR, "trash", `${id}.${createHash("sha256").update(worktree).digest("hex").slice(0, 8)}`);
+/**
+ * The id of the desktop of a T3 thread that has no ward. It has no dot, which
+ * every ward's id has, so the two never share a runtime folder.
+ */
+export const threadDesktopId = (thread: string) => `t-${sanitize(thread)}`;
+/** A thread desktop's caches, app profiles and log, kept only while it runs. */
+export const desktopStateDir = (id: string) => join(STATE_DIR, "desktops", id);
+/** The transient unit a thread's desktop runs as. */
+export const desktopUnitName = (id: string) => `${env.WARD_UNIT ?? "ward"}-desktop-${id}.service`;
 /** Unit template wards run under; WARD_UNIT names another, to run a second Ward beside the installed one. */
 export const unitName = (id: string) => `${env.WARD_UNIT ?? "ward"}@${id}.service`;

@@ -64,24 +64,53 @@ ward_exec() {
   ward_enter "$@"
 }
 
-# Put this shell on the desktop of ward $WARD_ID.
+# Put this shell on the desktop whose owner's runtime folder is $1 (default: ward $WARD_ID's).
 ward_desktop_env() {
   # shellcheck disable=SC2086
   unset $WARD_DESKTOP_UNSET
-  . "$WARD_RUNTIME/$WARD_ID/desktop/env"
+  . "${1:-$WARD_RUNTIME/$WARD_ID}/desktop/env"
 }
 
-# ward desktop [--worktree DIR] [-- CMD...]: the ward's private desktop (a headless
-# Umbriel on a session bus of its own), started on first use. Prints the desktop's
-# environment, or runs CMD in the ward with it; exits 3 where there is no ward,
-# never running CMD on the live session instead. The checks here keep wardd and
-# Node out of every call after the first (Puck asks before each tool call).
+# ward_thread_desktop [CMD...]: the desktop of the calling T3 thread, where there
+# is no ward: the same desktop in no namespace, as a unit of its own that wardd
+# starts and, once the thread is done or it sat unused, stops. CMD starts it and
+# joins its cgroup, so it stops with the desktop. Printing starts it only for a
+# thread that has had one (wardd leaves a marker): until a thread opens something
+# of its own, exit 3 keeps Puck on your screen, where such a thread works on
+# purpose; afterwards a desktop that stopped comes back empty, and Puck never
+# falls back to your screen in the middle of a thread.
+ward_thread_desktop() {
+  unset WARD_ID WARD_REPO WARD_ROOT   # ward_resolve's, of a folder that has no ward
+  id=$(ward_thread_desktop_id "$T3CODE_THREAD_ID")
+  rt=$WARD_RUNTIME/$id
+  pid=$(cat "$rt/desktop/pid" 2>/dev/null || true)
+  if [ ! -e "$rt/desktop/env" ] || [ -z "$pid" ] || [ ! -e "/proc/$pid" ]; then
+    [ $# -gt 0 ] || [ -e "$WARD_STATE/desktops/$id/thread" ] || { echo "ward: this thread has no desktop yet; \`ward desktop -- CMD\` starts one" >&2; exit 3; }
+    (ward_node desktop --thread "$T3CODE_THREAD_ID") >&2 || exit 1
+    pid=$(cat "$rt/desktop/pid")
+  fi
+  # The reconciler stops a desktop nothing has asked for in a while.
+  : > "$rt/last-exec"
+  [ $# -gt 0 ] || exec cat "$rt/desktop/env"
+  # The unit's cgroup, read from the desktop's own process: there is no file to wait for.
+  echo $$ > "/sys/fs/cgroup$(cut -d: -f3 "/proc/$pid/cgroup")/cgroup.procs" || { echo "ward: could not join the cgroup of this thread's desktop" >&2; exit 1; }
+  set -a; ward_desktop_env "$rt"; set +a
+  exec "$@"
+}
+
+# ward desktop [--worktree DIR] [-- CMD...]: a private desktop (a headless Umbriel
+# on a session bus of its own), started on first use: the ward's, or where there
+# is no ward the calling T3 thread's own (ward_thread_desktop). Prints the
+# desktop's environment, or runs CMD on it, in the ward if there is one; exits 3
+# where there is neither, or a thread that never opened one asks for it to be
+# printed, never running CMD on the live session instead. The checks here keep wardd and Node out of every call after
+# the first (Puck asks before each tool call).
 ward_desktop() {
-  dir=
+  dir= named=
   while [ $# -gt 0 ]; do
     case "$1" in
-      --worktree) dir=$2; shift 2 ;;
-      --worktree=*) dir=${1#*=}; shift ;;
+      --worktree) dir=$2; named=1; shift 2 ;;
+      --worktree=*) dir=${1#*=}; named=1; shift ;;
       --) shift; break ;;
       *) echo "usage: ward desktop [--worktree DIR] [-- CMD...]" >&2; exit 2 ;;
     esac
@@ -91,8 +120,12 @@ ward_desktop() {
     [ -n "$dir" ] || dir=$(pwd -P)
     dir=$(readlink -f -- "$dir" 2>/dev/null || printf '%s' "$dir")
     if ! ward_resolve "$dir" || ! ward_enabled "$WARD_REPO"; then
-      echo "ward: $dir is not a warded worktree, so it has no desktop" >&2
-      exit 3
+      # A named folder means that folder's ward, so only the caller's own folder falls to its thread.
+      if [ -n "$named" ] || [ -z "${T3CODE_THREAD_ID:-}" ]; then
+        echo "ward: $dir is not a warded worktree, and no T3 thread is calling, so there is no desktop" >&2
+        exit 3
+      fi
+      ward_thread_desktop "$@"
     fi
   fi
   d=$WARD_RUNTIME/$WARD_ID/desktop

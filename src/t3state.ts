@@ -35,15 +35,19 @@ function t3Origin(): string {
   return "http://127.0.0.1:3773";
 }
 
-/** Threads grouped by worktree path. Throws when T3 is unreachable or the token is missing or rejected. */
-export async function threadsByWorktree(): Promise<Map<string, ThreadState[]>> {
+/** Every thread T3 knows. Throws when T3 is unreachable or the token is missing or rejected. */
+export async function loadThreads(): Promise<readonly ShellThread[]> {
   const token = readFileSync(T3_TOKEN_FILE, "utf8").trim();
   const res = await fetch(`${t3Origin()}/api/orchestration/shell`, {
     headers: { authorization: `Bearer ${token}`, "x-t3-orchestration-protocol": "2", accept: "application/json" },
     signal: AbortSignal.timeout(10_000),
   });
   if (!res.ok) throw new Error(`T3 answered HTTP ${res.status}${res.status === 401 ? " (token expired or revoked; rerun `ward install`)" : ""}`);
-  const { threads } = (await res.json()) as { threads: readonly ShellThread[] };
+  return ((await res.json()) as { threads: readonly ShellThread[] }).threads;
+}
+
+/** Threads grouped by worktree path; threads without a worktree are left out. */
+export function threadsByWorktree(threads: readonly ShellThread[]): Map<string, ThreadState[]> {
   const byWorktree = new Map<string, ThreadState[]>();
   for (const thread of threads) {
     const state = threadState(thread);
@@ -52,27 +56,34 @@ export async function threadsByWorktree(): Promise<Map<string, ThreadState[]>> {
   return byWorktree;
 }
 
-/** A thread's worktree and idle time, or undefined when it has no worktree. */
-export function threadState(thread: ShellThread): ThreadState | undefined {
-  if (!thread.worktreePath) return undefined;
-  const idleSince = [thread.deletedAt, thread.archivedAt, isSettled(thread) ? thread.settledAt : undefined]
+/** When the thread was settled, archived or deleted, or undefined while it is active. */
+export const idleSince = (thread: ShellThread): string | undefined =>
+  [thread.deletedAt, thread.archivedAt, isSettled(thread) ? thread.settledAt : undefined]
     .filter((t): t is string => Boolean(t))
     .sort()
     .at(-1);
-  return { threadId: thread.id, worktree: thread.worktreePath, idleSince };
+
+/** A thread's worktree and idle time, or undefined when it has no worktree. */
+export function threadState(thread: ShellThread): ThreadState | undefined {
+  if (!thread.worktreePath) return undefined;
+  return { threadId: thread.id, worktree: thread.worktreePath, idleSince: idleSince(thread) };
 }
 
 /** How long a ward whose worktree has no active thread (archived, deleted, or none) may sit unused. */
 export const NO_THREAD_GRACE_MS = 30 * 60_000;
 
+/** How long a thread's desktop may run with nothing asking for it, even while its thread is active. */
+export const DESKTOP_IDLE_MS = 2 * 60 * 60_000;
+
 /**
- * Whether the reconciler should stop a running ward. lastActivity is when the
- * ward last started, ran a command, or got terminal input (ms). With threads, once all are idle:
+ * Whether the reconciler should stop a running ward, or a thread's desktop
+ * (its threads: that one, if T3 knows it). lastActivity is when it
+ * last started, ran a command, or got terminal input (ms). With threads, once all are idle:
  * right away if the latest went idle after that activity, else (someone used a
  * settled thread's worktree) after NO_THREAD_GRACE_MS unused. Without threads:
  * after NO_THREAD_GRACE_MS unused.
  */
-export function shouldStop(threads: readonly ThreadState[], lastActivity: number, now: number): boolean {
+export function shouldStop(threads: readonly Pick<ThreadState, "idleSince">[], lastActivity: number, now: number): boolean {
   const unused = now - lastActivity > NO_THREAD_GRACE_MS;
   if (threads.length === 0) return unused;
   const idle = threads.map((t) => (t.idleSince === undefined ? Number.NaN : Date.parse(t.idleSince)));
