@@ -413,13 +413,10 @@ function threadDesktop(thread: string, cwd: string): Promise<{ ward?: string }> 
     if (desktopReady(id)) return {};
     // A thread of a warded worktree whose shell stands elsewhere: no desktop of its own,
     // its ward's (asked afresh, since a new thread may call before the next reconcile).
-    const ward = await loadThreads().then(
-      (threads) => {
-        const listed = threads.find((t) => t.id === thread);
-        return listed && noteThreadWard(listed);
-      },
-      () => undefined, // T3 unreachable: its own desktop
-    );
+    const ward = await withThreads((threads) => {
+      const listed = threads.find((t) => t.id === thread);
+      return listed && noteThreadWard(listed);
+    }).catch(() => undefined); // T3 unreachable: its own desktop
     if (ward !== undefined) return { ward };
     const unit = desktopUnitName(id);
     const rt = wardRuntimeDir(id);
@@ -490,7 +487,7 @@ async function clearThreadDesktop(id: string): Promise<void> {
  */
 function noteThreadWard(thread: ShellThread): string | undefined {
   const location = thread.worktreePath ? locate(thread.worktreePath) : undefined;
-  if (location === undefined || !isEnabled(location.repo) || !existsSync(location.root)) return undefined;
+  if (thread.deletedAt || location === undefined || !isEnabled(location.repo) || !existsSync(location.root)) return undefined;
   const note = join(THREAD_WARDS_DIR, threadDesktopId(thread.id));
   const text = `${location.root}\n${thread.id}\n`;
   if (!existsSync(note) || readFileSync(note, "utf8") !== text) {
@@ -503,18 +500,32 @@ function noteThreadWard(thread: ShellThread): string | undefined {
 
 /**
  * Thread notes follow T3's list: written for each thread in a warded worktree,
- * and removed only once T3 has no such thread. One whose ward went away (the
- * worktree removed, the project disabled) stays, and bin/ward then gives the
- * thread a desktop of its own instead of the live session.
+ * and removed only once T3 no longer lists the thread with that worktree. One
+ * whose ward went away (the worktree removed, the project disabled, the thread
+ * deleted but still listed) stays, and bin/ward then gives the thread a desktop
+ * of its own instead of the live session.
  */
 function syncThreadNotes(threads: readonly ShellThread[]): void {
-  const listed = new Set(threads.filter((t) => !t.deletedAt).map((t) => t.id));
-  for (const thread of threads) if (listed.has(thread.id)) noteThreadWard(thread);
+  for (const thread of threads) noteThreadWard(thread);
   if (!existsSync(THREAD_WARDS_DIR)) return;
+  const roots = new Map(threads.map((t) => [t.id, t.worktreePath ? locate(t.worktreePath)?.root : undefined]));
   for (const name of readdirSync(THREAD_WARDS_DIR)) {
     const note = join(THREAD_WARDS_DIR, name);
-    if (!listed.has(readFileSync(note, "utf8").split("\n")[1] ?? "")) rmSync(note, { force: true });
+    const [root, thread] = readFileSync(note, "utf8").split("\n");
+    if (thread === undefined || roots.get(thread) !== root) rmSync(note, { force: true });
   }
+}
+
+let threadLists: Promise<unknown> = Promise.resolve();
+/**
+ * T3's thread list, one fetch at a time, with `use` run on each answer before
+ * the next fetch starts. Notes are written and removed only in `use`, so a list
+ * fetched earlier never undoes what a later one wrote.
+ */
+function withThreads<T>(use: (threads: readonly ShellThread[]) => T): Promise<T> {
+  const answer = threadLists.then(async () => use(await loadThreads()));
+  threadLists = answer.catch(() => undefined);
+  return answer;
 }
 
 /**
@@ -996,7 +1007,10 @@ async function reconcile(): Promise<string[]> {
   let threads: Map<string, ThreadState[]> | undefined;
   let allThreads: readonly ShellThread[] | undefined;
   try {
-    allThreads = await loadThreads();
+    allThreads = await withThreads((list) => {
+      syncThreadNotes(list);
+      return list;
+    });
     threads = lastThreads = threadsByWorktree(allThreads);
   } catch (error) {
     log(`reconcile: cannot read T3 thread state: ${error instanceof Error ? error.message : String(error)}`);
@@ -1018,7 +1032,6 @@ async function reconcile(): Promise<string[]> {
     if (await stop(record.id, record.worktree)) actions.push(`stopped ${record.id}: no active thread needs it`);
   }
   actions.push(...(await reconcileThreadDesktops(allThreads, now)));
-  if (allThreads !== undefined) syncThreadNotes(allThreads);
   actions.push(...(await purgeOldTrash()));
   return actions;
 }
