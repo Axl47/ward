@@ -38,14 +38,23 @@ st=$WARD_STATE/wards/$id
 #   except its `shell` folder, where the bash hook in a ward's terminal leaves
 #   the commands typed there. Miranda's MCP server runs on the host and still
 #   reads the store; its CLI inside a ward doesn't.
-# - Your Gradle home is the ward's own, so wards share no Gradle locks or daemons.
+# - The Gradle build cache wardd keeps for every project is hidden.
+# - Your Gradle home and Kotlin daemon folder are the ward's own, so wards share
+#   no Gradle locks or daemons; your gradle.properties and init.d are read-only
+#   over its home.
 # Every folder above one of these that you could rename (whose parent is yours)
 # becomes a mount point too, or a ward could move it aside and put a forged copy
 # where the host looks.
 lock_down() {
   local uid=$WARD_HOST_UID p a held=" " ancestors=() protected=() miranda=${MIRANDA_HOME:-$HOME/.local/share/miranda}
+  # Each line of own-homes is NAME PATH: the ward's own $st/NAME goes over PATH, a real
+  # path of yours (wardd wrote it before the ward started: src/daemon.ts prepareGradle).
+  local name path names=() paths=()
+  if [ -f "$rt/own-homes" ]; then
+    while read -r name path; do names+=("$name"); paths+=("$path"); done <"$rt/own-homes"
+  fi
   for p in "$WARD_STATE" "$WARD_CONFIG" "$WARD_RUNTIME" "$WARD_HOME" "$HOME"/.t3*/userdata "$WARD_T3/userdata" "$miranda" \
-           "/run/user/$uid/systemd" "/run/user/$uid/bus" "${XDG_RUNTIME_DIR:-}/systemd" "${XDG_RUNTIME_DIR:-}/bus"; do
+           "/run/user/$uid/systemd" "/run/user/$uid/bus" "${XDG_RUNTIME_DIR:-}/systemd" "${XDG_RUNTIME_DIR:-}/bus" "${paths[@]}"; do
     [ -e "$p" ] && [ ! -L "$p" ] || continue
     p=$(readlink -f -- "$p")
     [[ " ${protected[*]} " != *" $p "* ]] || continue
@@ -93,12 +102,31 @@ lock_down() {
       */systemd) mount -t tmpfs -o ro,mode=0755,size=4k tmpfs "$p" ;;
     esac
   done
-  # The ward's own Gradle home over yours, at the same path (wardd wrote it to
-  # gradle-home; src/gradle.ts made the home): its daemons, locks and caches are
-  # its own, and paths under it are the same in every ward and on the host.
-  local gradle
-  gradle=$(cat "$rt/gradle-home" 2>/dev/null) || gradle=
-  if [ -n "$gradle" ] && [ -d "$gradle" ] && [ -d "$st/gradle" ]; then mount --bind "$st/gradle" "$gradle"; fi
+  # ro_over SRC DST: SRC, which wardd keeps in the ward's runtime folder, read-only over
+  # DST in the ward's own home, made first as SRC's kind; a link or another kind there
+  # is removed, never followed.
+  ro_over() {
+    local kind=-f
+    [ -d "$1" ] && kind=-d
+    if [ -L "$2" ] || { [ -e "$2" ] && ! [ $kind "$2" ]; }; then rm -rf -- "$2" || return; fi
+    if [ ! -e "$2" ]; then
+      { if [ $kind = -d ]; then mkdir -- "$2"; else : >"$2"; fi; } && chown --reference="${2%/*}" -- "$2" || return
+    fi
+    mount --bind "$1" "$2" && seal "$2"
+  }
+  # The ward's own folders over yours, at the same paths, so paths under them are the
+  # same in every ward and on the host; then your Gradle settings over its home, as
+  # wardd last wrote them. A failure here is a warning: the ward starts without them.
+  local i f
+  for i in "${!names[@]}"; do
+    name=${names[$i]} path=${paths[$i]}
+    [ -d "$st/$name" ] && [ ! -L "$st/$name" ] && [ -d "$path" ] && [ ! -L "$path" ] || continue
+    if ! mount --bind "$st/$name" "$path"; then echo "ward: warning: could not mount the ward's own $name over $path" >&2; continue; fi
+    [ "$name" = gradle ] || continue
+    for f in gradle.properties init.d; do
+      [ ! -e "$rt/gradle/$f" ] || ro_over "$rt/gradle/$f" "$path/$f" || echo "ward: warning: could not mount your $f over the ward's Gradle home" >&2
+    done
+  done
 }
 
 # The inner user namespace maps every id the outer one does to itself.

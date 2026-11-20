@@ -13,11 +13,13 @@ import type { BrokerReply, BrokerRequest, PortInfo, Route, Routes, UpResult, War
 import { identify, type Caller } from "./caller.ts";
 import {
   ACTIVITY_DIR,
+  BUILD_CACHE_DIR,
   CONTROL_SOCKET,
   desktopStateDir,
   THREAD_WARDS_DIR,
   desktopUnitName,
   GRADLE_SOURCE_HOME,
+  KOTLIN_DAEMON_DIR,
   HOST_PORTS,
   isEnabled,
   parsePorts,
@@ -30,12 +32,11 @@ import {
   unitName,
   WARD_HOME,
   wardDesktopDir,
-  wardGradleHome,
   wardRuntimeDir,
   wardStateDir,
   wardTrashDir,
 } from "./paths.ts";
-import { acceptBuildCache, BUILD_CACHE_PORT, cloneGradleHome, ensureProjectStore, projectStore, sweepBuildCache, writeGradleSettings } from "./gradle.ts";
+import { acceptBuildCache, BUILD_CACHE_PORT, hasGradleBuild, ownFolder, projectStore, realFolder, sweepSoon, writeGradleSettings } from "./gradle.ts";
 import { wardHostPorts } from "./hostports.ts";
 import { listeningPorts } from "./procnet.ts";
 import { mappedServer, relayToHost, splice } from "./splice.ts";
@@ -181,22 +182,40 @@ function writeHostPorts(record: WardRecord): void {
 }
 
 /**
- * The ward's Gradle home (src/gradle.ts): cloned from yours the first time, its
- * settings from yours every time; and its project's build cache store. Before the
- * ward starts, the path ward-init-root mounts it over, which must exist.
+ * Gradle for a ward (src/gradle.ts), on every `up`: your settings, which ward-init-root
+ * mounts over its home. When it starts: its own Gradle home (cloned from yours the
+ * first time, if its worktree has a Gradle build) and Kotlin daemon folder, listed
+ * with the paths of yours they go over in `own-homes`, which ward-init-root reads.
+ * A failure is logged and the ward starts without them. Resolves to the real path of
+ * your Gradle home, or undefined after a failure.
  */
-async function prepareGradle(record: WardRecord, starting: boolean): Promise<void> {
-  const failure = await cloneGradleHome(wardGradleHome(record.id));
-  if (failure !== undefined) log(`ward ${record.id}: ${failure}`);
-  writeGradleSettings(wardGradleHome(record.id));
-  await ensureProjectStore(projectStore(record.repo));
-  if (!starting) return;
-  mkdirSync(GRADLE_SOURCE_HOME, { recursive: true });
-  writeFileSync(join(wardRuntimeDir(record.id), "gradle-home"), GRADLE_SOURCE_HOME);
+async function prepareGradle(record: WardRecord, starting: boolean): Promise<string | undefined> {
+  const rt = wardRuntimeDir(record.id);
+  try {
+    const source = realFolder(GRADLE_SOURCE_HOME);
+    writeGradleSettings(join(rt, "gradle"), source);
+    if (!starting) return source;
+    rmSync(join(rt, "own-homes"), { force: true });
+    // The ward owns its state folder: write there only while none of its processes can run.
+    const { stdout } = await systemctl("show", "--property=ActiveState", "--value", unitName(record.id));
+    if (stdout.trim() !== "inactive" && stdout.trim() !== "failed") throw new Error(`its unit is ${stdout.trim()}`);
+    const kotlin = realFolder(KOTLIN_DAEMON_DIR);
+    const failure = await ownFolder(join(wardStateDir(record.id), "gradle"), hasGradleBuild(record.worktree) ? source : undefined);
+    if (failure !== undefined) log(`ward ${record.id}: ${failure}`);
+    await ownFolder(join(wardStateDir(record.id), "kotlin-daemon"));
+    writeFileSync(join(rt, "own-homes"), `gradle ${source}\nkotlin-daemon ${kotlin}\n`);
+    return source;
+  } catch (error) {
+    log(`ward ${record.id}: could not prepare Gradle, so it ${starting ? "starts" : "goes on"} without its own Gradle home: ${String(error)}`);
+    return undefined;
+  }
 }
 
-/** The env `ward exec` loads; rewritten on every `up` so env changes reach running wards. */
-function writeEnvFile(record: WardRecord): void {
+/**
+ * The env `ward exec` loads; rewritten on every `up` so env changes reach running wards.
+ * `gradleHome` is your Gradle home's real path, set as GRADLE_USER_HOME when wardd has one.
+ */
+function writeEnvFile(record: WardRecord, gradleHome: string | undefined): void {
   const rt = wardRuntimeDir(record.id);
   const hostPorts = readHostPorts(record.id).join(",");
   const podman = `unix://${rt}/podman/podman.sock`;
@@ -216,6 +235,7 @@ function writeEnvFile(record: WardRecord): void {
     // that is the global setting, and a `ward` run in the ward would read this as it.
     WARD_FORWARDED_PORTS: hostPorts,
   };
+  if (process.env.GRADLE_USER_HOME && gradleHome !== undefined) vars.GRADLE_USER_HOME = gradleHome;
   const sdk = process.env.ANDROID_HOME;
   if (sdk && existsSync(join(sdk, "platform-tools/adb"))) {
     const overlay = join(wardStateDir(record.id), "android-sdk");
@@ -233,6 +253,7 @@ function writeEnvFile(record: WardRecord): void {
 function info(record: WardRecord): WardInfo {
   const ward = live.get(record.id);
   const ports: PortInfo[] = Object.entries(record.ports)
+    .filter(([wardPort]) => Number(wardPort) !== BUILD_CACHE_PORT)
     .map(([wardPort, host]) => ({ ward: Number(wardPort), host, listening: ward?.listening.has(Number(wardPort)) ?? false }))
     .sort((a, b) => a.ward - b.ward);
   const threadIds = (lastThreads?.get(record.worktree) ?? []).map((t) => t.threadId);
@@ -265,8 +286,7 @@ async function up(worktree: string): Promise<UpResult> {
     }
     const starting = !isReady(record.id);
     if (starting) writeHostPorts(record);
-    writeEnvFile(record);
-    await prepareGradle(record, starting);
+    writeEnvFile(record, await prepareGradle(record, starting));
     if (starting) {
       await systemctl("start", unitName(record.id));
       await waitReady(record.id);
@@ -866,10 +886,11 @@ function scan(id: string): Promise<unknown> {
       return Promise.resolve(); // broker gone; its exit handler detaches the ward
     }
     for (const [port, hosts] of listeningPorts(text)) {
-      if (!ward.hostPorts.has(port) && port !== ward.relayPort && port !== BUILD_CACHE_PORT) found.set(port, [...new Set([...(found.get(port) ?? []), ...hosts])]);
+      if (!ward.hostPorts.has(port) && port !== ward.relayPort) found.set(port, [...new Set([...(found.get(port) ?? []), ...hosts])]);
     }
   }
   for (const port of ward.containerPorts) if (!found.has(port)) found.set(port, ["127.0.0.1"]);
+  found.delete(BUILD_CACHE_PORT);
   ward.listening.clear();
   // Close listeners whose port went quiet, so the host sees "refused", not accept-then-reset.
   // The registry keeps the port number for when it listens again.
@@ -1068,6 +1089,7 @@ async function ensureListener(id: string, wardPort: number): Promise<number> {
   const ward = live.get(id);
   const record = wards.get(id);
   if (ward === undefined || record === undefined) throw new Error(`ward ${id} is not running`);
+  if (wardPort === BUILD_CACHE_PORT) throw new Error(`port ${wardPort} is the Gradle build cache's in every ward`);
   const existing = ward.listeners.get(wardPort);
   const known = record.ports[String(wardPort)];
   if (existing !== undefined && known !== undefined) return known;
@@ -1358,6 +1380,7 @@ function main(): void {
   mkdirSync(dirname(CONTROL_SOCKET), { recursive: true });
   // Before any ward starts: a ward hides the folder only if it exists by then.
   mkdirSync(ACTIVITY_DIR, { recursive: true, mode: 0o700 });
+  mkdirSync(BUILD_CACHE_DIR, { recursive: true }); // before any ward starts, so ward-init-root hides it
   rmSync(CONTROL_SOCKET, { force: true });
   const server = createHttpServer((req, res) => void handle(req, res));
   server.listen(CONTROL_SOCKET, () => log(`wardd listening on ${CONTROL_SOCKET}`));
@@ -1367,9 +1390,8 @@ function main(): void {
   watchWorktreeParents();
   void runReconcile();
   setInterval(() => void runReconcile(), RECONCILE_MS);
-  const sweep = () => void sweepBuildCache().then((n) => n > 0 && log(`build cache: deleted ${n} files`), (e: unknown) => log(`build cache sweep: ${String(e)}`));
-  sweep();
-  setInterval(sweep, 3_600_000);
+  sweepSoon();
+  setInterval(sweepSoon, 3_600_000);
   const shutdown = () => {
     // Wards keep running; a restarted wardd re-attaches to them.
     for (const id of [...live.keys()]) detach(id);
