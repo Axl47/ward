@@ -15,7 +15,9 @@ export const CONFIG_DIR = join(env.XDG_CONFIG_HOME ?? join(home, ".config"), "wa
 export const RUNTIME_DIR = join(env.XDG_RUNTIME_DIR ?? `/run/user/${userInfo().uid}`, "ward");
 /** The T3 home Ward serves. Not T3CODE_HOME: dev servers point that at their own state. */
 export const T3_HOME = env.WARD_T3_HOME ?? join(home, ".t3");
-export const WORKTREES_DIR = join(T3_HOME, "worktrees");
+/** Where T3 puts worktrees when its `worktreesDirectory` setting is unset. */
+export const DEFAULT_WORKTREES_DIR = join(T3_HOME, "worktrees");
+const T3_SETTINGS = join(T3_HOME, "userdata/settings.json");
 export const CONTROL_SOCKET = join(RUNTIME_DIR, "wardd.sock");
 export const REGISTRY_FILE = join(STATE_DIR, "registry.json");
 
@@ -37,13 +39,32 @@ export interface WardLocation {
 const sanitize = (segment: string) =>
   [...Buffer.from(segment, "utf8")].map((b) => (/[A-Za-z0-9_-]/.test(String.fromCharCode(b)) ? String.fromCharCode(b) : "_")).join("");
 
-/** The ward for a folder inside a T3 worktree, or undefined for any other folder. */
+/**
+ * The folders T3 puts worktrees in: the default one, which keeps the worktrees
+ * made before the setting changed, and T3's `worktreesDirectory` setting when it
+ * is an absolute path. Read on every call, so a change applies without restarting.
+ */
+export function worktreeRoots(): string[] {
+  try {
+    const { worktreesDirectory } = JSON.parse(readFileSync(T3_SETTINGS, "utf8")) as { worktreesDirectory?: unknown };
+    if (typeof worktreesDirectory === "string" && worktreesDirectory.startsWith("/"))
+      return [...new Set([DEFAULT_WORKTREES_DIR, resolve(worktreesDirectory)])];
+  } catch {
+    // No settings file, or one T3 is mid-write: the default folder still counts.
+  }
+  return [DEFAULT_WORKTREES_DIR];
+}
+
+/** The ward for a folder inside a T3 worktree (<root>/<repo>/<name>/...), or undefined for any other folder. */
 export function locate(dir: string): WardLocation | undefined {
   const abs = resolve(dir);
-  if (!abs.startsWith(WORKTREES_DIR + sep)) return undefined;
-  const [repo, name] = abs.slice(WORKTREES_DIR.length + 1).split(sep);
-  if (!repo || !name) return undefined;
-  return { id: `${sanitize(repo)}.${sanitize(name)}`, repo, root: join(WORKTREES_DIR, repo, name) };
+  for (const root of worktreeRoots()) {
+    if (!abs.startsWith(root + sep)) continue;
+    const [repo, name] = abs.slice(root.length + 1).split(sep);
+    if (!repo || !name) return undefined;
+    return { id: `${sanitize(repo)}.${sanitize(name)}`, repo, root: join(root, repo, name) };
+  }
+  return undefined;
 }
 
 /** A project's opt-in marker. Its content lists more host ports for that project's wards, e.g. "39003". */
