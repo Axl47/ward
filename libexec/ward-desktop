@@ -46,14 +46,14 @@ if [ "$1" = --session ]; then
 fi
 
 # Sockets live in XDG_RUNTIME_DIR and their paths must fit in 108 bytes, the
-# compositor's and every app's, so it is a short name for $rt/desktop: d<the
-# ward's process id>, which no other ward gets while this one runs, so a command
-# holding the name can't end up on another ward's desktop. The name is left
-# behind when the ward stops; those are cleared here.
+# compositor's and every app's, so it is a short name for $rt/desktop: d<this
+# process's id>, new at every start, so a command still holding the name of an
+# earlier desktop, this ward's or another's, can't act on this one. This ward's
+# earlier names go here, and the last one with the ward (units/ward@.service).
 for old in "$WARD_RUNTIME"/d[0-9]*; do
-  if [ -L "$old" ] && [ ! -e "$old" ]; then rm -f "$old"; fi
+  [ "$(readlink "$old" 2>/dev/null)" != "$1/desktop" ] || rm -f "$old"
 done
-dir=$WARD_RUNTIME/d$(cat "$WARD_RUNTIME/$1/pid")
+dir=$WARD_RUNTIME/d$$
 umask 077
 mkdir -p "$WARD_RUNTIME/$1/desktop/services"
 ln -sfn "$1/desktop" "$dir"
@@ -107,9 +107,10 @@ export XDG_RUNTIME_DIR="$dir" DBUS_SESSION_BUS_ADDRESS="unix:path=$dir/bus" WLR_
 dbus-daemon --config-file="$dir/bus.conf" --nofork &
 bus=$!
 # The bus goes with the compositor, however this ends, and the accessibility bus
-# with the bus; the registry is only on the latter, so it is stopped by pid.
+# with the bus; the registry is only on the latter, so it is stopped by pid. So
+# do `env`, which says the desktop is up, and the desktop's name.
 # shellcheck disable=SC2046 # no registry.pid, no second pid
-trap 'kill "$bus" $(cat "$dir/registry.pid" 2>/dev/null) 2>/dev/null' EXIT
+trap 'kill "$bus" $(cat "$dir/registry.pid" 2>/dev/null) 2>/dev/null; rm -f "$dir/env" "$dir"' EXIT
 for _ in $(seq 100); do
   [ -S "$dir/bus" ] && break
   sleep 0.02

@@ -2,7 +2,7 @@
 // maps each port a ward listens on to a host port in the ward's slot, and runs
 // the reconciler that stops or removes wards when T3 is done with them.
 import { execFile, spawn, type ChildProcess } from "node:child_process";
-import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, watch, writeFileSync, type FSWatcher } from "node:fs";
+import { closeSync, existsSync, fstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, readSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, watch, writeFileSync, type FSWatcher } from "node:fs";
 import { createServer as createHttpServer, request as httpRequest, type ClientRequest, type IncomingMessage, type ServerResponse } from "node:http";
 import { type Server, type Socket } from "node:net";
 import { userInfo } from "node:os";
@@ -308,6 +308,19 @@ function desktopReady(id: string): boolean {
   }
 }
 
+/** The end of a ward's desktop log. Every program on the desktop writes to it, so only its last 4 KB are read. */
+function logTail(file: string): string {
+  const fd = openSync(file, "r");
+  try {
+    const { size } = fstatSync(fd);
+    const end = Buffer.alloc(Math.min(size, 4096));
+    readSync(fd, end, 0, end.length, size - end.length);
+    return end.toString("utf8").split("\n").filter(Boolean).slice(-15).join("\n");
+  } finally {
+    closeSync(fd);
+  }
+}
+
 /**
  * Start the ward's private desktop (libexec/ward-desktop) unless it is up,
  * starting the ward first if needed. It runs through `ward exec`, so it lives in
@@ -319,6 +332,8 @@ async function desktop(id: string, worktree?: string): Promise<Record<string, ne
   if (!result.enabled) throw new Error(result.reason);
   const ward = result.ward.id;
   return serialized(ward, async () => {
+    // Between `up` and here the ward may have been removed, and its id taken by a folder whose name sanitizes alike.
+    if (wards.get(ward)?.worktree !== result.ward.worktree) throw new Error(`ward ${ward} changed hands while its desktop was starting; try again`);
     if (desktopReady(ward)) return {};
     // Stopped since `up` answered. `--running` below covers a stop from here on:
     // plain `ward exec` would start the ward again, waiting on this very lock, or
@@ -344,7 +359,7 @@ async function desktop(id: string, worktree?: string): Promise<Record<string, ne
       if (exited || Date.now() > deadline) {
         // Its own process group (detached), so this takes the bus and compositor with it.
         if (!exited && child.pid !== undefined) process.kill(-child.pid, "SIGKILL");
-        const tail = readFileSync(logFile, "utf8").split("\n").filter(Boolean).slice(-15).join("\n");
+        const tail = logTail(logFile);
         throw new Error(`ward ${ward}'s desktop ${exited ? "failed to start" : `did not start within ${DESKTOP_TIMEOUT_MS / 1000}s`}${tail ? `:\n${tail}` : ""}`);
       }
       await new Promise((r) => setTimeout(r, 50));
