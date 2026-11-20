@@ -6,7 +6,7 @@ Gives every T3 Code worktree on gaia-arch its own network namespace, Podman and 
 
 ## Setup
 
-Needs Linux with unprivileged user namespaces, Node 26+ (`wardd` reads callers' credentials through `node:ffi`), `podman`, `passt`, `crun`, and subuid/subgid ranges for your user (`/etc/subuid`, `/etc/subgid`). Desktops also need `umbriel`, `dbus-daemon`, `at-spi2-core` for apps' text, and `wtype` for typing into them; with [Caliban](https://github.com/Axl47/caliban) installed they also get a sound server of their own.
+Needs Linux with unprivileged user namespaces, Node 26+ (`wardd` reads callers' credentials through `node:ffi`), `podman`, `passt`, `crun`, `xdg-dbus-proxy` (the session bus a ward sees), and subuid/subgid ranges for your user (`/etc/subuid`, `/etc/subgid`). Desktops also need `umbriel`, `dbus-daemon`, `at-spi2-core` for apps' text, and `wtype` for typing into them; with [Caliban](https://github.com/Axl47/caliban) installed they also get a sound server of their own.
 
 ```sh
 pnpm install
@@ -41,7 +41,7 @@ Only the prefixed command is on that desktop: a GUI app started without it opens
 
 ### Limits
 
-Inside a ward, `sudo` doesn't work, and host services are reachable only on the ports in `WARD_HOST_PORTS` (default `3773,5037`, plus DNS) and the project's own, set with `ward enable <repo> --host-ports 39003,…`. The flag replaces the project's list, and a ward picks up a new list only when it next starts: `ward enable` names the running wards still on the old one (`ward stop` them to apply it now). A forwarded host port is taken inside the ward, so a server in the ward can't listen on it (`EADDRINUSE`). Port 53, Ward's own host ports (20100–29999) and lists over 200 ports in all are refused. In a ward, `WARD_FORWARDED_PORTS` lists what it reaches. From inside a ward, `ward` can only map that ward's ports, start its desktop and list it; stopping, removing or starting wards, and anything about another ward, is for the host. `/tmp` and `XDG_RUNTIME_DIR` are the host's, shared by every ward, so keep per-worktree pid files and sockets in `TMPDIR`.
+Inside a ward, `sudo` doesn't work, and host services are reachable only on the ports in `WARD_HOST_PORTS` (default `3773,5037`, plus DNS) and the project's own, set with `ward enable <repo> --host-ports 39003,…`. The flag replaces the project's list, and a ward picks up a new list only when it next starts: `ward enable` names the running wards still on the old one (`ward stop` them to apply it now). A forwarded host port is taken inside the ward, so a server in the ward can't listen on it (`EADDRINUSE`). Port 53, Ward's own host ports (20100–29999) and lists over 200 ports in all are refused. In a ward, `WARD_FORWARDED_PORTS` lists what it reaches. From inside a ward, `ward` can only map that ward's ports, start its desktop and list it; stopping, removing or starting wards, and anything about another ward, is for the host. `/tmp` and `XDG_RUNTIME_DIR` are the host's, shared by every ward, so keep per-worktree pid files and sockets in `TMPDIR`. Inside a ward there is no `systemctl --user` and the session bus reaches only the keyring; Ward's own state, config and checkout are read-only; and Ward's T3 token and T3's `userdata` (except `attachments`) are hidden. [DESIGN.md](docs/DESIGN.md) lists what a ward can still reach on purpose.
 
 Connections through a mapped port end with a reset when their ward stops or `wardd` restarts, so a transfer in flight fails rather than looking complete.
 

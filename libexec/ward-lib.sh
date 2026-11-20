@@ -19,6 +19,20 @@ WARD_HOST_PORTS=${WARD_HOST_PORTS:-3773,5037}
 # its display, its accessibility bus, and where it would look for the sound servers.
 WARD_DESKTOP_UNSET="WAYLAND_DISPLAY WAYLAND_SOCKET DISPLAY UMBRIEL_SOCKET AT_SPI_BUS_ADDRESS PULSE_SERVER PULSE_RUNTIME_PATH PIPEWIRE_RUNTIME_DIR PIPEWIRE_REMOTE"
 
+# Put this shell on the desktop whose owner's runtime folder is $1 (default: ward $WARD_ID's).
+# The env file is written inside the ward, so it is read as data, never sourced:
+# only the variables ward-desktop writes, each taken verbatim.
+ward_desktop_env() {
+  # shellcheck disable=SC2086
+  unset $WARD_DESKTOP_UNSET
+  while IFS= read -r _line; do
+    case ${_line%%=*} in
+      XDG_RUNTIME_DIR|WAYLAND_DISPLAY|UMBRIEL_SOCKET|DBUS_SESSION_BUS_ADDRESS|XDG_CURRENT_DESKTOP|XDG_SESSION_DESKTOP|XDG_SESSION_TYPE|TMPDIR|XDG_CONFIG_HOME|DISPLAY)
+        export "$_line" ;;
+    esac
+  done < "${1:-$WARD_RUNTIME/$WARD_ID}/desktop/env"
+}
+
 # ID map for every ward's user namespace: your uid/gid stays itself (1000 → 1000),
 # root and the other ids come from your subuid/subgid range.
 ward_map_args() {

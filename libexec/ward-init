@@ -1,7 +1,10 @@
-#!/bin/sh
-# ExecStart of ward@<id>.service. Runs as you in the host namespaces, records the
-# unit's cgroup, then enters a new user namespace as root for ward-init-root.
-set -eu
+#!/bin/bash
+# ExecStart of ward@<id>.service. Runs as you in the host namespaces: records the
+# unit's cgroup, starts the ward's filtered session bus, then enters a new user
+# and mount namespace as root for ward-init-root. The files the host trusts
+# (pid, ready) are written here, from what ward-init-root reports on fd 3: inside
+# the ward, Ward's runtime folder is read-only.
+set -euo pipefail
 . "$(dirname -- "$(readlink -f -- "$0")")/ward-lib.sh"
 id=$1
 rt=$WARD_RUNTIME/$id
@@ -11,7 +14,35 @@ mkdir -p "$rt"
 # stderr goes to a file; wardd shows its tail when a ward fails to start.
 exec 2>"$rt/init.log"
 mkdir -p "$rt/podman" "$st/storage" "$st/home" "$st/tmp" "$st/net" "$st/resolve" "$st/sock" "$WARD_STATE/images"
-rm -f "$rt/ready" "$rt/pid"
+rm -f "$rt/ready" "$rt/pid" "$rt/bus"
+# The shared image store is read-only inside the ward, and Podman must find its
+# lock files there, so an empty store is set up here first.
+[ -e "$WARD_STATE/images/overlay-layers" ] || "$WARD_LIBEXEC/ward-images" images -q >/dev/null
+# The desktop's folder is bind-mounted into the ward, so it is made once here and
+# only emptied while the ward runs (src/daemon.ts: desktop).
+rm -rf "$rt/desktop"
+mkdir "$rt/desktop"
 echo "/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup)" > "$rt/cgroup"
+
+# The session bus the ward sees: a proxy that passes only the keyring (gh and git
+# keep tokens there), so a ward can't ask your systemd user manager, portals or
+# any other service on your bus to run something outside it.
+if command -v xdg-dbus-proxy >/dev/null; then
+  xdg-dbus-proxy "${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/$(id -u)/bus}" "$rt/bus" --filter --talk=org.freedesktop.secrets &
+  for _ in $(seq 100); do
+    [ -S "$rt/bus" ] && break
+    sleep 0.02
+  done
+  [ -S "$rt/bus" ] || echo "ward: warning: the session bus proxy did not start; the ward has no session bus" >&2
+else
+  echo "ward: warning: xdg-dbus-proxy is not installed; the ward has no session bus, so no keyring" >&2
+fi
+
 # shellcheck disable=SC2046 # word splitting of the map flags is intended
-exec unshare $(ward_map_args) --setuid 0 --setgid 0 -- "$WARD_LIBEXEC/ward-init-root" "$id"
+WARD_HOST_UID=$(id -u) unshare $(ward_map_args) --mount --setuid 0 --setgid 0 -- "$WARD_LIBEXEC/ward-init-root" "$id" 3>&1 >&2 |
+  while read -r line; do
+    case $line in
+      pid=*) echo "${line#pid=}" > "$rt/pid" ;;
+      ready) touch "$rt/ready" ;;
+    esac
+  done
