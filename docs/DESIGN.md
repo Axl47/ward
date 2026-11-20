@@ -10,7 +10,7 @@ The threat model is accidental collision between trusted agents, not containment
 
 ## What T3 offers today (Annex, verified by reading the code)
 
-- Worktrees are created in `ThreadLaunchService` → `GitVcsDriverCore.createWorktree`, at `~/.t3/worktrees/<repo>/<branch-prefix>-<16 hex>`. The thread ↔ worktree link lives only in `statev2.sqlite` (`orchestration_v2_projection_threads.payload_json.$.worktreePath`).
+- Worktrees are created in `ThreadLaunchService` → `GitVcsDriverCore.createWorktree`, at `<worktrees folder>/<repo>/<branch-prefix>-<16 hex>`, where the folder is `~/.t3/worktrees` or T3's `worktreesDirectory` setting. The thread ↔ worktree link lives only in `statev2.sqlite` (`orchestration_v2_projection_threads.payload_json.$.worktreePath`).
 - Removal happens on many paths: launch failure, UI remove, handoff failure, and an hourly storage-cleanup job. Thread archive and delete never remove the worktree. "Settle" is a flag on the thread, not a removal.
 - `t3.json` scripts can run on worktree create and on settle, but only the first matching script runs, they are per project, they get no thread id, and nothing runs on removal.
 - Claude and Codex get `T3CODE_THREAD_ID`; terminals have every `T3CODE_*` variable stripped.
@@ -180,7 +180,7 @@ System changes on gaia-arch, recorded in omarchy-config: install `podman`, `pass
 1. **Podman as root inside a custom user namespace** worked, with cgroups disabled, crun, file event logging, and a private `/run`.
 2. **`sudo` doesn't work inside a ward** (setuid binaries can't run in a user namespace). Wards are opt-in per project (`ward enable <repo>`), so projects that need system changes simply don't enable them.
 3. **Codex** runs one app-server per thread, but wrapping the app-server would put its API traffic and MCP in the ward too, so the `BASH_ENV` hook wraps its commands instead.
-4. **Ward's view of T3.** Ward serves `~/.t3` (or `WARD_T3_HOME`), not `T3CODE_HOME`, which T3 dev servers point at their own state. T3's configurable worktrees folder isn't followed.
+4. **Ward's view of T3.** Ward serves `~/.t3` (or `WARD_T3_HOME`), not `T3CODE_HOME`, which T3 dev servers point at their own state. Ward follows T3's `worktreesDirectory` setting (absolute paths only), read on every call, and keeps counting `~/.t3/worktrees` so worktrees made before the setting changed keep their wards; a folder the setting pointed at before is dropped when it changes again. Only folders outside `~/.t3/worktrees` pay for reading the setting, one `sed` per agent command.
 5. **Processes leave T3's per-thread scope.** Ward commands move into the ward's unit, so T3's thread kill no longer reaches dev servers an agent started; stopping the ward does.
 6. **Emulators** were not tested end to end: `/dev/kvm` is absent until SVM is turned on. The adb path (host server reachable from a ward, `adb reverse` rewrite) is tested without a device.
 7. **`XDG_RUNTIME_DIR` is shared** between wards and the host, since Wayland, PipeWire and the session bus live there. Two worktrees of an app that keeps a pid file or socket there collide; such files belong in `TMPDIR`, which is per ward.

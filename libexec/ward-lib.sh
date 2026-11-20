@@ -8,7 +8,8 @@ WARD_CONFIG=${XDG_CONFIG_HOME:-$HOME/.config}/ward
 WARD_RUNTIME=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/ward
 # The T3 home Ward serves. Deliberately not T3CODE_HOME: dev servers set that to
 # their own state folder, and agents inherit it.
-WARD_WORKTREES=${WARD_T3_HOME:-$HOME/.t3}/worktrees
+WARD_T3=${WARD_T3_HOME:-$HOME/.t3}
+WARD_WORKTREES=$WARD_T3/worktrees
 # Host loopback ports reachable from inside every ward: T3's server and the adb
 # server. DNS (53) is always forwarded too. Only a fallback: wardd writes each
 # ward's list, with its project's ports, to $rt/host-ports.
@@ -38,19 +39,29 @@ ward_sanitize() {
 }
 
 # ward_resolve DIR: set WARD_REPO, WARD_ROOT and WARD_ID when DIR is inside a T3
-# worktree (<worktrees>/<repo>/<name>/...). Returns 1 otherwise.
+# worktree (<root>/<repo>/<name>/...), where <root> is the default worktrees folder
+# or T3's worktreesDirectory setting when that is an absolute path. Returns 1 otherwise.
 ward_resolve() {
   _dir=$1
+  _wroot=$WARD_WORKTREES
   case "$_dir" in
-    "$WARD_WORKTREES"/*/*) ;;
+    "$_wroot"/*/*) ;;
+    /*/*/*)
+      # Only folders outside the default pay for reading the setting.
+      _wroot=$(sed -n 's/.*"worktreesDirectory"[[:space:]]*:[[:space:]]*"\(\/[^"]*\)".*/\1/p' "$WARD_T3/userdata/settings.json" 2>/dev/null)
+      _wroot=${_wroot%/}
+      case "$_dir" in
+        "$_wroot"/*/*) [ -n "$_wroot" ] || return 1 ;;
+        *) return 1 ;;
+      esac ;;
     *) return 1 ;;
   esac
-  _rest=${_dir#"$WARD_WORKTREES"/}
+  _rest=${_dir#"$_wroot"/}
   WARD_REPO=${_rest%%/*}
   _rest=${_rest#*/}
   _name=${_rest%%/*}
   [ -n "$WARD_REPO" ] && [ -n "$_name" ] || return 1
-  WARD_ROOT=$WARD_WORKTREES/$WARD_REPO/$_name
+  WARD_ROOT=$_wroot/$WARD_REPO/$_name
   WARD_ID=$(ward_sanitize "$WARD_REPO").$(ward_sanitize "$_name")
 }
 

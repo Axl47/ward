@@ -28,7 +28,6 @@ import {
   wardRuntimeDir,
   wardStateDir,
   wardTrashDir,
-  WORKTREES_DIR,
 } from "./paths.ts";
 import { wardHostPorts } from "./hostports.ts";
 import { listeningPorts } from "./procnet.ts";
@@ -1081,7 +1080,7 @@ async function reconcile(): Promise<string[]> {
   for (const record of [...wards.values()]) {
     if (!existsSync(record.worktree)) {
       // No worktrees folder at all means it was moved or unmounted, not that worktrees were removed.
-      if (!existsSync(WORKTREES_DIR)) continue;
+      if (!existsSync(dirname(dirname(record.worktree)))) continue;
       if (await rm(record.id, { trash: true, worktree: record.worktree }))
         actions.push(`removed ${record.id}: worktree is gone (data kept in the trash for ${TRASH_DAYS} days)`);
       continue;

@@ -138,7 +138,7 @@ function repoArg(): string {
   if (location) return location.repo;
   const top = spawnSync("git", ["rev-parse", "--show-toplevel"], { encoding: "utf8" });
   if (top.status === 0) return basename(top.stdout.trim());
-  throw new WardError("pass a project name (the folder name under ~/.t3/worktrees)");
+  throw new WardError("pass a project name (its folder name under T3's worktrees folder)");
 }
 
 async function main(): Promise<void> {

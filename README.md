@@ -11,7 +11,7 @@ Needs Linux with unprivileged user namespaces, Node 24+, `podman`, `passt`, `cru
 ```sh
 pnpm install
 bin/ward install        # systemd user units, ward on PATH, read-only T3 token
-ward enable <repo>      # opt a project in (folder name under ~/.t3/worktrees)
+ward enable <repo>      # opt a project in (its folder name under T3's worktrees folder)
 ```
 
 For T3 to run agent commands and terminals in wards, start the Annex server with `T3CODE_WARD_COMMAND=$HOME/.local/bin/ward`. Ward serves the T3 at `~/.t3`; set `WARD_T3_HOME` for another.
