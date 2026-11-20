@@ -123,10 +123,22 @@ function lastActivity(id: string): number {
   return Math.max(...times, ...terminalInputTimes(id));
 }
 
+/**
+ * The cgroup a ward's commands run in, from the file its start left; a thread's
+ * desktop has no such file, and its unit's cgroup is read from the desktop's own
+ * process, as bin/ward does. Throws when neither is there.
+ */
+function cgroupDir(id: string): string {
+  const rt = wardRuntimeDir(id);
+  if (existsSync(join(rt, "cgroup"))) return readFileSync(join(rt, "cgroup"), "utf8").trim();
+  const pid = readFileSync(join(rt, "desktop/pid"), "utf8").trim();
+  return `/sys/fs/cgroup${readFileSync(`/proc/${pid}/cgroup`, "utf8").trim().split(":")[2]}`;
+}
+
 function terminalInputTimes(id: string): number[] {
   let procs: string[];
   try {
-    procs = readFileSync(join(readFileSync(join(wardRuntimeDir(id), "cgroup"), "utf8").trim(), "cgroup.procs"), "utf8").split("\n").filter(Boolean);
+    procs = readFileSync(join(cgroupDir(id), "cgroup.procs"), "utf8").split("\n").filter(Boolean);
   } catch {
     return [];
   }
@@ -433,18 +445,19 @@ function threadDesktop(thread: string, cwd: string): Promise<Record<string, neve
       rmSync(rt, { recursive: true, force: true });
       throw error;
     }
-    // Only for lastActivity, which counts typing in a terminal on the desktop; bin/ward finds the cgroup itself.
-    const { stdout } = await systemctl("show", "--property=ControlGroup", "--value", unit);
-    writeFileSync(join(rt, "cgroup"), `/sys/fs/cgroup${stdout.trim()}\n`);
     return {};
   });
 }
 
 /**
  * Stop a thread's desktop, if it runs, and remove its runtime folder, its short
- * names and what apps kept there. Its marker and its last log stay. Call it holding the id's lock.
+ * names and what apps kept there. Its marker and its last log stay, and the
+ * marker's time becomes the desktop's last use, which went with the runtime
+ * folder. Call it holding the id's lock.
  */
 async function clearThreadDesktop(id: string): Promise<void> {
+  const marker = threadMarker(id);
+  const used = existsSync(marker) ? Math.max(lastActivity(id), statSync(marker).mtimeMs) / 1000 : undefined;
   await systemctl("stop", desktopUnitName(id)).catch(() => undefined);
   for (const name of readdirSync(RUNTIME_DIR)) {
     if (!/^d\d+$/.test(name)) continue;
@@ -454,6 +467,7 @@ async function clearThreadDesktop(id: string): Promise<void> {
   }
   rmSync(wardRuntimeDir(id), { recursive: true, force: true });
   rmSync(join(desktopStateDir(id), "tmp"), { recursive: true, force: true });
+  if (used !== undefined) utimesSync(marker, used, used);
 }
 
 /**
