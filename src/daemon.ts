@@ -521,13 +521,22 @@ function syncThreadNotes(threads: readonly ShellThread[]): void {
   const roots = new Map(threads.map((t) => [t.id, t.worktreePath ? locate(t.worktreePath)?.root : undefined]));
   for (const name of readdirSync(THREAD_WARDS_DIR)) {
     const note = join(THREAD_WARDS_DIR, name);
-    const [root, thread] = readFileSync(note, "utf8").split("\n");
-    if (thread !== undefined && roots.get(thread) === root) continue;
-    if (thread !== undefined && roots.has(thread) && !existsSync(threadMarker(name))) {
-      mkdirSync(desktopStateDir(name), { recursive: true });
-      writeFileSync(threadMarker(name), thread);
+    try {
+      if (name.endsWith(".tmp")) {
+        rmSync(note, { force: true }); // left by a write that was cut off; none is under way now
+        continue;
+      }
+      const [root, thread] = readFileSync(note, "utf8").split("\n");
+      if (thread !== undefined && roots.get(thread) === root) continue;
+      if (thread !== undefined && roots.has(thread) && !existsSync(threadMarker(name))) {
+        mkdirSync(desktopStateDir(name), { recursive: true });
+        writeFileSync(threadMarker(name), thread);
+      }
+      rmSync(note, { force: true });
+    } catch (error) {
+      // The note stays for the next pass; the others still get their turn.
+      log(`reconcile: thread note ${name}: ${error instanceof Error ? error.message : String(error)}`);
     }
-    rmSync(note, { force: true });
   }
 }
 
