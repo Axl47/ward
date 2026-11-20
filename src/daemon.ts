@@ -216,7 +216,7 @@ function info(record: WardRecord): WardInfo {
     .map(([wardPort, host]) => ({ ward: Number(wardPort), host, listening: ward?.listening.has(Number(wardPort)) ?? false }))
     .sort((a, b) => a.ward - b.ward);
   const threadIds = (lastThreads?.get(record.worktree) ?? []).map((t) => t.threadId);
-  return { id: record.id, repo: record.repo, worktree: record.worktree, threadIds, slot: record.slot, running: isReady(record.id), ports };
+  return { id: record.id, repo: record.repo, worktree: record.worktree, threadIds, slot: record.slot, running: isReady(record.id), activityHidden: existsSync(join(wardRuntimeDir(record.id), "activity-hidden")), ports };
 }
 
 // ── Lifecycle ────────────────────────────────────────────────────────────────
