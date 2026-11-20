@@ -140,11 +140,13 @@ done
 # sink, its sockets in $dir, so apps here play into a sink Caliban can record
 # rather than finding no server (Caliban's docs/DESIGN.md, "Sound server"). An
 # app picks its sound server when it starts, so the desktop isn't up (no `env`)
-# until the server is ready, waiting at most 3 s; without it, no sound, as before.
+# until the server is ready, waiting while it is alive and not ready, at most
+# 10 s (its own budget is 8 s); without it, no sound, as before. --watch: it
+# exits with this shell even if this is killed before its trap runs.
 if command -v caliban >/dev/null; then
-  caliban audio serve &
+  caliban audio serve --watch $$ &
   sound=$!
-  for _ in $(seq 30); do
+  for _ in $(seq 100); do
     [ ! -e "$dir/caliban/ready" ] && kill -0 "$sound" 2>/dev/null || break
     sleep 0.1
   done
