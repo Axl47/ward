@@ -457,8 +457,10 @@ function threadDesktop(thread: string, cwd: string): Promise<Record<string, neve
  */
 async function clearThreadDesktop(id: string): Promise<void> {
   const marker = threadMarker(id);
-  const used = existsSync(marker) ? Math.max(lastActivity(id), statSync(marker).mtimeMs) / 1000 : undefined;
+  const before = lastActivity(id); // typing in a terminal counts only while the terminal runs
   await systemctl("stop", desktopUnitName(id)).catch(() => undefined);
+  // Read again after the stop: a call may have come in while it ran.
+  const used = existsSync(marker) ? Math.max(before, lastActivity(id), statSync(marker).mtimeMs) / 1000 : undefined;
   for (const name of readdirSync(RUNTIME_DIR)) {
     if (!/^d\d+$/.test(name)) continue;
     try {
@@ -491,10 +493,11 @@ async function reconcileThreadDesktops(threads: readonly ShellThread[] | undefin
       if (thread === undefined) return rmSync(desktopStateDir(id), { recursive: true, force: true }); // left by a start that never finished
       if (threads === undefined) return; // T3 unreachable: leave it as it is
       const known = threads.find((t) => t.id === thread);
-      const used = Math.max(lastActivity(id), statSync(marker).mtimeMs);
+      let used = Math.max(lastActivity(id), statSync(marker).mtimeMs);
       const done = shouldStop(known ? [{ idleSince: idleSince(known) }] : [], used, now);
       if (running && (done || now - used > DESKTOP_IDLE_MS)) {
         await clearThreadDesktop(id);
+        used = statSync(marker).mtimeMs; // its last use, with any call that came in while it stopped
         actions.push(`stopped the desktop of thread ${thread}: ${!done ? `unused for ${DESKTOP_IDLE_MS / 3_600_000} h` : known ? "the thread is done" : "unused, and T3 has no such thread"}`);
       }
       if (!known && now - used > NO_THREAD_GRACE_MS) rmSync(desktopStateDir(id), { recursive: true, force: true });
