@@ -11,6 +11,7 @@ import { promisify } from "node:util";
 import type { BrokerReply, BrokerRequest, PortInfo, Route, Routes, UpResult, WardInfo } from "./api.ts";
 import { identify, type Caller } from "./caller.ts";
 import {
+  ACTIVITY_DIR,
   CONTROL_SOCKET,
   desktopStateDir,
   THREAD_WARDS_DIR,
@@ -216,7 +217,7 @@ function info(record: WardRecord): WardInfo {
     .map(([wardPort, host]) => ({ ward: Number(wardPort), host, listening: ward?.listening.has(Number(wardPort)) ?? false }))
     .sort((a, b) => a.ward - b.ward);
   const threadIds = (lastThreads?.get(record.worktree) ?? []).map((t) => t.threadId);
-  return { id: record.id, repo: record.repo, worktree: record.worktree, threadIds, slot: record.slot, running: isReady(record.id), ports };
+  return { id: record.id, repo: record.repo, worktree: record.worktree, threadIds, slot: record.slot, running: isReady(record.id), activityHidden: existsSync(join(wardRuntimeDir(record.id), "activity-hidden")), ports };
 }
 
 // ── Lifecycle ────────────────────────────────────────────────────────────────
@@ -1331,6 +1332,8 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 
 function main(): void {
   mkdirSync(dirname(CONTROL_SOCKET), { recursive: true });
+  // Before any ward starts: a ward hides the folder only if it exists by then.
+  mkdirSync(ACTIVITY_DIR, { recursive: true, mode: 0o700 });
   rmSync(CONTROL_SOCKET, { force: true });
   const server = createHttpServer((req, res) => void handle(req, res));
   server.listen(CONTROL_SOCKET, () => log(`wardd listening on ${CONTROL_SOCKET}`));

@@ -20,6 +20,8 @@ export interface WardInfo {
   readonly threadIds: readonly string[];
   readonly slot: number;
   readonly running: boolean;
+  /** Whether the ward's mount namespace hides the activity folder (false for one started before the folder existed). */
+  readonly activityHidden: boolean;
   readonly ports: readonly PortInfo[];
 }
 
