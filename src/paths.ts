@@ -85,6 +85,13 @@ export function projectHostPorts(repo: string): number[] {
   }
 }
 
+/** Your Gradle home, as wardd runs: each ward gets its own mounted over it (src/gradle.ts). */
+export const GRADLE_SOURCE_HOME = env.GRADLE_USER_HOME ?? join(home, ".gradle");
+/** Where Kotlin daemons leave their run files; each ward gets its own folder mounted over it. */
+export const KOTLIN_DAEMON_DIR = join(env.XDG_DATA_HOME || join(home, ".local/share"), "kotlin/daemon");
+/** The build cache wardd serves to wards: one folder per project, of entries named by key. */
+export const BUILD_CACHE_DIR = join(STATE_DIR, "build-cache");
+
 export const wardRuntimeDir = (id: string) => join(RUNTIME_DIR, id);
 /** The ward desktop's own XDG_RUNTIME_DIR: its Wayland, Umbriel and session bus sockets, and `env` once it is up. */
 export const wardDesktopDir = (id: string) => join(RUNTIME_DIR, id, "desktop");
