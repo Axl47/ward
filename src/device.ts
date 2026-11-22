@@ -60,7 +60,10 @@ const MAX = Math.max(1, Math.floor(Number(process.env.WARD_DEVICE_MAX)) || 8);
  */
 export const RECLAIM_MS = 6 * 60_000;
 const BOOT_MS = 60_000;
-const BASE_BOOT_MS = 120_000;
+/** A boot without a snapshot: a base image's first, and a device's when its snapshot doesn't load. */
+const COLD_BOOT_MS = 120_000;
+/** How long a base image build that failed isn't tried again: every adb call in every ward would wait minutes for the same failure. */
+const BASE_RETRY_MS = 5 * 60_000;
 /** First-boot work goes on after sys.boot_completed; the snapshot is taken once it has had this long. */
 const SETTLE_MS = 10_000;
 const SAVE_MS = 45_000;
@@ -125,14 +128,29 @@ const read = (file: string) => {
 export const baseName = (sources: readonly string[]) => `ward-base-${createHash("sha256").update(sources.join("\0")).digest("hex").slice(0, 8)}`;
 
 /**
+ * The AVD of yours that ward devices take their hardware from: WARD_DEVICE_TEMPLATE,
+ * else the one taken before while it exists, else the first by name, which is
+ * written down: an AVD you make later doesn't change what ward devices are.
+ */
+function templateName(): string {
+  if (process.env.WARD_DEVICE_TEMPLATE !== undefined) return process.env.WARD_DEVICE_TEMPLATE;
+  const file = join(DEVICE_DIR, "template");
+  const kept = read(file).trim();
+  if (kept !== "" && existsSync(join(USER_AVD_HOME, `${kept}.ini`))) return kept;
+  const first = readdirSync(USER_AVD_HOME).filter((e) => e.endsWith(".ini")).sort()[0]?.slice(0, -4);
+  if (first === undefined) throw new Error(`no AVD in ${USER_AVD_HOME} to model ward devices on: create one, or name one with WARD_DEVICE_TEMPLATE`);
+  mkdirSync(DEVICE_DIR, { recursive: true });
+  writeFileSync(file, first);
+  return first;
+}
+
+/**
  * The base image for what is installed now: its name, and the AVD files it is
- * made of. The hardware is a template AVD's of yours (WARD_DEVICE_TEMPLATE, else
- * the first by name), of which only `config.ini` is read; it is never booted or
+ * made of. Of the template AVD only `config.ini` is read; it is never booted or
  * changed. The salt is rewritten when an image's snapshot turns out not to load.
  */
 function currentBase(): { readonly name: string; readonly ini: string; readonly config: string } {
-  const template = process.env.WARD_DEVICE_TEMPLATE ?? readdirSync(USER_AVD_HOME).filter((e) => e.endsWith(".ini")).sort()[0]?.slice(0, -4);
-  if (template === undefined) throw new Error(`no AVD in ${USER_AVD_HOME} to model ward devices on: create one, or name one with WARD_DEVICE_TEMPLATE`);
+  const template = templateName();
   const ini = readFileSync(join(USER_AVD_HOME, `${template}.ini`), "utf8");
   const config = readFileSync(join(/^path=(.+)$/m.exec(ini)?.[1] ?? join(USER_AVD_HOME, `${template}.avd`), "config.ini"), "utf8");
   const image = join(SDK, /^image\.sysdir\.1\s*=\s*(.+)$/m.exec(config)?.[1]?.trim() ?? "");
@@ -151,11 +169,22 @@ const removeBase = (name: string) => {
 };
 
 let base: Promise<string> | undefined;
-/** The name of a base image that is ready, built first if the current one isn't: one build at a time, shared by everyone waiting. */
+let baseFailure: { readonly name: string; readonly error: unknown; readonly at: number } | undefined;
+/**
+ * The name of a base image that is ready, built first if the current one isn't:
+ * one build at a time, shared by everyone waiting. A build that failed fails
+ * everyone who asks in the next BASE_RETRY_MS, with the same reason.
+ */
 function ensureBase(): Promise<string> {
   const current = currentBase();
   if (existsSync(readyMarker(current.name))) return Promise.resolve(current.name);
-  return (base ??= buildBase(current).finally(() => (base = undefined)));
+  if (baseFailure?.name === current.name && Date.now() - baseFailure.at < BASE_RETRY_MS) return Promise.reject(baseFailure.error);
+  return (base ??= buildBase(current)
+    .catch((error: unknown) => {
+      baseFailure = { name: current.name, error, at: Date.now() };
+      throw error;
+    })
+    .finally(() => (base = undefined)));
 }
 
 /**
@@ -181,7 +210,7 @@ async function buildBase({ name, ini, config }: ReturnType<typeof currentBase>):
     const port = await exclusive(() => pickPort("base"));
     building = { serial: `emulator-${port}`, startedAt: new Date().toISOString() };
     const pid = await startEmulator(BASE_UNIT, "Ward's base Android image, being built", name, port, tmp, logFile);
-    await booted(building.serial, BASE_UNIT, pid, logFile, BASE_BOOT_MS);
+    await booted(building.serial, name, BASE_UNIT, pid, logFile, COLD_BOOT_MS);
     await sleep(SETTLE_MS);
     await systemctl("kill", "--kill-whom=main", "--signal=INT", BASE_UNIT);
     for (const deadline = Date.now() + SAVE_MS; alive(BASE_UNIT, pid); await sleep(200))
@@ -201,9 +230,11 @@ async function buildBase({ name, ini, config }: ReturnType<typeof currentBase>):
   }
 }
 
+const snapshotFailed = (logFile: string) => /Failed to load snapshot/.test(read(logFile));
+
 /**
- * A device booted without its snapshot (the emulator's log says so): it works,
- * but took a cold boot. Change the salt so the next start builds a new base image,
+ * A device booted without its snapshot (the emulator's log says so): it works
+ * if it is given the time, but took a cold boot. Change the salt so the next start builds a new base image,
  * at most once a day, in case the new one fares no better.
  */
 function distrustBase(avd: string): void {
@@ -251,20 +282,39 @@ async function startEmulator(unit: string, description: string, avd: string, por
 }
 
 /**
+ * Start the host's adb server unless it runs, in a scope of its own: one that an
+ * adb command of wardd's started would be part of wardd's unit and stop with
+ * every wardd restart, cutting T3 off its devices.
+ */
+export const startHostAdb = () => run("systemd-run", ["--user", "--scope", "--quiet", "--collect", HOST_ADB, "start-server"], { timeout: 30_000 });
+
+/**
  * Wait until Android on `serial` has booted and answers: `sys.boot_completed`
  * alone is already set in a boot snapshot, before anything in it runs again.
- * Throws, with the end of its log, if its emulator exits first or takes too long.
+ * It must name `avd` as its own, in case the port is another emulator's that
+ * took it first. Throws, with the end of its log, if its emulator exits first,
+ * takes too long (a snapshot that didn't load gets a cold boot's time), or is
+ * no longer `wanted`.
  */
-async function booted(serial: string, unit: string, pid: number, logFile: string, timeoutMs: number): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
+async function booted(serial: string, avd: string, unit: string, pid: number, logFile: string, timeoutMs: number, wanted: () => boolean = () => true): Promise<void> {
+  await startHostAdb().catch(() => undefined);
+  let deadline = Date.now() + timeoutMs;
   for (;;) {
-    const up = await run(HOST_ADB, ["-s", serial, "shell", "getprop sys.boot_completed; pm path android"], { timeout: 5000 }).then(
-      (result) => /^1\s+package:/.test(result.stdout),
+    if (!alive(unit, pid)) throw new Error(`the emulator exited${tail(logFile)}`);
+    if (!wanted()) throw new Error("its ward stopped");
+    const up = await run(HOST_ADB, ["-s", serial, "shell", "getprop sys.boot_completed; getprop ro.boot.qemu.avd_name; pm path android"], { timeout: 5000 }).then(
+      ({ stdout }) => {
+        const [completed, name, android] = stdout.split(/\r?\n/);
+        return completed === "1" && name === avd && android?.startsWith("package:") === true;
+      },
       () => false,
     );
     if (up) return;
-    if (!alive(unit, pid)) throw new Error(`the emulator exited${tail(logFile)}`);
-    if (Date.now() > deadline) throw new Error(`Android did not boot within ${timeoutMs / 1000} s${tail(logFile)}`);
+    if (Date.now() > deadline) {
+      if (timeoutMs >= COLD_BOOT_MS || !snapshotFailed(logFile)) throw new Error(`Android did not boot within ${timeoutMs / 1000} s${tail(logFile)}`);
+      deadline += COLD_BOOT_MS - timeoutMs;
+      timeoutMs = COLD_BOOT_MS;
+    }
     await sleep(250);
   }
 }
@@ -320,6 +370,7 @@ function inTurn<T>(id: string, fn: () => Promise<T>): Promise<T> {
 function deviceOf(id: string): Device | undefined {
   const device = devices.get(id);
   if (device === undefined || device.state === "booting" || alive(deviceUnitName(id), device.pid)) return device;
+  log(`device: ${device.serial} of ward ${id} is gone (it crashed, was killed for memory, or T3 shut it down); the ward's next use starts a fresh one`);
   forget(id);
   return undefined;
 }
@@ -330,28 +381,33 @@ function forget(id: string): void {
   rmSync(runDir(id), { recursive: true, force: true });
 }
 
-/** The console port of ward `id`'s device while it has one; the device's adb port is the next. */
-export const consolePort = (id: string) => deviceOf(id)?.port;
+/** The console port of ward `id`'s device once it is up; the device's adb port is the next. Not while it boots: the port isn't known to be its own yet. */
+export function consolePort(id: string): number | undefined {
+  const device = deviceOf(id);
+  return device?.state === "ready" ? device.port : undefined;
+}
 
 /**
  * Start ward `id`'s device unless it is up, and count this as a use. Resolves once
- * Android has booted; everyone who asks meanwhile gets the same device.
+ * Android has booted; everyone who asks meanwhile gets the same device. A start
+ * gives up once `wanted` says no: the ward it was for stopped.
  */
-export async function startDevice(id: string, worktree: string): Promise<DeviceInfo> {
+export async function startDevice(id: string, worktree: string, wanted: () => boolean = () => true): Promise<DeviceInfo> {
   const device = await inTurn(id, async () => {
     const up = deviceOf(id);
-    return up?.state === "ready" ? up : boot(id, worktree);
+    return up?.state === "ready" ? up : boot(id, worktree, wanted);
   });
   useDevice(id);
   return info(device);
 }
 
-async function boot(id: string, worktree: string): Promise<Device> {
+async function boot(id: string, worktree: string, wanted: () => boolean): Promise<Device> {
   const avd = await ensureBase();
   const unit = deviceUnitName(id);
   const dir = runDir(id);
   const logFile = join(dir, "log");
   const device = await exclusive(async () => {
+    if (!wanted()) throw new Error(`ward ${id} stopped while its device was starting`);
     await makeRoom(id);
     const port = await pickPort(id);
     const starting: Device = { ward: id, worktree, serial: `emulator-${port}`, port, avd, startedAt: new Date().toISOString(), pid: 0, state: "booting" };
@@ -362,13 +418,14 @@ async function boot(id: string, worktree: string): Promise<Device> {
     await stopUnit(unit); // one a wardd left that died while it booted
     rmSync(dir, { recursive: true, force: true });
     device.pid = await startEmulator(unit, `Ward device of ${id}`, avd, device.port, dir, logFile, ["-read-only", "-no-snapshot-save"]);
-    await booted(device.serial, unit, device.pid, logFile, BOOT_MS);
+    await booted(device.serial, avd, unit, device.pid, logFile, BOOT_MS, wanted);
     device.state = "ready";
     writeFileSync(join(dir, "device.json"), JSON.stringify(device));
-    if (/Failed to load snapshot/.test(read(logFile))) distrustBase(avd);
+    if (snapshotFailed(logFile)) distrustBase(avd);
     log(`device: started ${device.serial} for ward ${id}`);
     return device;
   } catch (error) {
+    if (snapshotFailed(logFile)) distrustBase(avd);
     await stopUnit(unit);
     forget(id);
     throw new Error(`ward ${id}'s device did not start: ${message(error)}`);
@@ -393,13 +450,20 @@ async function makeRoom(id: string): Promise<void> {
   log(`device: stopped ${idle.serial} of ward ${idle.ward}, unused the longest, to make room for ward ${id}`);
 }
 
-/** Stop ward `id`'s device, once a start under way has finished. Its data goes with it. Whether there was one. */
-export function stopDevice(id: string): Promise<boolean> {
+/**
+ * Stop ward `id`'s device, once a start under way has finished, if `when` still
+ * says so by then. Its data goes with it. Whether one was stopped; throws if its
+ * emulator is still there afterwards, and it stays the ward's device.
+ */
+export function stopDevice(id: string, when: () => boolean = () => true): Promise<boolean> {
   return inTurn(id, async () => {
-    const had = deviceOf(id) !== undefined;
-    await stopUnit(deviceUnitName(id));
+    const device = deviceOf(id);
+    if (!when()) return false;
+    const unit = deviceUnitName(id);
+    await stopUnit(unit);
+    if (device !== undefined && alive(unit, device.pid)) throw new Error(`ward ${id}'s device, ${device.serial}, did not stop`);
     forget(id);
-    return had;
+    return device !== undefined;
   });
 }
 
@@ -456,16 +520,25 @@ export async function reconcileDevices(wardUp: (id: string) => boolean): Promise
   for (const id of [...devices.keys()]) {
     const device = deviceOf(id);
     if (device?.state !== "ready") continue;
-    const unused = Date.now() - usedAt(id);
-    const why = !wardUp(id) ? "its ward is not running" : unused > IDLE_MS ? `unused for ${Math.round(unused / 60_000)} minutes` : undefined;
-    if (why === undefined) continue;
-    await (wardUp(id) ? stopDevice(id) : releaseDevice(id));
-    actions.push(`stopped ${device.serial}, the device of ${id}: ${why}`);
+    const why = () => {
+      const unused = Date.now() - usedAt(id);
+      return !wardUp(id) ? "its ward is not running" : unused > IDLE_MS ? `unused for ${Math.round(unused / 60_000)} minutes` : undefined;
+    };
+    const reason = why();
+    if (reason === undefined) continue;
+    try {
+      // Asked again in its turn: a use may have been waiting ahead of this.
+      if (!(await stopDevice(id, () => why() !== undefined))) continue;
+      if (!wardUp(id)) ports.delete(id);
+      actions.push(`stopped ${device.serial}, the device of ${id}: ${reason}`);
+    } catch (error) {
+      actions.push(message(error));
+    }
   }
   try {
     const keep = new Set([currentBase().name, ...[...devices.values()].map((d) => d.avd)]);
     for (const name of baseNames()) {
-      if (keep.has(name) || base !== undefined) continue;
+      if (keep.has(name) || base !== undefined || turns.size > 0) continue; // a start under way may be about to run from it
       removeBase(name);
       actions.push(`deleted the base image ${name}: no device runs from it`);
     }

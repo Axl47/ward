@@ -54,7 +54,9 @@ function relay(port) {
   });
   server.on("error", (error) => {
     console.error(`ward broker: cannot relay port ${port}: ${String(error)}`);
-    if (relays.get(port) === server) relays.delete(port);
+    if (relays.get(port) !== server) return;
+    relays.delete(port);
+    send(/** @type {BrokerReply} */ ({ t: "unrelayed", port }));
   });
   server.listen(port, "127.0.0.1");
   relays.set(port, server);

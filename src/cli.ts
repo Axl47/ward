@@ -12,6 +12,9 @@ import { parseProjectHostPorts, wardHostPorts } from "./hostports.ts";
 import { CONTROL_SOCKET, enabledMarker, locate, parsePorts, projectHostPorts, WARD_HOME, wardRuntimeDir } from "./paths.ts";
 import { T3_TOKEN_FILE } from "./t3state.ts";
 
+/** How long `ward device` waits for wardd: the first device of all waits for its ward to start and for a base image to be built. */
+const DEVICE_TIMEOUT_MS = 600_000;
+
 const USAGE = `usage: ward <command>
 
   exec [--worktree DIR] -- CMD...   run CMD in the worktree's ward
@@ -20,7 +23,8 @@ const USAGE = `usage: ward <command>
                                     without CMD, print its environment
   device [--worktree DIR] [--keep DURATION] [--json]
                                     start the ward's own Android emulator unless it is up, and print its serial;
-                                    it stops after 15 minutes unused, or DURATION (90s, 30m, 2h) from now if that is later
+                                    it stops once unused for 15 minutes (WARD_DEVICE_IDLE); --keep counts it as in
+                                    use for DURATION from now (90s, 30m, 2h; at most 4h)
   device stop [ID|--worktree DIR]   stop it; the next use starts a fresh one, without what was installed
   devices [--json]                  every ward's device
   up [--worktree DIR]               start the worktree's ward
@@ -212,7 +216,7 @@ async function main(): Promise<void> {
       if (args[0] === "stop") {
         await ensureDaemon();
         const ward = target(args[1]);
-        const { stopped } = await call("POST /device/stop", ward);
+        const { stopped } = await call("POST /device/stop", ward, DEVICE_TIMEOUT_MS); // it waits for a start under way
         return console.log(`${ward.id}: ${stopped ? "device stopped" : "had no device running"}`);
       }
       const keep = values.keep;
@@ -223,8 +227,7 @@ async function main(): Promise<void> {
       const ward = find();
       if (ward === undefined) return none(`${flag("worktree") ?? process.cwd()} is not a T3 worktree`);
       await ensureDaemon();
-      // Long: the first device after an emulator or system image update waits for a new base image.
-      const result = await call("POST /device", { ...ward, ...(keepMs === undefined ? {} : { keepMs }) }, 300_000);
+      const result = await call("POST /device", { ...ward, ...(keepMs === undefined ? {} : { keepMs }) }, DEVICE_TIMEOUT_MS);
       if (!result.enabled) return none(result.reason);
       const { serial, state, startedAt } = result.device;
       return console.log(values.json ? JSON.stringify({ serial, state, startedAt }) : serial);

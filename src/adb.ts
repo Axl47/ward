@@ -17,6 +17,8 @@ export const ADB_PORT = 5037;
 export const ADB_SERVER_PORT = 5038;
 /** How long a connection may take to send its request. */
 const REQUEST_TIMEOUT_MS = 30_000;
+/** How long an adb server may take to answer `ask`. */
+const ANSWER_TIMEOUT_MS = 10_000;
 
 /** Requests about the adb server itself. Every other one is about a device, or lists them, so the ward's must be up to answer it. */
 const SERVER_ONLY = /^host:(version|kill|host-features|server-status|reconnect-offline|(mdns|connect|disconnect|pair):.*)$/s;
@@ -55,13 +57,15 @@ function readRequest(socket: Socket): Promise<string | undefined> {
 
 /**
  * Ask an adb server one thing over a new connection to it and close it: the
- * text of its answer. Throws with the server's reason when it fails the request.
+ * text of its answer. Throws with the server's reason when it fails the request,
+ * and when it doesn't answer in time.
  */
 export function ask(server: Socket, request: string): Promise<string> {
   return new Promise((resolve, reject) => {
     let answer = Buffer.alloc(0);
     const fail = (reason: string) => (server.destroy(), reject(new Error(reason)));
     server
+      .setTimeout(ANSWER_TIMEOUT_MS, () => fail("the adb server did not answer"))
       .on("data", (chunk: Buffer) => {
         answer = Buffer.concat([answer, chunk]);
         if (answer.length < 8) return;

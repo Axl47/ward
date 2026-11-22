@@ -38,7 +38,7 @@ import {
   wardStateDir,
   wardTrashDir,
 } from "./paths.ts";
-import { consolePort, HOST_ADB, listDevices, loadDevices, reconcileDevices, releaseDevice, startDevice, stopDevice, useDevice } from "./device.ts";
+import { consolePort, HOST_ADB, listDevices, loadDevices, reconcileDevices, releaseDevice, startDevice, startHostAdb, stopDevice, useDevice } from "./device.ts";
 import { acceptBuildCache, BUILD_CACHE_PORT, hasGradleBuild, ownFolder, projectStore, realFolder, sweepSoon, writeGradleSettings } from "./gradle.ts";
 import { wardHostPorts } from "./hostports.ts";
 import { listeningPorts } from "./procnet.ts";
@@ -87,10 +87,10 @@ interface LiveWard {
   relayPort: number | undefined;
   /** The console and adb ports of the ward's device, which the broker relays while it runs: also not the ward's own. */
   devicePorts: readonly number[];
-  /** `startedAt` of the device the ward's adb server has found, so it is shown each device once. */
-  shownDevice: string | undefined;
   /** The ward's adb server, while it is being started. */
   adbServer: Promise<void> | undefined;
+  /** When wardd last told what held the ward's port 5037 to exit (reclaimAdb). */
+  adbReclaimedAt: number;
 }
 
 const wards = loadRegistry();
@@ -249,6 +249,10 @@ function writeEnvFile(record: WardRecord, gradleHome: string | undefined): void 
     // What this ward's pasta forwards, from when it started. Not WARD_HOST_PORTS:
     // that is the global setting, and a `ward` run in the ward would read this as it.
     WARD_FORWARDED_PORTS: hostPorts,
+    // An adb server started in the ward, wardd's or one a client starts by itself, finds devices
+    // on the ward's loopback only: USB devices are the host server's, and two servers fight over one.
+    ADB_USB: "0",
+    ADB_MDNS: "0",
   };
   if (process.env.GRADLE_USER_HOME && gradleHome !== undefined) vars.GRADLE_USER_HOME = gradleHome;
   const sdk = process.env.ANDROID_HOME;
@@ -824,8 +828,8 @@ function attach(record: WardRecord): void {
     hostPorts: new Set([53, ...readHostPorts(record.id)]),
     relayPort: undefined,
     devicePorts: [],
-    shownDevice: undefined,
     adbServer: undefined,
+    adbReclaimedAt: 0,
   };
   live.set(record.id, ward);
   broker.on("message", (reply: BrokerReply, socket: unknown) => {
@@ -838,6 +842,11 @@ function attach(record: WardRecord): void {
       if (hasOwnAdb(ward)) broker.send({ t: "relay", port: ADB_PORT } satisfies BrokerRequest);
       relayDevice(record.id, ward); // one that kept running while wardd restarted
       return void scan(record.id);
+    }
+    if (reply.t === "unrelayed") {
+      if (reply.port === ADB_PORT) void reclaimAdb(record.id, ward);
+      if (ward.devicePorts.includes(reply.port)) ward.devicePorts = []; // relayDevice asks again
+      return;
     }
     const upstream = socket instanceof Object && "pipe" in socket ? (socket as Socket) : undefined;
     if (reply.t === "accepted") {
@@ -862,6 +871,8 @@ function attach(record: WardRecord): void {
   broker.on("exit", () => {
     if (live.get(record.id) === ward) detach(record.id);
   });
+  // A message it could not be sent, once it is gone; without this the error would end wardd.
+  broker.on("error", (error) => log(`ward ${record.id}: broker: ${String(error)}`));
 }
 
 /** The host ports a ward was started with. */
@@ -1180,7 +1191,13 @@ function dial(ward: LiveWard, port: number, hosts: readonly string[]): Promise<S
       if (reply.t === "connected" && upstream !== undefined) return resolve(upstream);
       reject(new Error(reply.t === "failed" ? reply.message : `no connection to port ${port} in the ward`));
     });
-    ward.broker.send({ t: "connect", req, port, hosts } satisfies BrokerRequest);
+    const failed = (error: Error | null) => {
+      if (error === null || !ward.pending.delete(req)) return;
+      clearTimeout(timer);
+      reject(new Error(`the ward's broker is gone: ${error.message}`));
+    };
+    if (!ward.broker.connected) return failed(new Error("it exited"));
+    ward.broker.send({ t: "connect", req, port, hosts } satisfies BrokerRequest, failed);
   });
 }
 
@@ -1254,6 +1271,8 @@ function watchDeviceDaemon(): void {
 
 /** How long the ward's adb server may take to find the device once it is told of it. */
 const DEVICE_SHOWN_MS = 20_000;
+/** The longest `ward device --keep`: a device kept is one no other ward can take when all are in use. */
+const KEEP_MAX_MS = 4 * 3_600_000;
 
 /**
  * Whether adb in the ward is the ward's own. A ward started before wards had
@@ -1261,6 +1280,29 @@ const DEVICE_SHOWN_MS = 20_000;
  * is stopped and started.
  */
 const hasOwnAdb = (ward: LiveWard) => !ward.hostPorts.has(ADB_PORT);
+
+/** How often at most wardd tells what holds a ward's port 5037 to exit. */
+const ADB_RECLAIM_MS = 10_000;
+
+/**
+ * Port 5037 in the ward was taken when the broker went to listen there: by an
+ * adb server that a client started by itself, because nothing answered there
+ * yet (the broker wasn't in the ward, or wardd was restarting). It can only
+ * find the ward's device, but it doesn't start it. Tell it to exit, as adb
+ * does, and take the port. The reconciler asks for the port again each minute,
+ * in case what holds it takes longer, or isn't adb.
+ */
+async function reclaimAdb(id: string, ward: LiveWard): Promise<void> {
+  if (Date.now() - ward.adbReclaimedAt < ADB_RECLAIM_MS) return;
+  ward.adbReclaimedAt = Date.now();
+  log(`ward ${id}: its port ${ADB_PORT} is taken, by an adb server a client started while wardd wasn't there; telling it to exit`);
+  await dial(ward, ADB_PORT, ["127.0.0.1"]).then(
+    (socket) => void socket.on("error", () => socket.destroy()).resume().end(frame("host:kill")),
+    () => undefined, // gone already
+  );
+  await new Promise((r) => setTimeout(r, 300));
+  if (live.get(id) === ward) ward.broker.send({ t: "relay", port: ADB_PORT } satisfies BrokerRequest);
+}
 
 /** Have the broker relay the ports of the ward's device and no others: none once the device is gone. */
 function relayDevice(id: string, ward: LiveWard): void {
@@ -1271,7 +1313,6 @@ function relayDevice(id: string, ward: LiveWard): void {
   for (const p of ward.devicePorts) ward.broker.send({ t: "unrelay", port: p } satisfies BrokerRequest);
   for (const p of ports) ward.broker.send({ t: "relay", port: p } satisfies BrokerRequest);
   ward.devicePorts = ports;
-  ward.shownDevice = undefined;
 }
 
 /**
@@ -1319,35 +1360,36 @@ async function startWardAdb(id: string): Promise<void> {
 }
 
 /**
- * Have the ward's adb server find the ward's device, once per device. An adb
+ * Have the ward's adb server find the ward's device, unless it lists it. An adb
  * server looks for emulators when it starts; one already running is told a new
  * emulator's adb port, as the emulator itself tells the host's server, and
- * sends no answer to that.
+ * sends no answer to that. Asked each time, since the server may be a new one,
+ * or have been told to drop the device (`adb disconnect`).
  */
 async function showDevice(id: string, ward: LiveWard, device: DeviceInfo): Promise<void> {
   relayDevice(id, ward);
-  if (ward.shownDevice === device.startedAt) return;
   const adbPort = Number(device.serial.replace("emulator-", "")) + 1;
   for (const deadline = Date.now() + DEVICE_SHOWN_MS; ; await new Promise((r) => setTimeout(r, 100))) {
-    (await wardAdb(id, ward)).end(frame(`host:emulator:${adbPort}`));
     const list = await ask(await wardAdb(id, ward), "host:devices").catch(() => "");
-    if (list.split("\n").includes(`${device.serial}\tdevice`)) break;
-    if (Date.now() > deadline) throw new Error(`the adb server in ward ${id} did not find the ward's device, ${device.serial}`);
+    if (list.split("\n").includes(`${device.serial}\tdevice`)) return;
+    if (Date.now() > deadline) {
+      const state = list.split("\n").find((line) => line.startsWith(`${device.serial}\t`))?.split("\t")[1];
+      throw new Error(`the adb server in ward ${id} did not find the ward's device, ${device.serial}${state === undefined ? "" : ` (it is ${state} there)`}`);
+    }
+    (await wardAdb(id, ward)).end(frame(`host:emulator:${adbPort}`));
   }
-  ward.shownDevice = device.startedAt;
 }
 
 /** Start running ward `id`'s device unless it is up, and have the ward's adb server find it. */
 async function wardDevice(id: string): Promise<DeviceInfo> {
   const { worktree } = requireRecord(id);
-  if (!live.has(id)) throw new Error(`ward ${id} is not running`);
-  const device = await startDevice(id, worktree);
-  // Its ward may have stopped while it booted, or been removed and its id taken.
   const ward = live.get(id);
-  if (ward === undefined || wards.get(id)?.worktree !== worktree) {
-    dropDevice(id);
-    throw new Error(`ward ${id} stopped while its device was starting; try again`);
-  }
+  if (ward === undefined) throw new Error(`ward ${id} is not running`);
+  // Its ward may stop while it boots, or be removed and its id taken by another: the start
+  // gives up then, and the ward's stop takes a device that was already up (dropDevice).
+  const current = () => live.get(id) === ward;
+  const device = await startDevice(id, worktree, current);
+  if (!current()) throw new Error(`ward ${id} stopped while its device was starting; try again`);
   await showDevice(id, ward, device);
   return device;
 }
@@ -1367,7 +1409,7 @@ async function device(id: string, worktree?: string, keepMs?: number): Promise<D
       reason: `ward ${result.ward.id} was started before wards had devices of their own and still uses the host's adb server; it gets its own once it is stopped and started (ward stop ${result.ward.id})`,
     };
   const started = await wardDevice(result.ward.id);
-  if (typeof keepMs === "number" && keepMs > 0) useDevice(result.ward.id, Date.now() + keepMs);
+  if (typeof keepMs === "number" && keepMs > 0) useDevice(result.ward.id, Date.now() + Math.min(keepMs, KEEP_MAX_MS));
   return { enabled: true, device: started };
 }
 
@@ -1419,7 +1461,11 @@ async function reconcile(): Promise<string[]> {
   }
   actions.push(...(await reconcileThreadDesktops(allThreads, now)));
   actions.push(...(await reconcileDevices(isReady)));
-  for (const [id, ward] of live) relayDevice(id, ward); // of devices that stopped, here or by themselves
+  for (const [id, ward] of live) {
+    relayDevice(id, ward); // of devices that stopped, here or by themselves
+    // Again, in case the port was taken the last time (reclaimAdb); the broker ignores it when it has it.
+    if (hasOwnAdb(ward) && ward.scanTimer !== undefined) ward.broker.send({ t: "relay", port: ADB_PORT } satisfies BrokerRequest);
+  }
   actions.push(...(await purgeOldTrash()));
   return actions;
 }
@@ -1484,7 +1530,7 @@ const handlers: Handlers = {
     return { stopped };
   },
   "GET /devices": async () => listDevices(),
-  "POST /adb-server": async () => ({ ok: await run(HOST_ADB, ["start-server"], { timeout: 30_000 }).then(() => true, () => false) }),
+  "POST /adb-server": async () => ({ ok: await startHostAdb().then(() => true, () => false) }),
   "GET /ls": async () => {
     await Promise.all([...live.keys()].map(scan)); // what listens now, not at the last scan
     return [...wards.values()].map(info).sort((a, b) => a.slot - b.slot);

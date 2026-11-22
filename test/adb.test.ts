@@ -32,7 +32,16 @@ async function drain(socket: Socket): Promise<string> {
  * the ward's device is asked for.
  */
 async function ward(calls: string[], device: () => Promise<unknown> = async () => {}): Promise<number> {
-  const server = await listen(createServer((socket) => socket.once("data", (sent: Buffer) => socket.end(`got ${sent.toString()}`))));
+  // It answers once the request's frame is whole, however many pieces it came in.
+  const server = await listen(
+    createServer((socket) => {
+      let sent = "";
+      socket.on("data", (chunk: Buffer) => {
+        sent += chunk.toString();
+        if (sent.length >= 4 && sent.length >= 4 + parseInt(sent.slice(0, 4), 16)) socket.end(`got ${sent}`);
+      });
+    }),
+  );
   return listen(
     createServer({ pauseOnConnect: true }, (client) => {
       void acceptAdb(client, { device: () => (calls.push("device"), device()), server: () => dial(server) });

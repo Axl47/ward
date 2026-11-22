@@ -15,6 +15,8 @@ export function hostPortProblem(port: number): string | undefined {
   if (port === 53) return "53 is always forwarded (DNS)";
   if (port === BUILD_CACHE_PORT) return `${port} is the Gradle build cache's in every ward`;
   if (port === ADB_PORT || port === ADB_SERVER_PORT) return `${port} is adb's in every ward, where it reaches the ward's own device and no other`;
+  // Where adb servers look for emulators: forwarded, a ward's would find one that isn't its own.
+  if (port >= 5554 && port <= 5585) return `${port} is an emulator's port, and a ward reaches only its own device`;
   if (port >= WARD_FIRST && port <= WARD_LAST) return `${port} is in Ward's own host port range ${WARD_FIRST}-${WARD_LAST}, so it would reach another ward`;
   return undefined;
 }
