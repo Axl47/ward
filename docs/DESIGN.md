@@ -2,7 +2,7 @@
 
 Status: approved 2026-11-19 and built. Where the build departed from the draft, this file now describes what was built.
 
-Names used here: gaia-arch is the Arch Linux workstation Ward was built on, and omarchy-config the repo recording its setup; Annex is the T3 Code fork that carries Ward's hook; Puck, Caliban and Miranda are the author's own (private) tools for driving a desktop, capturing its audio and recording a screen and terminal timeline.
+Names used here: gaia-arch is the Arch Linux workstation Ward was built on, and omarchy-config the repo recording its setup; Annex is the T3 Code fork that carries Ward's hook; [Puck](https://github.com/Axl47/puck) drives a desktop for agents; Caliban and Miranda are the author's own private tools for capturing a desktop's audio and recording a screen and terminal timeline.
 
 ## Problem
 

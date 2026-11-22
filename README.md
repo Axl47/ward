@@ -11,25 +11,31 @@ Ward gives each worktree a sandbox, called a ward, with its own:
 - **network**: a private `localhost`, so every agent can use 5173 and 5432 at once
 - **containers**: a private Podman, behind the usual `docker` and `docker compose` commands
 - **temp folder**: a private `TMPDIR`
-- **desktop**: a headless Wayland desktop for GUI apps, off your screen
+- **desktop**: a headless Wayland desktop for GUI apps, off your screen, which agents drive with [Puck](https://github.com/Axl47/puck)
 - **Android emulator**: started on first use, and the only device `adb` finds in that ward
 
 A ward is a set of unprivileged Linux namespaces (the kernel feature containers are built on): no root, no VM, and the worktree's files stay on disk where they are. It starts on an agent's first command and stops once the agent's thread is done. It protects trusted agents from each other's accidents; it is not a security boundary against a hostile one.
 
 ## How it works
 
-```
-host                                        ward (one per worktree)
-┌─────────────────────────────┐             ┌──────────────────────────────┐
-│ T3 Code, Claude Code, Codex │─ commands ─▶│ the agent's shell commands   │
-│                             │             │ vite :5173, postgres :5432   │
-│ wardd (Ward's daemon)       │             │ own Podman, TMPDIR, desktop  │
-│   127.0.0.1:20100 ◀─────────┼──── maps ───┤ own adb server and emulator  │
-│ your browser, preview pane  │             │ internet through pasta       │
-└─────────────────────────────┘             └──────────────────────────────┘
+```mermaid
+flowchart TB
+  subgraph host["Host"]
+    agents["Claude Code, Codex<br/>(run by T3 Code)"]
+    wardd["wardd<br/>(maps ports for your browser)"]
+  end
+  subgraph w2["Ward 2 · worktree B"]
+    c2["agent's shell commands"] ~~~ s2["Vite :5173<br/>Postgres :5432"]
+  end
+  subgraph w1["Ward 1 · worktree A"]
+    c1["agent's shell commands"] ~~~ s1["Vite :5173<br/>Postgres :5432"]
+  end
+  agents --> c2 & c1
+  wardd -- "127.0.0.1:20200" --> s2
+  wardd -- "127.0.0.1:20100" --> s1
 ```
 
-The agent process itself stays on the host; only the shell commands it runs enter the ward. Inside, servers listen on their usual ports. For whatever outside needs to reach them, such as your browser or T3's preview pane, `wardd` gives each ward a block of 100 host ports and maps a port as soon as something in the ward listens on it: ward 1's first server, say Vite on `:5173`, becomes `127.0.0.1:20100`. `ward ports` prints the mapping.
+The agent process itself stays on the host; only the shell commands it runs enter the ward. Inside, servers listen on their usual ports. For whatever outside needs to reach them, such as your browser or T3's preview pane, `wardd` gives each ward a block of 100 host ports and maps a port as soon as something in the ward listens on it: ward 1's first server, say Vite on `:5173`, becomes `127.0.0.1:20100`, and ward 2's becomes `127.0.0.1:20200`. `ward ports` prints the mapping.
 
 [docs/DESIGN.md](docs/DESIGN.md) covers the design in depth.
 
