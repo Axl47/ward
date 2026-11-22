@@ -92,9 +92,10 @@ export type BrokerRequest =
   | { readonly t: "relay"; readonly port: number }
   | { readonly t: "unrelay"; readonly port: number };
 
-/** broker → wardd; "connected" and "accepted" come with the socket. "unrelayed": it could not listen on a relay's port. */
+/** broker → wardd; "connected" and "accepted" come with the socket. "relayed": it listens on a relay's port now; "unrelayed": it could not. */
 export type BrokerReply =
   | { readonly t: "ready" }
+  | { readonly t: "relayed"; readonly port: number }
   | { readonly t: "unrelayed"; readonly port: number }
   | { readonly t: "connected"; readonly req: number }
   | { readonly t: "failed"; readonly req: number; readonly message: string }

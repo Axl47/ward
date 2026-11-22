@@ -20,4 +20,5 @@ All notable changes to Ward are recorded here. The format follows [Keep a Change
 
 ### Fixed
 
+- The first adb command right after a ward started could find no device and fail once: the ward now counts as started only when its adb port is ready.
 - Transfers through a ward's mapped ports no longer stall on protocols that send small acknowledgements: such traffic could run twenty times slower through a ward than on the host.

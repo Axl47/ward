@@ -50,6 +50,8 @@ const run = promisify(execFile);
 const { uid, gid } = userInfo();
 const RECONCILE_MS = 60_000;
 const READY_TIMEOUT_MS = 60_000;
+/** How long `up` waits for a new ward's broker to listen on the ward's adb port. */
+const ADB_RELAYED_MS = 5000;
 const CONNECT_TIMEOUT_MS = 10_000;
 const TRASH_DAYS = 7;
 // With READY_TIMEOUT_MS, inside the 70 s a client waits for an answer.
@@ -91,6 +93,8 @@ interface LiveWard {
   adbServer: Promise<void> | undefined;
   /** When wardd last told what held the ward's port 5037 to exit (reclaimAdb). */
   adbReclaimedAt: number;
+  /** Settles once the broker listens on the ward's port 5037, or at once for a ward without its own adb. */
+  adbRelayed: Promise<void>;
 }
 
 const wards = loadRegistry();
@@ -312,7 +316,12 @@ async function up(worktree: string): Promise<UpResult> {
       log(`started ward ${record.id}`);
       for (const line of initLog(record.id).filter((l) => l.startsWith("ward: warning"))) log(`ward ${record.id}: ${line}`);
     }
-    if (!live.has(record.id)) attach(record);
+    if (!live.has(record.id)) {
+      attach(record);
+      // The ward's first command may be adb, and an adb client that finds nothing on port 5037
+      // starts a server of its own there: not before the broker has the port.
+      await Promise.race([live.get(record.id)?.adbRelayed, new Promise((r) => setTimeout(r, ADB_RELAYED_MS))]);
+    }
     if (!lastThreads?.has(record.worktree)) void runReconcile(); // learn which threads use it
     return { enabled: true, ward: info(record) };
   });
@@ -809,6 +818,7 @@ function attach(record: WardRecord): void {
   } catch (error) {
     log(`ward ${record.id}: could not move broker into the ward's cgroup: ${String(error)}`);
   }
+  let adbRelayed = () => {};
   const ward: LiveWard = {
     broker,
     brokerPid: broker.pid,
@@ -830,6 +840,7 @@ function attach(record: WardRecord): void {
     devicePorts: [],
     adbServer: undefined,
     adbReclaimedAt: 0,
+    adbRelayed: new Promise((resolve) => (adbRelayed = resolve)),
   };
   live.set(record.id, ward);
   broker.on("message", (reply: BrokerReply, socket: unknown) => {
@@ -840,9 +851,11 @@ function attach(record: WardRecord): void {
       relayDeviceDaemon(ward);
       broker.send({ t: "relay", port: BUILD_CACHE_PORT } satisfies BrokerRequest);
       if (hasOwnAdb(ward)) broker.send({ t: "relay", port: ADB_PORT } satisfies BrokerRequest);
+      else adbRelayed();
       relayDevice(record.id, ward); // one that kept running while wardd restarted
       return void scan(record.id);
     }
+    if (reply.t === "relayed") return void (reply.port === ADB_PORT && adbRelayed());
     if (reply.t === "unrelayed") {
       if (reply.port === ADB_PORT) return void reclaimAdb(record.id, ward);
       // A device's port that something in the ward holds: relayDevice asks for it again.
@@ -870,6 +883,7 @@ function attach(record: WardRecord): void {
     callback(reply, upstream);
   });
   broker.on("exit", () => {
+    adbRelayed(); // nothing to wait for any more
     if (live.get(record.id) === ward) detach(record.id);
   });
   // A message it could not be sent, once it is gone; without this the error would end wardd.
