@@ -21,8 +21,11 @@ const pending = new Map<number, (socket: Socket | undefined) => void>();
 const accepted = new Map<number, (socket: Socket) => void>();
 broker.on("message", (reply: BrokerReply, socket: unknown) => {
   if (reply.t === "accepted") accepted.get(reply.port)?.(socket as Socket);
+  else if (reply.t === "unrelayed") unrelayed.get(reply.port)?.();
   else if (reply.t !== "ready") pending.get(reply.req)?.(socket as Socket | undefined);
 });
+/** Port → called when the broker says it could not listen there. */
+const unrelayed = new Map<number, () => void>();
 let nextReq = 1;
 
 async function listen(server: Server): Promise<number> {
@@ -119,4 +122,21 @@ test("a relay port reaches the host service, half-close included, until it is un
   broker.send({ t: "unrelay", port: relayPort } satisfies BrokerRequest);
   await new Promise((r) => setTimeout(r, 100));
   assert.equal(await accepting(relayPort, 100), false);
+});
+
+// A ward's port 5037 when an adb server took it before the broker did: wardd has
+// to hear of it, to tell that server to exit and ask again.
+test("a relay port that is taken is reported, and relayed when asked again once it is free", async () => {
+  const holder = createServer();
+  const port = await listen(holder);
+  const reported = new Promise<void>((resolve) => unrelayed.set(port, resolve));
+  broker.send({ t: "relay", port } satisfies BrokerRequest);
+  await reported;
+  holder.close();
+  await once(holder, "close");
+  accepted.set(port, (s) => s.on("error", () => {}).end("relayed")); // `accepting` hangs up on its probe
+  broker.send({ t: "relay", port } satisfies BrokerRequest);
+  assert.ok(await accepting(port));
+  assert.equal(await exchange(port, (s) => s.end()), "relayed");
+  broker.send({ t: "unrelay", port } satisfies BrokerRequest);
 });

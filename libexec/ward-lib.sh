@@ -10,10 +10,10 @@ WARD_RUNTIME=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/ward
 # their own state folder, and agents inherit it.
 WARD_T3=${WARD_T3_HOME:-$HOME/.t3}
 WARD_WORKTREES=$WARD_T3/worktrees
-# Host loopback ports reachable from inside every ward: T3's server and the adb
-# server. DNS (53) is always forwarded too. Only a fallback: wardd writes each
+# Host loopback ports reachable from inside every ward: T3's server. DNS (53) is
+# always forwarded too. Only a fallback: wardd writes each
 # ward's list, with its project's ports, to $rt/host-ports.
-WARD_HOST_PORTS=${WARD_HOST_PORTS:-3773,5037}
+WARD_HOST_PORTS=${WARD_HOST_PORTS:-3773}
 
 # What could point a program on a ward's desktop at the live session instead:
 # its display, its accessibility bus, and where it would look for the sound servers.

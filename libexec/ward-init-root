@@ -39,6 +39,8 @@ st=$WARD_STATE/wards/$id
 #   the commands typed there. Miranda's MCP server runs on the host and still
 #   reads the store; its CLI inside a ward doesn't.
 # - The Gradle build cache wardd keeps for every project is hidden.
+# - Your AVDs (~/.android/avd) are hidden: an emulator started in a ward would run
+#   from their disks. A ward's device is Ward's own, on the host.
 # - Your Gradle home and Kotlin daemon folder are the ward's own, so wards share
 #   no Gradle locks or daemons; your gradle.properties and init.d are read-only
 #   over its home.
@@ -47,13 +49,14 @@ st=$WARD_STATE/wards/$id
 # where the host looks.
 lock_down() {
   local uid=$WARD_HOST_UID p a held=" " ancestors=() protected=() miranda=${MIRANDA_HOME:-$HOME/.local/share/miranda}
+  local avds=${ANDROID_AVD_HOME:-$HOME/.android/avd}
   # Each line of own-homes is NAME PATH: the ward's own $st/NAME goes over PATH, a real
   # path of yours (wardd wrote it before the ward started: src/daemon.ts prepareGradle).
   local name path names=() paths=()
   if [ -f "$rt/own-homes" ]; then
     while read -r name path; do names+=("$name"); paths+=("$path"); done <"$rt/own-homes"
   fi
-  for p in "$WARD_STATE" "$WARD_CONFIG" "$WARD_RUNTIME" "$WARD_HOME" "$HOME"/.t3*/userdata "$WARD_T3/userdata" "$miranda" \
+  for p in "$WARD_STATE" "$WARD_CONFIG" "$WARD_RUNTIME" "$WARD_HOME" "$HOME"/.t3*/userdata "$WARD_T3/userdata" "$miranda" "$(readlink -f -- "$avds")" \
            "/run/user/$uid/systemd" "/run/user/$uid/bus" "${XDG_RUNTIME_DIR:-}/systemd" "${XDG_RUNTIME_DIR:-}/bus" "${paths[@]}"; do
     [ -e "$p" ] && [ ! -L "$p" ] || continue
     p=$(readlink -f -- "$p")
@@ -97,6 +100,9 @@ lock_down() {
       "$(readlink -f "$WARD_CONFIG")") hide_except "$p" enabled; [ ! -d "$p/enabled" ] || seal "$p/enabled" ;;
       "$(readlink -f "$WARD_HOME")") ro "$p"; seal "$p" ;;
       "$(readlink -f "$miranda")") hide_except "$p" shell ;;
+      # Your emulators (T3's shared ones among them): an emulator started in a ward would
+      # run from their disks. A ward's device is Ward's own, on the host (src/device.ts).
+      "$(readlink -f "$avds")") [ ! -d "$p" ] || mount -t tmpfs -o ro,mode=0755,size=4k tmpfs "$p" ;;
       */userdata) hide_except "$p" attachments ;;
       */bus) if [ -S "$rt/bus" ]; then mount --bind "$rt/bus" "$p"; else mount --bind /dev/null "$p"; fi ;;
       */systemd) mount -t tmpfs -o ro,mode=0755,size=4k tmpfs "$p" ;;

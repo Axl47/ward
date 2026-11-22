@@ -29,6 +29,28 @@ export type UpResult =
   | { readonly enabled: false; readonly reason: string }
   | { readonly enabled: true; readonly ward: WardInfo };
 
+/** A ward's Android device (src/device.ts), or the base image they all start from while Ward builds it. */
+export interface DeviceInfo {
+  /** Its name on the host's adb server and on its ward's: `emulator-<port>`. */
+  readonly serial: string;
+  /** Null for the base image being built, which nobody may use: what changed on it would be in every ward's device. */
+  readonly ward: string | null;
+  readonly worktree: string | null;
+  readonly state: "booting" | "ready" | "building";
+  /** When this emulator started. A serial is used again by later devices; this tells them apart. */
+  readonly startedAt: string;
+}
+
+export interface DeviceList {
+  /** Ward's base images, by AVD name. They are in Ward's own AVD home, and only Ward boots them. */
+  readonly avds: readonly string[];
+  readonly devices: readonly DeviceInfo[];
+}
+
+export type DeviceResult =
+  | { readonly enabled: false; readonly reason: string }
+  | { readonly enabled: true; readonly device: DeviceInfo };
+
 export interface Routes {
   "POST /up": { body: { worktree: string }; result: UpResult };
   /** With worktree, acts only if the ward is that worktree's. */
@@ -43,8 +65,15 @@ export interface Routes {
    */
   "POST /desktop": { body: { id: string; worktree?: string } | { thread: string; cwd: string }; result: { ward?: string } };
   "POST /gc": { body: Record<string, never>; result: { actions: string[] } };
-  /** Starts the host's adb server, which a ward's adb can reach but not start (bin/ward adb-server). */
+  /** Starts the host's adb server, for a ward started before wards had their own, which reaches it but can't start it (bin/ward adb-server). */
   "POST /adb-server": { body: Record<string, never>; result: { ok: boolean } };
+  /**
+   * Starts the ward if needed, then its device unless it is up, and answers once Android has booted.
+   * Each call counts as a use of the device; with `keepMs`, it also counts as used for that long from now.
+   */
+  "POST /device": { body: { id: string; worktree?: string; keepMs?: number }; result: DeviceResult };
+  "POST /device/stop": { body: { id: string; worktree?: string }; result: { stopped: boolean } };
+  "GET /devices": { body: Record<string, never>; result: DeviceList };
   "GET /ls": { body: Record<string, never>; result: WardInfo[] };
 }
 
@@ -59,21 +88,25 @@ export type BrokerRequest =
       readonly hosts: readonly string[];
       readonly port: number;
     }
-  /** Listen on the ward's 127.0.0.1:port and hand each connection to wardd ("accepted"), which relays it to the host's. */
+  /** Listen on the ward's 127.0.0.1:port and hand each connection to wardd ("accepted"), which serves it or relays it to the host's. */
   | { readonly t: "relay"; readonly port: number }
   | { readonly t: "unrelay"; readonly port: number };
 
-/** broker → wardd; "connected" and "accepted" come with the socket. */
+/** broker → wardd; "connected" and "accepted" come with the socket. "unrelayed": it could not listen on a relay's port. */
 export type BrokerReply =
   | { readonly t: "ready" }
+  | { readonly t: "unrelayed"; readonly port: number }
   | { readonly t: "connected"; readonly req: number }
   | { readonly t: "failed"; readonly req: number; readonly message: string }
   | { readonly t: "accepted"; readonly port: number };
 
 export class WardError extends Error {}
 
-/** Call wardd. Rejects with WardError carrying the daemon's message on failure. */
-export function call<R extends Route>(route: R, body: Routes[R]["body"]): Promise<Routes[R]["result"]> {
+/**
+ * Call wardd. Rejects with WardError carrying the daemon's message on failure.
+ * The default wait covers `up`, which may take 60 s to see a ward ready.
+ */
+export function call<R extends Route>(route: R, body: Routes[R]["body"], timeoutMs = 70_000): Promise<Routes[R]["result"]> {
   const [method, path] = route.split(" ") as [string, string];
   return new Promise((resolve, reject) => {
     const req = request({ socketPath: CONTROL_SOCKET, method, path }, (res) => {
@@ -90,8 +123,7 @@ export function call<R extends Route>(route: R, body: Routes[R]["body"]): Promis
       });
     });
     req.on("error", reject);
-    // Generous: `up` may wait up to 60s for a ward to become ready.
-    req.setTimeout(70_000, () => req.destroy(new WardError("wardd did not answer within 70s")));
+    req.setTimeout(timeoutMs, () => req.destroy(new WardError(`wardd did not answer within ${timeoutMs / 1000}s`)));
     req.end(method === "GET" ? undefined : JSON.stringify(body));
   });
 }

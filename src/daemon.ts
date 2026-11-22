@@ -1,7 +1,8 @@
 // wardd: the user daemon behind every ward. It starts and stops ward units,
 // maps each port a ward listens on to a host port in the ward's slot, and runs
-// the reconciler that stops or removes wards when T3 is done with them, and
-// serves the Gradle build cache a project's wards share (src/gradle.ts).
+// the reconciler that stops or removes wards when T3 is done with them, serves
+// the Gradle build cache a project's wards share (src/gradle.ts), and gives each
+// ward an Android device of its own (src/device.ts).
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { closeSync, existsSync, fstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, readSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, watch, writeFileSync, type FSWatcher } from "node:fs";
 import { createServer as createHttpServer, request as httpRequest, type ClientRequest, type IncomingMessage, type ServerResponse } from "node:http";
@@ -9,7 +10,8 @@ import { type Server, type Socket } from "node:net";
 import { homedir, userInfo } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { promisify } from "node:util";
-import type { BrokerReply, BrokerRequest, PortInfo, Route, Routes, UpResult, WardInfo } from "./api.ts";
+import { acceptAdb, ADB_PORT, ADB_SERVER_PORT, ask, frame } from "./adb.ts";
+import type { BrokerReply, BrokerRequest, DeviceInfo, DeviceResult, PortInfo, Route, Routes, UpResult, WardInfo } from "./api.ts";
 import { identify, type Caller } from "./caller.ts";
 import {
   ACTIVITY_DIR,
@@ -36,6 +38,7 @@ import {
   wardStateDir,
   wardTrashDir,
 } from "./paths.ts";
+import { consolePort, HOST_ADB, listDevices, loadDevices, reconcileDevices, releaseDevice, startDevice, startHostAdb, stopDevice, useDevice } from "./device.ts";
 import { acceptBuildCache, BUILD_CACHE_PORT, hasGradleBuild, ownFolder, projectStore, realFolder, sweepSoon, writeGradleSettings } from "./gradle.ts";
 import { wardHostPorts } from "./hostports.ts";
 import { listeningPorts } from "./procnet.ts";
@@ -82,6 +85,12 @@ interface LiveWard {
   readonly hostPorts: ReadonlySet<number>;
   /** The host port the broker relays (T3's device daemon), listening inside the ward but not the ward's own. */
   relayPort: number | undefined;
+  /** The console and adb ports of the ward's device, which the broker relays while it runs: also not the ward's own. */
+  devicePorts: readonly number[];
+  /** The ward's adb server, while it is being started. */
+  adbServer: Promise<void> | undefined;
+  /** When wardd last told what held the ward's port 5037 to exit (reclaimAdb). */
+  adbReclaimedAt: number;
 }
 
 const wards = loadRegistry();
@@ -240,6 +249,10 @@ function writeEnvFile(record: WardRecord, gradleHome: string | undefined): void 
     // What this ward's pasta forwards, from when it started. Not WARD_HOST_PORTS:
     // that is the global setting, and a `ward` run in the ward would read this as it.
     WARD_FORWARDED_PORTS: hostPorts,
+    // An adb server started in the ward, wardd's or one a client starts by itself, finds devices
+    // on the ward's loopback only: USB devices are the host server's, and two servers fight over one.
+    ADB_USB: "0",
+    ADB_MDNS: "0",
   };
   if (process.env.GRADLE_USER_HOME && gradleHome !== undefined) vars.GRADLE_USER_HOME = gradleHome;
   const sdk = process.env.ANDROID_HOME;
@@ -345,6 +358,7 @@ function stop(id: string, worktree?: string): Promise<boolean> {
     if (!owns(id, worktree)) return false;
     const wasRunning = isReady(id) || live.has(id);
     detach(id);
+    dropDevice(id);
     await stopContainers(id);
     await systemctl("stop", unitName(id)).catch(() => undefined);
     if (wasRunning) log(`stopped ward ${id}`);
@@ -738,6 +752,7 @@ function rm(id: string, { trash = false, worktree }: { trash?: boolean; worktree
   return serialized(id, async () => {
     if (!owns(id, worktree)) return false;
     detach(id);
+    dropDevice(id);
     await stopContainers(id);
     await systemctl("stop", unitName(id)).catch(() => undefined);
     const recorded = wards.get(id)?.worktree;
@@ -812,6 +827,9 @@ function attach(record: WardRecord): void {
     nextReq: 1,
     hostPorts: new Set([53, ...readHostPorts(record.id)]),
     relayPort: undefined,
+    devicePorts: [],
+    adbServer: undefined,
+    adbReclaimedAt: 0,
   };
   live.set(record.id, ward);
   broker.on("message", (reply: BrokerReply, socket: unknown) => {
@@ -821,18 +839,30 @@ function attach(record: WardRecord): void {
       watchContainers(record.id, ward);
       relayDeviceDaemon(ward);
       broker.send({ t: "relay", port: BUILD_CACHE_PORT } satisfies BrokerRequest);
+      if (hasOwnAdb(ward)) broker.send({ t: "relay", port: ADB_PORT } satisfies BrokerRequest);
+      relayDevice(record.id, ward); // one that kept running while wardd restarted
       return void scan(record.id);
+    }
+    if (reply.t === "unrelayed") {
+      if (reply.port === ADB_PORT) return void reclaimAdb(record.id, ward);
+      // A device's port that something in the ward holds: relayDevice asks for it again.
+      if (ward.devicePorts.includes(reply.port)) return void (ward.devicePorts = ward.devicePorts.filter((p) => p !== reply.port));
+      return log(`ward ${record.id}: port ${reply.port} is taken inside it, so the host's is not reached there`);
     }
     const upstream = socket instanceof Object && "pipe" in socket ? (socket as Socket) : undefined;
     if (reply.t === "accepted") {
       if (upstream === undefined) return;
-      const track = (s: Socket) => {
-        ward.connections.add(s);
-        s.once("close", () => ward.connections.delete(s));
-      };
-      if (reply.port !== BUILD_CACHE_PORT) return relayToHost(upstream, reply.port, track);
-      track(upstream);
-      return acceptBuildCache(upstream, projectStore(record.repo), record.id);
+      if (reply.port === BUILD_CACHE_PORT) {
+        track(ward, upstream);
+        return acceptBuildCache(upstream, projectStore(record.repo), record.id);
+      }
+      if (reply.port === ADB_PORT) {
+        track(ward, upstream);
+        return void acceptAdb(upstream, { device: () => wardDevice(record.id), server: () => wardAdb(record.id, ward) });
+      }
+      if (ward.devicePorts.includes(reply.port)) return relayToDevice(record.id, ward, reply.port, upstream);
+      if (reply.port === ward.relayPort) return relayToHost(upstream, reply.port, (s) => track(ward, s));
+      return void upstream.destroy(); // a port that was relayed when it connected, and is no longer
     }
     const callback = ward.pending.get(reply.req);
     ward.pending.delete(reply.req);
@@ -842,6 +872,8 @@ function attach(record: WardRecord): void {
   broker.on("exit", () => {
     if (live.get(record.id) === ward) detach(record.id);
   });
+  // A message it could not be sent, once it is gone; without this the error would end wardd.
+  broker.on("error", (error) => log(`ward ${record.id}: broker: ${String(error)}`));
 }
 
 /** The host ports a ward was started with. */
@@ -896,7 +928,8 @@ function scan(id: string): Promise<unknown> {
     }
   }
   for (const port of ward.containerPorts) if (!found.has(port)) found.set(port, ["127.0.0.1"]);
-  found.delete(BUILD_CACHE_PORT);
+  // The broker's own listeners, and the ward's adb server, which only the ward is to reach.
+  for (const port of [BUILD_CACHE_PORT, ADB_PORT, ADB_SERVER_PORT, ...ward.devicePorts]) found.delete(port);
   ward.listening.clear();
   // Close listeners whose port went quiet, so the host sees "refused", not accept-then-reset.
   // The registry keeps the port number for when it listens again.
@@ -1096,6 +1129,7 @@ async function ensureListener(id: string, wardPort: number): Promise<number> {
   const record = wards.get(id);
   if (ward === undefined || record === undefined) throw new Error(`ward ${id} is not running`);
   if (wardPort === BUILD_CACHE_PORT) throw new Error(`port ${wardPort} is the Gradle build cache's in every ward`);
+  if (wardPort === ADB_PORT || wardPort === ADB_SERVER_PORT) throw new Error(`port ${wardPort} is adb's in every ward`);
   const existing = ward.listeners.get(wardPort);
   const known = record.ports[String(wardPort)];
   if (existing !== undefined && known !== undefined) return known;
@@ -1139,25 +1173,46 @@ async function ensureListener(id: string, wardPort: number): Promise<number> {
   return ensureListener(id, wardPort);
 }
 
+/** Remember a socket of a connection into or out of the ward, so detach can reset it. */
+function track(ward: LiveWard, socket: Socket): void {
+  ward.connections.add(socket);
+  socket.once("close", () => ward.connections.delete(socket));
+}
+
+/** A connection to a port inside the ward, which its broker makes: the first of `hosts` that answers. */
+function dial(ward: LiveWard, port: number, hosts: readonly string[]): Promise<Socket> {
+  return new Promise((resolve, reject) => {
+    const req = ward.nextReq++;
+    const timer = setTimeout(() => {
+      ward.pending.delete(req);
+      reject(new Error(`no answer from port ${port} in the ward within ${CONNECT_TIMEOUT_MS / 1000}s`));
+    }, CONNECT_TIMEOUT_MS);
+    ward.pending.set(req, (reply, upstream) => {
+      clearTimeout(timer);
+      if (reply.t === "connected" && upstream !== undefined) return resolve(upstream);
+      reject(new Error(reply.t === "failed" ? reply.message : `no connection to port ${port} in the ward`));
+    });
+    const failed = (error: Error | null) => {
+      if (error === null || !ward.pending.delete(req)) return;
+      clearTimeout(timer);
+      reject(new Error(`the ward's broker is gone: ${error.message}`));
+    };
+    if (!ward.broker.connected) return failed(new Error("it exited"));
+    ward.broker.send({ t: "connect", req, port, hosts } satisfies BrokerRequest, failed);
+  });
+}
+
 function forward(id: string, wardPort: number, client: Socket): void {
   const ward = live.get(id);
   if (ward === undefined) return void client.destroy();
-  const req = ward.nextReq++;
-  const timer = setTimeout(() => {
-    ward.pending.delete(req);
-    client.destroy();
-  }, CONNECT_TIMEOUT_MS);
-  ward.pending.set(req, (reply, upstream) => {
-    clearTimeout(timer);
-    if (reply.t !== "connected" || upstream === undefined) return void client.destroy();
-    for (const socket of [client, upstream]) {
-      ward.connections.add(socket);
-      socket.once("close", () => ward.connections.delete(socket));
-    }
-    splice(client, upstream);
-  });
-  const message: BrokerRequest = { t: "connect", req, port: wardPort, hosts: ward.listening.get(wardPort) ?? ["127.0.0.1", "::1"] };
-  ward.broker.send(message);
+  dial(ward, wardPort, ward.listening.get(wardPort) ?? ["127.0.0.1", "::1"]).then(
+    (upstream) => {
+      track(ward, client);
+      track(ward, upstream);
+      splice(client, upstream);
+    },
+    () => client.destroy(),
+  );
 }
 
 // ── T3's device daemon ───────────────────────────────────────────────────────
@@ -1207,8 +1262,167 @@ function watchDeviceDaemon(): void {
   deviceWatcher.on("error", () => (deviceWatcher?.close(), (deviceWatcher = undefined)));
 }
 
-/** The host's adb, which T3's device tools use too: the server must be the same version as every client. */
-const HOST_ADB = join(process.env.ANDROID_HOME ?? join(homedir(), "Android/Sdk"), "platform-tools/adb");
+// ── Devices ──────────────────────────────────────────────────────────────────
+//
+// Each ward's Android device is an emulator on the host (src/device.ts). The
+// ward reaches it through an adb server of its own, inside the ward, where the
+// broker relays the device's console and adb ports from the host under their own
+// numbers. So the device has one serial, in the ward and for T3, and it is the
+// only device the ward's adb server can find (src/adb.ts, docs/DESIGN.md: Devices).
+
+/** How long the ward's adb server may take to find the device once it is told of it. */
+const DEVICE_SHOWN_MS = 20_000;
+/** The longest `ward device --keep`: a device kept is one no other ward can take when all are in use. */
+const KEEP_MAX_MS = 4 * 3_600_000;
+
+/**
+ * Whether adb in the ward is the ward's own. A ward started before wards had
+ * devices reaches the host's adb server on that port, through pasta, until it
+ * is stopped and started.
+ */
+const hasOwnAdb = (ward: LiveWard) => !ward.hostPorts.has(ADB_PORT);
+
+/** How often at most wardd tells what holds a ward's port 5037 to exit. */
+const ADB_RECLAIM_MS = 10_000;
+
+/**
+ * Port 5037 in the ward was taken when the broker went to listen there: by an
+ * adb server that a client started by itself, because nothing answered there
+ * yet (the broker wasn't in the ward, or wardd was restarting). It can only
+ * find the ward's device, but it doesn't start it. Tell it to exit, as adb
+ * does, and take the port. The reconciler asks for the port again each minute,
+ * in case what holds it takes longer, or isn't adb.
+ */
+async function reclaimAdb(id: string, ward: LiveWard): Promise<void> {
+  if (Date.now() - ward.adbReclaimedAt < ADB_RECLAIM_MS) return;
+  ward.adbReclaimedAt = Date.now();
+  const holder = () => dial(ward, ADB_PORT, ["127.0.0.1"]); // fails once the port is the broker's
+  try {
+    await ask(await holder(), "host:version");
+    const socket = await holder();
+    socket.on("error", () => socket.destroy()).resume().end(frame("host:kill"));
+    setTimeout(() => socket.destroy(), 2000);
+    log(`ward ${id}: its port ${ADB_PORT} was taken by an adb server a client started while wardd wasn't there; told it to exit`);
+  } catch (error) {
+    // It may be gone already, so the port is asked for again all the same.
+    log(`ward ${id}: its port ${ADB_PORT} was taken, and what held it didn't answer as an adb server (${error instanceof Error ? error.message : String(error)})`);
+  }
+  await new Promise((r) => setTimeout(r, 300));
+  if (live.get(id) === ward) ward.broker.send({ t: "relay", port: ADB_PORT } satisfies BrokerRequest);
+}
+
+/** Have the broker relay the ports of the ward's device and no others: none once the device is gone. */
+function relayDevice(id: string, ward: LiveWard): void {
+  if (ward.scanTimer === undefined) return; // the broker isn't in the ward yet; this runs again once it is
+  const port = consolePort(id);
+  const ports = port === undefined ? [] : [port, port + 1];
+  for (const p of ward.devicePorts) if (!ports.includes(p)) ward.broker.send({ t: "unrelay", port: p } satisfies BrokerRequest);
+  for (const p of ports) if (!ward.devicePorts.includes(p)) ward.broker.send({ t: "relay", port: p } satisfies BrokerRequest);
+  ward.devicePorts = ports;
+}
+
+/**
+ * Connect what dialed one of the device's ports inside the ward (its adb
+ * server, or `adb emu`) to that port on the host, if the ward's device is still
+ * the emulator there: the port is another emulator's after it.
+ */
+function relayToDevice(id: string, ward: LiveWard, port: number, accepted: Socket): void {
+  const own = consolePort(id);
+  if (own === undefined || (port !== own && port !== own + 1)) return void accepted.destroy();
+  relayToHost(accepted, port, (socket) => {
+    track(ward, socket);
+    // What the device sends over adb is the sign that the ward is using it: an idle link is silent.
+    if (port === own + 1 && socket !== accepted) socket.on("data", () => useDevice(id));
+  });
+}
+
+/** A new connection to the ward's own adb server, which is started first if it isn't running. */
+async function wardAdb(id: string, ward: LiveWard): Promise<Socket> {
+  const connect = async () => {
+    const socket = await dial(ward, ADB_SERVER_PORT, ["127.0.0.1"]);
+    track(ward, socket);
+    return socket.on("error", () => socket.destroy());
+  };
+  try {
+    return await connect();
+  } catch {
+    await (ward.adbServer ??= startWardAdb(id).finally(() => (ward.adbServer = undefined)));
+    return connect();
+  }
+}
+
+/**
+ * Start a ward's adb server: the SDK's adb, run in the ward. It finds devices on
+ * the ward's loopback only, so USB is off (those are the host server's, and two
+ * servers fight over one) and so is mDNS.
+ */
+async function startWardAdb(id: string): Promise<void> {
+  const { worktree } = requireRecord(id);
+  const adb = ["env", "ADB_USB=0", "ADB_MDNS=0", HOST_ADB, "-P", String(ADB_SERVER_PORT), "start-server"];
+  await run(join(WARD_HOME, "bin/ward"), ["exec", "--running", "--worktree", worktree, "--", ...adb], { cwd: worktree, timeout: 30_000 }).catch((error: unknown) => {
+    throw new Error(`could not start the adb server in ward ${id}: ${error instanceof Error ? error.message.split("\n")[0] : String(error)}`);
+  });
+  log(`ward ${id}: started its adb server`);
+}
+
+/**
+ * Have the ward's adb server find the ward's device, unless it lists it. An adb
+ * server looks for emulators when it starts; one already running is told a new
+ * emulator's adb port, as the emulator itself tells the host's server, and
+ * sends no answer to that. Asked each time, since the server may be a new one,
+ * or have been told to drop the device (`adb disconnect`).
+ */
+async function showDevice(id: string, ward: LiveWard, device: DeviceInfo): Promise<void> {
+  relayDevice(id, ward);
+  const adbPort = Number(device.serial.replace("emulator-", "")) + 1;
+  for (const deadline = Date.now() + DEVICE_SHOWN_MS; ; await new Promise((r) => setTimeout(r, 100))) {
+    const list = await ask(await wardAdb(id, ward), "host:devices").catch(() => "");
+    if (list.split("\n").includes(`${device.serial}\tdevice`)) return;
+    if (Date.now() > deadline) {
+      const state = list.split("\n").find((line) => line.startsWith(`${device.serial}\t`))?.split("\t")[1];
+      throw new Error(`the adb server in ward ${id} did not find the ward's device, ${device.serial}${state === undefined ? "" : ` (it is ${state} there)`}`);
+    }
+    (await wardAdb(id, ward)).end(frame(`host:emulator:${adbPort}`));
+  }
+}
+
+/** Start running ward `id`'s device unless it is up, and have the ward's adb server find it. */
+async function wardDevice(id: string): Promise<DeviceInfo> {
+  const { worktree } = requireRecord(id);
+  const ward = live.get(id);
+  if (ward === undefined) throw new Error(`ward ${id} is not running`);
+  // Its ward may stop while it boots, or be removed and its id taken by another: the start
+  // gives up then, and the ward's stop takes a device that was already up (dropDevice).
+  const current = () => live.get(id) === ward;
+  const device = await startDevice(id, worktree, current);
+  if (!current()) throw new Error(`ward ${id} stopped while its device was starting; try again`);
+  await showDevice(id, ward, device);
+  return device;
+}
+
+/**
+ * `ward device`: start the worktree's ward if needed, then its device. Not under
+ * the ward's lock, as its desktop is: the first device of all waits minutes for
+ * the base image, and a `ward stop` must not wait behind it.
+ */
+async function device(id: string, worktree?: string, keepMs?: number): Promise<DeviceResult> {
+  const result = await up(worktree ?? requireRecord(id).worktree);
+  if (!result.enabled) return result;
+  const ward = live.get(result.ward.id);
+  if (ward !== undefined && !hasOwnAdb(ward))
+    return {
+      enabled: false,
+      reason: `ward ${result.ward.id} was started before wards had devices of their own and still uses the host's adb server; it gets its own once it is stopped and started (ward stop ${result.ward.id})`,
+    };
+  const started = await wardDevice(result.ward.id);
+  if (typeof keepMs === "number" && keepMs > 0) useDevice(result.ward.id, Date.now() + Math.min(keepMs, KEEP_MAX_MS));
+  return { enabled: true, device: started };
+}
+
+/** Stop ward `id`'s device because the ward stopped. Not waited for: a start under way finishes first. */
+function dropDevice(id: string): void {
+  void releaseDevice(id).catch((error: unknown) => log(`ward ${id}: stopping its device: ${String(error)}`));
+}
 
 // ── Reconciler ───────────────────────────────────────────────────────────────
 
@@ -1252,6 +1466,12 @@ async function reconcile(): Promise<string[]> {
     if (await stop(record.id, record.worktree)) actions.push(`stopped ${record.id}: no active thread needs it`);
   }
   actions.push(...(await reconcileThreadDesktops(allThreads, now)));
+  actions.push(...(await reconcileDevices(isReady)));
+  for (const [id, ward] of live) {
+    relayDevice(id, ward); // of devices that stopped, here or by themselves
+    // Again, in case the port was taken the last time (reclaimAdb); the broker ignores it when it has it.
+    if (hasOwnAdb(ward) && ward.scanTimer !== undefined) ward.broker.send({ t: "relay", port: ADB_PORT } satisfies BrokerRequest);
+  }
   actions.push(...(await purgeOldTrash()));
   return actions;
 }
@@ -1307,7 +1527,16 @@ const handlers: Handlers = {
   },
   "POST /desktop": (body) => ("thread" in body ? threadDesktop(body.thread, body.cwd) : desktop(body.id, body.worktree).finally(watchWorktreeParents)),
   "POST /gc": async () => ({ actions: await runReconcile() }),
-  "POST /adb-server": async () => ({ ok: await run(HOST_ADB, ["start-server"], { timeout: 30_000 }).then(() => true, () => false) }),
+  "POST /device": ({ id, worktree, keepMs }) => device(id, worktree, keepMs).finally(watchWorktreeParents),
+  "POST /device/stop": async ({ id, worktree }) => {
+    const record = requireRecord(id, worktree);
+    const stopped = await stopDevice(record.id);
+    const ward = live.get(record.id);
+    if (ward !== undefined) relayDevice(record.id, ward);
+    return { stopped };
+  },
+  "GET /devices": async () => listDevices(),
+  "POST /adb-server": async () => ({ ok: await startHostAdb().then(() => true, () => false) }),
   "GET /ls": async () => {
     await Promise.all([...live.keys()].map(scan)); // what listens now, not at the last scan
     return [...wards.values()].map(info).sort((a, b) => a.slot - b.slot);
@@ -1316,9 +1545,10 @@ const handlers: Handlers = {
 
 /**
  * What a caller inside a ward may ask, always about its own ward (`id`, from
- * its network namespace): map a port, start its desktop, start the host's adb
- * server (bin/ward, shims/adb), and list itself (`ward ports`). Everything
- * else, and any other ward's id, is the host's alone.
+ * its network namespace): map a port, start its desktop, start and stop its
+ * device, start the host's adb server (bin/ward, shims/adb), and list itself
+ * (`ward ports`) and its device. Everything else, and any other ward's id, is
+ * the host's alone.
  */
 const wardHandlers: { [R in Route]?: (id: string, body: Routes[R]["body"]) => Promise<Routes[R]["result"]> } = {
   "POST /port": (id, body) => {
@@ -1330,9 +1560,21 @@ const wardHandlers: { [R in Route]?: (id: string, body: Routes[R]["body"]) => Pr
       throw new Forbidden("a ward can start only its own desktop");
     return handlers["POST /desktop"]({ id });
   },
+  "POST /device": (id, body) => {
+    if (!ownWard(id, body)) throw new Forbidden("a ward can start only its own device");
+    return handlers["POST /device"]({ id, ...(body.keepMs === undefined ? {} : { keepMs: body.keepMs }) });
+  },
+  "POST /device/stop": (id, body) => {
+    if (!ownWard(id, body)) throw new Forbidden("a ward can stop only its own device");
+    return handlers["POST /device/stop"]({ id });
+  },
+  "GET /devices": async (id) => ({ avds: [], devices: listDevices().devices.filter((d) => d.ward === id) }),
   "POST /adb-server": (_id, body) => handlers["POST /adb-server"](body),
   "GET /ls": async (id, body) => (await handlers["GET /ls"](body)).filter((w) => w.id === id),
 };
+
+/** Whether a request names the caller's own ward, `id`, and no other worktree. */
+const ownWard = (id: string, body: { id: string; worktree?: string }) => body.id === id && (body.worktree === undefined || body.worktree === wards.get(id)?.worktree);
 
 class Forbidden extends Error {}
 
@@ -1382,8 +1624,9 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   }
 }
 
-function main(): void {
+async function main(): Promise<void> {
   mkdirSync(dirname(CONTROL_SOCKET), { recursive: true });
+  await loadDevices(); // before anything asks for one
   // Before any ward starts: a ward hides the folder only if it exists by then.
   mkdirSync(ACTIVITY_DIR, { recursive: true, mode: 0o700 });
   mkdirSync(BUILD_CACHE_DIR, { recursive: true }); // before any ward starts, so ward-init-root hides it
@@ -1410,4 +1653,4 @@ function main(): void {
   process.on("SIGINT", shutdown);
 }
 
-if (import.meta.main) main();
+if (import.meta.main) await main();

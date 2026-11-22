@@ -13,6 +13,10 @@ export const mappedServer = (onConnection: (client: Socket) => void): Server =>
  */
 export function splice(client: Socket, upstream: Socket): void {
   upstream.allowHalfOpen = true; // a socket received over IPC can't be created with it
+  // Each piece goes on as it comes: the two ends chose when to send, and a small one
+  // held back here (adb's acknowledgements) stalls them for the 40 ms a delayed ACK takes.
+  client.setNoDelay(true);
+  upstream.setNoDelay(true);
   client.pipe(upstream).pipe(client);
   const drop = () => {
     client.destroy();

@@ -30,8 +30,8 @@ export const REGISTRY_FILE = join(STATE_DIR, "registry.json");
 export const parsePorts = (text: string) =>
   text.split(",").map((p) => p.trim()).filter((p) => /^\d{1,5}$/.test(p)).map(Number).filter((p) => p > 0 && p < 65536);
 
-/** Host loopback ports forwarded into every ward (T3, adb); DNS (53) always is too. */
-export const HOST_PORTS: readonly number[] = parsePorts(env.WARD_HOST_PORTS ?? "3773,5037");
+/** Host loopback ports forwarded into every ward (T3); DNS (53) always is too. */
+export const HOST_PORTS: readonly number[] = parsePorts(env.WARD_HOST_PORTS ?? "3773");
 
 export interface WardLocation {
   readonly id: string;
@@ -110,5 +110,9 @@ export const desktopStateDir = (id: string) => join(STATE_DIR, "desktops", id);
 export const THREAD_WARDS_DIR = join(STATE_DIR, "thread-wards");
 /** The transient unit a thread's desktop runs as. */
 export const desktopUnitName = (id: string) => `${env.WARD_UNIT ?? "ward"}-desktop-${id}.service`;
+/** What ward devices are made of and run in (src/device.ts): the base images, and a folder per running device. No ward sees it. */
+export const DEVICE_DIR = join(STATE_DIR, "device");
+/** The transient unit a ward's device runs as; "base" for a base image while it is built (no ward's id: those have a dot). */
+export const deviceUnitName = (id: string) => `${env.WARD_UNIT ?? "ward"}-device-${id}.service`;
 /** Unit template wards run under; WARD_UNIT names another, to run a second Ward beside the installed one. */
 export const unitName = (id: string) => `${env.WARD_UNIT ?? "ward"}@${id}.service`;

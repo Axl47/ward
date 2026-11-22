@@ -21,5 +21,11 @@ test("a list that can't fit pasta's rules is refused", () => {
 });
 
 test("a ward's list is deduplicated and cleaned even from a hand-edited marker", () => {
-  assert.deepEqual(wardHostPorts([5037, 53, 28000, 39003], [3773, 5037]), [3773, 5037, 39003]);
+  assert.deepEqual(wardHostPorts([8081, 53, 28000, 39003], [3773, 8081]), [3773, 8081, 39003]);
+});
+
+test("the host's adb server and emulators are never forwarded: a ward has its own", () => {
+  assert.deepEqual(wardHostPorts([5037, 5555, 39003], [3773, 5037, 5554]), [3773, 39003]);
+  assert.throws(() => parseProjectHostPorts("5037", [3773]), /adb's in every ward/);
+  assert.throws(() => parseProjectHostPorts("5585", [3773]), /an emulator's port/);
 });
