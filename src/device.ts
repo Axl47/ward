@@ -272,6 +272,10 @@ function distrustBase(avd: string): void {
  * (the default is /tmp, which is memory), and its own, because the emulator
  * finds its radio simulator (netsimd) through the temp folder, so each gets one
  * that stops with its unit rather than sharing the one your emulators use.
+ * Stopping signals only the emulator, and kills what is left once it exits: a
+ * signal to netsimd at the same time cuts the emulator's link to it mid-shutdown,
+ * which makes it abort and dump a ~1 GB core, and the adb server it starts for
+ * itself ignores SIGTERM, so the unit would wait out its stop timeout and fail.
  * `flags` says which ports it listens on (`-port`, or `-ports`) and anything else
  * that differs; `env` is added to the emulator's environment.
  */
@@ -285,7 +289,7 @@ async function startEmulator(unit: string, description: string, avd: string, dir
     `--unit=${unit}`,
     `--description=${description}`,
     "--slice=app-t3code-agents-wards.slice",
-    "--property=KillMode=control-group",
+    "--property=KillMode=mixed",
     "--property=TimeoutStopSec=10",
     "--property=OOMScoreAdjust=500",
     `--property=StandardOutput=append:${logFile}`,
