@@ -79,6 +79,8 @@ interface Device {
   /** The emulator's pid, 0 until its unit has started. */
   pid: number;
   state: "booting" | "ready";
+  /** Being stopped, or its stop failed: no longer anyone's to use, relay or list. */
+  stopping?: boolean;
 }
 
 const devices = new Map<string, Device>();
@@ -297,7 +299,9 @@ export const startHostAdb = () => run("systemd-run", ["--user", "--scope", "--qu
  * no longer `wanted`.
  */
 async function booted(serial: string, avd: string, unit: string, pid: number, logFile: string, timeoutMs: number, wanted: () => boolean = () => true): Promise<void> {
-  await startHostAdb().catch(() => undefined);
+  await startHostAdb().catch((error: unknown) => {
+    throw new Error(`could not start the host's adb server: ${message(error)}`);
+  });
   let deadline = Date.now() + timeoutMs;
   for (;;) {
     if (!alive(unit, pid)) throw new Error(`the emulator exited${tail(logFile)}`);
@@ -384,7 +388,7 @@ function forget(id: string): void {
 /** The console port of ward `id`'s device once it is up; the device's adb port is the next. Not while it boots: the port isn't known to be its own yet. */
 export function consolePort(id: string): number | undefined {
   const device = deviceOf(id);
-  return device?.state === "ready" ? device.port : undefined;
+  return device?.state === "ready" && !device.stopping ? device.port : undefined;
 }
 
 /**
@@ -395,7 +399,7 @@ export function consolePort(id: string): number | undefined {
 export async function startDevice(id: string, worktree: string, wanted: () => boolean = () => true): Promise<DeviceInfo> {
   const device = await inTurn(id, async () => {
     const up = deviceOf(id);
-    return up?.state === "ready" ? up : boot(id, worktree, wanted);
+    return up?.state === "ready" && !up.stopping ? up : boot(id, worktree, wanted);
   });
   useDevice(id);
   return info(device);
@@ -406,8 +410,9 @@ async function boot(id: string, worktree: string, wanted: () => boolean): Promis
   const unit = deviceUnitName(id);
   const dir = runDir(id);
   const logFile = join(dir, "log");
+  const stopped = () => new Error(`ward ${id} stopped while its device was starting`);
   const device = await exclusive(async () => {
-    if (!wanted()) throw new Error(`ward ${id} stopped while its device was starting`);
+    if (!wanted()) throw stopped();
     await makeRoom(id);
     const port = await pickPort(id);
     const starting: Device = { ward: id, worktree, serial: `emulator-${port}`, port, avd, startedAt: new Date().toISOString(), pid: 0, state: "booting" };
@@ -415,8 +420,9 @@ async function boot(id: string, worktree: string, wanted: () => boolean): Promis
     return starting;
   });
   try {
-    await stopUnit(unit); // one a wardd left that died while it booted
+    await stopUnit(unit); // one a wardd left that died while it booted, or whose stop failed
     rmSync(dir, { recursive: true, force: true });
+    if (!wanted()) throw stopped();
     device.pid = await startEmulator(unit, `Ward device of ${id}`, avd, device.port, dir, logFile, ["-read-only", "-no-snapshot-save"]);
     await booted(device.serial, avd, unit, device.pid, logFile, BOOT_MS, wanted);
     device.state = "ready";
@@ -451,14 +457,22 @@ async function makeRoom(id: string): Promise<void> {
 }
 
 /**
- * Stop ward `id`'s device, once a start under way has finished, if `when` still
- * says so by then. Its data goes with it. Whether one was stopped; throws if its
- * emulator is still there afterwards, and it stays the ward's device.
+ * Stop ward `id`'s device, once a start under way has finished; with `when`, only
+ * if that still says so by then. Its data goes with it. Whether one was stopped.
+ * From the moment it is to stop, the device is nobody's: a ward started again
+ * meanwhile gets a new one, also if the emulator is still there afterwards,
+ * which throws.
  */
-export function stopDevice(id: string, when: () => boolean = () => true): Promise<boolean> {
+export function stopDevice(id: string, when?: () => boolean): Promise<boolean> {
+  const retire = () => {
+    const device = devices.get(id);
+    if (device?.state === "ready") device.stopping = true;
+  };
+  if (when === undefined) retire();
   return inTurn(id, async () => {
     const device = deviceOf(id);
-    if (!when()) return false;
+    if (when !== undefined && !when()) return false;
+    retire();
     const unit = deviceUnitName(id);
     await stopUnit(unit);
     if (device !== undefined && alive(unit, device.pid)) throw new Error(`ward ${id}'s device, ${device.serial}, did not stop`);
@@ -504,7 +518,7 @@ export function useDevice(id: string, until = Date.now()): void {
 
 /** Every serial Ward owns, for `ward devices`: each ward's device, and a base image while it builds. */
 export function listDevices(): DeviceList {
-  const running = [...devices.keys()].flatMap((id) => deviceOf(id) ?? []).map(info);
+  const running = [...devices.keys()].flatMap((id) => deviceOf(id) ?? []).filter((d) => !d.stopping).map(info);
   return {
     avds: baseNames(),
     devices: building === undefined ? running : [...running, { ...building, ward: null, worktree: null, state: "building" }],
@@ -522,7 +536,7 @@ export async function reconcileDevices(wardUp: (id: string) => boolean): Promise
     if (device?.state !== "ready") continue;
     const why = () => {
       const unused = Date.now() - usedAt(id);
-      return !wardUp(id) ? "its ward is not running" : unused > IDLE_MS ? `unused for ${Math.round(unused / 60_000)} minutes` : undefined;
+      return device.stopping ? "its last stop did not finish" : !wardUp(id) ? "its ward is not running" : unused > IDLE_MS ? `unused for ${Math.round(unused / 60_000)} minutes` : undefined;
     };
     const reason = why();
     if (reason === undefined) continue;

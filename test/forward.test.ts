@@ -134,7 +134,9 @@ test("a relay port that is taken is reported, and relayed when asked again once 
   await reported;
   holder.close();
   await once(holder, "close");
-  accepted.set(port, (s) => s.end("relayed"));
+  accepted.set(port, (s) => s.on("error", () => {}).end("relayed")); // `accepting` hangs up on its probe
   broker.send({ t: "relay", port } satisfies BrokerRequest);
   assert.ok(await accepting(port));
+  assert.equal(await exchange(port, (s) => s.end()), "relayed");
+  broker.send({ t: "unrelay", port } satisfies BrokerRequest);
 });

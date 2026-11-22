@@ -56,7 +56,7 @@ lock_down() {
   if [ -f "$rt/own-homes" ]; then
     while read -r name path; do names+=("$name"); paths+=("$path"); done <"$rt/own-homes"
   fi
-  for p in "$WARD_STATE" "$WARD_CONFIG" "$WARD_RUNTIME" "$WARD_HOME" "$HOME"/.t3*/userdata "$WARD_T3/userdata" "$miranda" "$avds" \
+  for p in "$WARD_STATE" "$WARD_CONFIG" "$WARD_RUNTIME" "$WARD_HOME" "$HOME"/.t3*/userdata "$WARD_T3/userdata" "$miranda" "$(readlink -f -- "$avds")" \
            "/run/user/$uid/systemd" "/run/user/$uid/bus" "${XDG_RUNTIME_DIR:-}/systemd" "${XDG_RUNTIME_DIR:-}/bus" "${paths[@]}"; do
     [ -e "$p" ] && [ ! -L "$p" ] || continue
     p=$(readlink -f -- "$p")
@@ -102,7 +102,7 @@ lock_down() {
       "$(readlink -f "$miranda")") hide_except "$p" shell ;;
       # Your emulators (T3's shared ones among them): an emulator started in a ward would
       # run from their disks. A ward's device is Ward's own, on the host (src/device.ts).
-      "$(readlink -f "$avds")") mount -t tmpfs -o ro,mode=0755,size=4k tmpfs "$p" ;;
+      "$(readlink -f "$avds")") [ ! -d "$p" ] || mount -t tmpfs -o ro,mode=0755,size=4k tmpfs "$p" ;;
       */userdata) hide_except "$p" attachments ;;
       */bus) if [ -S "$rt/bus" ]; then mount --bind "$rt/bus" "$p"; else mount --bind /dev/null "$p"; fi ;;
       */systemd) mount -t tmpfs -o ro,mode=0755,size=4k tmpfs "$p" ;;

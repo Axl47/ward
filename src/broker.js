@@ -52,8 +52,7 @@ function relay(port) {
     const reply = { t: "accepted", port };
     send(reply, socket, { keepOpen: false });
   });
-  server.on("error", (error) => {
-    console.error(`ward broker: cannot relay port ${port}: ${String(error)}`);
+  server.on("error", () => {
     if (relays.get(port) !== server) return;
     relays.delete(port);
     send(/** @type {BrokerReply} */ ({ t: "unrelayed", port }));
@@ -65,7 +64,8 @@ function relay(port) {
 process.on("message", (/** @type {BrokerRequest} */ message) => {
   if (message.t === "relay") return relay(message.port);
   if (message.t === "unrelay") return void (relays.get(message.port)?.close(), relays.delete(message.port));
-  tryConnect(message.hosts, message.port).then(
+  // Never one of its own relay listeners: that would be wardd dialing itself.
+  (relays.has(message.port) ? Promise.reject(new Error(`port ${message.port} is the broker's own`)) : tryConnect(message.hosts, message.port)).then(
     (socket) => {
       /** @type {BrokerReply} */
       const reply = { t: "connected", req: message.req };

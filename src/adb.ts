@@ -64,8 +64,8 @@ export function ask(server: Socket, request: string): Promise<string> {
   return new Promise((resolve, reject) => {
     let answer = Buffer.alloc(0);
     const fail = (reason: string) => (server.destroy(), reject(new Error(reason)));
+    const timer = setTimeout(() => fail("the adb server did not answer"), ANSWER_TIMEOUT_MS);
     server
-      .setTimeout(ANSWER_TIMEOUT_MS, () => fail("the adb server did not answer"))
       .on("data", (chunk: Buffer) => {
         answer = Buffer.concat([answer, chunk]);
         if (answer.length < 8) return;
@@ -78,7 +78,7 @@ export function ask(server: Socket, request: string): Promise<string> {
         resolve(text);
       })
       .on("error", (error) => fail(error.message))
-      .on("close", () => reject(new Error("the adb server hung up")));
+      .on("close", () => (clearTimeout(timer), reject(new Error("the adb server hung up"))));
     server.write(frame(request));
   });
 }

@@ -844,9 +844,10 @@ function attach(record: WardRecord): void {
       return void scan(record.id);
     }
     if (reply.t === "unrelayed") {
-      if (reply.port === ADB_PORT) void reclaimAdb(record.id, ward);
-      if (ward.devicePorts.includes(reply.port)) ward.devicePorts = []; // relayDevice asks again
-      return;
+      if (reply.port === ADB_PORT) return void reclaimAdb(record.id, ward);
+      // A device's port that something in the ward holds: relayDevice asks for it again.
+      if (ward.devicePorts.includes(reply.port)) return void (ward.devicePorts = ward.devicePorts.filter((p) => p !== reply.port));
+      return log(`ward ${record.id}: port ${reply.port} is taken inside it, so the host's is not reached there`);
     }
     const upstream = socket instanceof Object && "pipe" in socket ? (socket as Socket) : undefined;
     if (reply.t === "accepted") {
@@ -1295,11 +1296,17 @@ const ADB_RECLAIM_MS = 10_000;
 async function reclaimAdb(id: string, ward: LiveWard): Promise<void> {
   if (Date.now() - ward.adbReclaimedAt < ADB_RECLAIM_MS) return;
   ward.adbReclaimedAt = Date.now();
-  log(`ward ${id}: its port ${ADB_PORT} is taken, by an adb server a client started while wardd wasn't there; telling it to exit`);
-  await dial(ward, ADB_PORT, ["127.0.0.1"]).then(
-    (socket) => void socket.on("error", () => socket.destroy()).resume().end(frame("host:kill")),
-    () => undefined, // gone already
-  );
+  const holder = () => dial(ward, ADB_PORT, ["127.0.0.1"]); // fails once the port is the broker's
+  try {
+    await ask(await holder(), "host:version");
+    const socket = await holder();
+    socket.on("error", () => socket.destroy()).resume().end(frame("host:kill"));
+    setTimeout(() => socket.destroy(), 2000);
+    log(`ward ${id}: its port ${ADB_PORT} was taken by an adb server a client started while wardd wasn't there; told it to exit`);
+  } catch (error) {
+    log(`ward ${id}: its port ${ADB_PORT} is taken, and what holds it didn't answer as an adb server (${error instanceof Error ? error.message : String(error)})`);
+    return;
+  }
   await new Promise((r) => setTimeout(r, 300));
   if (live.get(id) === ward) ward.broker.send({ t: "relay", port: ADB_PORT } satisfies BrokerRequest);
 }
@@ -1309,9 +1316,8 @@ function relayDevice(id: string, ward: LiveWard): void {
   if (ward.scanTimer === undefined) return; // the broker isn't in the ward yet; this runs again once it is
   const port = consolePort(id);
   const ports = port === undefined ? [] : [port, port + 1];
-  if (ports.join() === ward.devicePorts.join()) return;
-  for (const p of ward.devicePorts) ward.broker.send({ t: "unrelay", port: p } satisfies BrokerRequest);
-  for (const p of ports) ward.broker.send({ t: "relay", port: p } satisfies BrokerRequest);
+  for (const p of ward.devicePorts) if (!ports.includes(p)) ward.broker.send({ t: "unrelay", port: p } satisfies BrokerRequest);
+  for (const p of ports) if (!ward.devicePorts.includes(p)) ward.broker.send({ t: "relay", port: p } satisfies BrokerRequest);
   ward.devicePorts = ports;
 }
 
