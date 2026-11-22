@@ -22,10 +22,12 @@ const accepted = new Map<number, (socket: Socket) => void>();
 broker.on("message", (reply: BrokerReply, socket: unknown) => {
   if (reply.t === "accepted") accepted.get(reply.port)?.(socket as Socket);
   else if (reply.t === "unrelayed") unrelayed.get(reply.port)?.();
+  else if (reply.t === "relayed") relayed.get(reply.port)?.();
   else if (reply.t !== "ready") pending.get(reply.req)?.(socket as Socket | undefined);
 });
-/** Port → called when the broker says it could not listen there. */
+/** Port → called when the broker says it could not listen there, and when it says it does. */
 const unrelayed = new Map<number, () => void>();
+const relayed = new Map<number, () => void>();
 let nextReq = 1;
 
 async function listen(server: Server): Promise<number> {
@@ -134,9 +136,10 @@ test("a relay port that is taken is reported, and relayed when asked again once 
   await reported;
   holder.close();
   await once(holder, "close");
-  accepted.set(port, (s) => s.on("error", () => {}).end("relayed")); // `accepting` hangs up on its probe
+  accepted.set(port, (s) => s.end("relayed"));
+  const listening = new Promise<void>((resolve) => relayed.set(port, resolve));
   broker.send({ t: "relay", port } satisfies BrokerRequest);
-  assert.ok(await accepting(port));
+  await listening; // wardd starts a ward's first command only after this, for the ward's adb port
   assert.equal(await exchange(port, (s) => s.end()), "relayed");
   broker.send({ t: "unrelay", port } satisfies BrokerRequest);
 });

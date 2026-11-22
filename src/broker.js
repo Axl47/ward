@@ -57,7 +57,7 @@ function relay(port) {
     relays.delete(port);
     send(/** @type {BrokerReply} */ ({ t: "unrelayed", port }));
   });
-  server.listen(port, "127.0.0.1");
+  server.listen(port, "127.0.0.1", () => send(/** @type {BrokerReply} */ ({ t: "relayed", port })));
   relays.set(port, server);
 }
 
