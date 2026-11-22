@@ -6,7 +6,8 @@ import { connect } from "node:net";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import { parseArgs } from "node:util";
-import { call, WardError, type WardInfo } from "./api.ts";
+import { call, WardError, type DeviceList, type WardInfo } from "./api.ts";
+import { parseDuration } from "./device.ts";
 import { parseProjectHostPorts, wardHostPorts } from "./hostports.ts";
 import { CONTROL_SOCKET, enabledMarker, locate, parsePorts, projectHostPorts, WARD_HOME, wardRuntimeDir } from "./paths.ts";
 import { T3_TOKEN_FILE } from "./t3state.ts";
@@ -17,6 +18,11 @@ const USAGE = `usage: ward <command>
   desktop [--worktree DIR] [-- CMD...]
                                     run CMD on a private desktop, the ward's or, with no ward, the T3 thread's own;
                                     without CMD, print its environment
+  device [--worktree DIR] [--keep DURATION] [--json]
+                                    start the ward's own Android emulator unless it is up, and print its serial;
+                                    it stops after 15 minutes unused, or DURATION (90s, 30m, 2h) from now if that is later
+  device stop [ID|--worktree DIR]   stop it; the next use starts a fresh one, without what was installed
+  devices [--json]                  every ward's device
   up [--worktree DIR]               start the worktree's ward
   stop [ID|--worktree DIR]          stop a ward, keeping its data
   rm [ID|--worktree DIR] [--now]    remove a ward; its data stays in the trash for 7 days (--now: delete it)
@@ -40,6 +46,7 @@ const { positionals, values } = parseArgs({
     quiet: { type: "boolean" },
     now: { type: "boolean" },
     "host-ports": { type: "string" },
+    keep: { type: "string" },
   },
 });
 const [command, ...args] = positionals;
@@ -50,12 +57,17 @@ const flag = (name: "worktree" | "thread") => (typeof values[name] === "string" 
  * current folder. worktree is set when it was found by path.
  */
 function target(explicit?: string): { id: string; worktree?: string } {
+  const found = find(explicit);
+  if (found === undefined) throw new WardError("not inside a T3 worktree; pass a ward id or --worktree");
+  return found;
+}
+/** As target, but undefined for a folder that is no T3 worktree's. */
+function find(explicit?: string): { id: string; worktree?: string } | undefined {
   if (explicit) return { id: explicit };
   const worktree = flag("worktree");
   if (worktree === undefined && process.env.WARD_ID) return { id: process.env.WARD_ID };
   const location = locate(worktree ?? process.cwd());
-  if (location === undefined) throw new WardError("not inside a T3 worktree; pass a ward id or --worktree");
-  return { id: location.id, worktree: location.root };
+  return location && { id: location.id, worktree: location.root };
 }
 const currentId = () => target().id;
 
@@ -196,6 +208,35 @@ async function main(): Promise<void> {
       // 4: the thread belongs to a warded worktree, and bin/ward starts over with the note wardd left.
       if ((await call("POST /desktop", flag("thread") === undefined ? target() : { thread: flag("thread")!, cwd: process.cwd() })).ward !== undefined) process.exitCode = 4;
       return;
+    case "device": {
+      if (args[0] === "stop") {
+        await ensureDaemon();
+        const ward = target(args[1]);
+        const { stopped } = await call("POST /device/stop", ward);
+        return console.log(`${ward.id}: ${stopped ? "device stopped" : "had no device running"}`);
+      }
+      const keep = values.keep;
+      const keepMs = keep === undefined ? undefined : typeof keep === "string" ? parseDuration(keep) : undefined;
+      if (args.length > 0 || (keep !== undefined && keepMs === undefined)) throw new WardError("usage: ward device [--worktree DIR] [--keep 90s|30m|2h] [--json]\n       ward device stop [ID|--worktree DIR]");
+      // 3, as `ward up`: the folder has no ward, so it has no device of its own either.
+      const none = (reason: string) => (console.error(`ward: ${reason}`), void (process.exitCode = 3));
+      const ward = find();
+      if (ward === undefined) return none(`${flag("worktree") ?? process.cwd()} is not a T3 worktree`);
+      await ensureDaemon();
+      // Long: the first device after an emulator or system image update waits for a new base image.
+      const result = await call("POST /device", { ...ward, ...(keepMs === undefined ? {} : { keepMs }) }, 300_000);
+      if (!result.enabled) return none(result.reason);
+      const { serial, state, startedAt } = result.device;
+      return console.log(values.json ? JSON.stringify({ serial, state, startedAt }) : serial);
+    }
+    case "devices": {
+      // No auto-start: T3 polls this, and a stopped wardd means no ward has a device.
+      const list: DeviceList = existsSync(CONTROL_SOCKET) && (await reachable()) ? await call("GET /devices", {}) : { avds: [], devices: [] };
+      if (values.json) return console.log(JSON.stringify(list, null, 2));
+      if (list.devices.length === 0) return console.log("no devices");
+      for (const d of list.devices) console.log(`${d.serial}\t${d.state}\t${d.ward ?? "(Ward's base image, being built)"}`);
+      return;
+    }
     case "env":
       process.stdout.write(readFileSync(join(wardRuntimeDir(currentId()), "env"), "utf8"));
       return;
@@ -218,7 +259,7 @@ async function main(): Promise<void> {
       return;
     }
     case "adb-server": {
-      // From shims/adb, when the host's adb server isn't answering.
+      // From shims/adb in a ward started before wards had their own adb server, when the host's isn't answering.
       await ensureDaemon();
       if (!(await call("POST /adb-server", {})).ok) throw new WardError("could not start the host's adb server");
       return;

@@ -1,5 +1,6 @@
 // Which host loopback ports pasta forwards into a project's wards. Used by
 // `ward enable --host-ports` to check input and by wardd to build each ward's list.
+import { ADB_PORT, ADB_SERVER_PORT } from "./adb.ts";
 import { BUILD_CACHE_PORT } from "./gradle.ts";
 import { HOST_PORTS } from "./paths.ts";
 import { MAX_SLOTS, PORT_BASE, SLOT_SIZE } from "./registry.ts";
@@ -13,6 +14,7 @@ const WARD_LAST = PORT_BASE + (MAX_SLOTS + 1) * SLOT_SIZE - 1;
 export function hostPortProblem(port: number): string | undefined {
   if (port === 53) return "53 is always forwarded (DNS)";
   if (port === BUILD_CACHE_PORT) return `${port} is the Gradle build cache's in every ward`;
+  if (port === ADB_PORT || port === ADB_SERVER_PORT) return `${port} is adb's in every ward, where it reaches the ward's own device and no other`;
   if (port >= WARD_FIRST && port <= WARD_LAST) return `${port} is in Ward's own host port range ${WARD_FIRST}-${WARD_LAST}, so it would reach another ward`;
   return undefined;
 }

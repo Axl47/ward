@@ -1,12 +1,19 @@
 #!/bin/sh
-# adb inside a ward. The adb server and emulators live on the host, so for
-# `adb reverse DEVICE tcp:PORT` the local side must be the ward's host-mapped
-# port for PORT; everything else goes to the real adb unchanged.
+# adb inside a ward. A ward has an adb server of its own, whose only device is
+# the ward's (docs/DESIGN.md: Devices), so adb runs unchanged. The shim is still
+# first on PATH and in the ward's ANDROID_HOME for wards started before that,
+# which reach the host's adb server instead; the rest of this file is for them,
+# and goes once none is left running.
 real=${WARD_REAL_ADB:-${ANDROID_HOME:-$HOME/Android/Sdk}/platform-tools/adb}
+case ",${WARD_FORWARDED_PORTS:-}," in
+  *,5037,*) ;;
+  *) exec "$real" "$@" ;;
+esac
 
-# Outside a ward, adb starts the host's server when it isn't running. Here the
-# server's port is pasta's forward, which accepts and then resets, and a server
-# started in the ward couldn't see the emulators; so wardd starts it on the host.
+# The server and emulators are on the host, so for `adb reverse DEVICE tcp:PORT`
+# the local side must be the ward's host-mapped port for PORT. And the server's
+# port is pasta's forward, which accepts and then resets when nothing listens,
+# so adb can't tell the server is down and start it: wardd does, on the host.
 server_up() {
   timeout 2 bash -c 'exec 3<>"/dev/tcp/127.0.0.1/$1" && printf 000chost:version >&3 && IFS= read -r -n 4 r <&3 && [ "$r" = OKAY ]' \
     bash "${ANDROID_ADB_SERVER_PORT:-5037}" 2>/dev/null
