@@ -883,6 +883,7 @@ function attach(record: WardRecord): void {
     callback(reply, upstream);
   });
   broker.on("exit", () => {
+    adbRelayed(); // nothing to wait for any more
     if (live.get(record.id) === ward) detach(record.id);
   });
   // A message it could not be sent, once it is gone; without this the error would end wardd.
