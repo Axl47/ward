@@ -50,7 +50,7 @@ export function parseDuration(text: string): number | undefined {
 }
 
 /** How long a device may go unused before the reconciler stops it. */
-export const IDLE_MS = parseDuration(process.env.WARD_DEVICE_IDLE ?? "") ?? 15 * 60_000;
+const IDLE_MS = parseDuration(process.env.WARD_DEVICE_IDLE ?? "") ?? 15 * 60_000;
 /** How many devices run at once: each holds about 3.6 GB of memory. */
 const MAX = Math.max(1, Math.floor(Number(process.env.WARD_DEVICE_MAX)) || 8);
 /**
@@ -58,7 +58,7 @@ const MAX = Math.max(1, Math.floor(Number(process.env.WARD_DEVICE_MAX)) || 8);
  * Longer than the 5 minutes between T3's keep-alives, so a device with an open T3
  * session is never taken.
  */
-export const RECLAIM_MS = 6 * 60_000;
+const RECLAIM_MS = 6 * 60_000;
 const BOOT_MS = 60_000;
 /** A boot without a snapshot: a base image's first, and a device's when its snapshot doesn't load. */
 const COLD_BOOT_MS = 120_000;
