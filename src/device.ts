@@ -33,7 +33,7 @@ const AVD_HOME = join(DEVICE_DIR, "avd");
 const USER_AVD_HOME = process.env.ANDROID_AVD_HOME ?? join(homedir(), ".android/avd");
 const GPU = process.env.WARD_DEVICE_GPU ?? "swangle_indirect";
 /** Change it when the way a base image is built changes, so every base is rebuilt. */
-const RECIPE = "1";
+const RECIPE = "2"; // 2: built off every adb server, so an image built before, which a host install could have reached, is replaced
 const BASE_UNIT = deviceUnitName("base"); // no ward's: a ward's id has a dot
 /**
  * Console ports ward devices take, highest first. The adb server finds emulators
