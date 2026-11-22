@@ -406,8 +406,13 @@ export async function startDevice(id: string, worktree: string, wanted: () => bo
 }
 
 async function boot(id: string, worktree: string, wanted: () => boolean): Promise<Device> {
-  const avd = await ensureBase();
   const unit = deviceUnitName(id);
+  // One whose stop failed, or that a wardd left when it died while it booted. While it
+  // is still there it keeps its record, for the reconciler to stop.
+  const last = devices.get(id);
+  await stopUnit(unit);
+  if (last !== undefined && alive(unit, last.pid)) throw new Error(`ward ${id}'s last device, ${last.serial}, has not stopped yet`);
+  const avd = await ensureBase();
   const dir = runDir(id);
   const logFile = join(dir, "log");
   const stopped = () => new Error(`ward ${id} stopped while its device was starting`);
@@ -420,7 +425,6 @@ async function boot(id: string, worktree: string, wanted: () => boolean): Promis
     return starting;
   });
   try {
-    await stopUnit(unit); // one a wardd left that died while it booted, or whose stop failed
     rmSync(dir, { recursive: true, force: true });
     if (!wanted()) throw stopped();
     device.pid = await startEmulator(unit, `Ward device of ${id}`, avd, device.port, dir, logFile, ["-read-only", "-no-snapshot-save"]);
@@ -466,7 +470,9 @@ async function makeRoom(id: string): Promise<void> {
 export function stopDevice(id: string, when?: () => boolean): Promise<boolean> {
   const retire = () => {
     const device = devices.get(id);
-    if (device?.state === "ready") device.stopping = true;
+    if (device?.state !== "ready") return;
+    device.stopping = true;
+    rmSync(join(runDir(id), "device.json"), { force: true }); // nor a later wardd's to take up (loadDevices)
   };
   if (when === undefined) retire();
   return inTurn(id, async () => {
@@ -542,7 +548,7 @@ export async function reconcileDevices(wardUp: (id: string) => boolean): Promise
     if (reason === undefined) continue;
     try {
       // Asked again in its turn: a use may have been waiting ahead of this.
-      if (!(await stopDevice(id, () => why() !== undefined))) continue;
+      if (!(await stopDevice(id, () => devices.get(id) === device && why() !== undefined))) continue;
       if (!wardUp(id)) ports.delete(id);
       actions.push(`stopped ${device.serial}, the device of ${id}: ${reason}`);
     } catch (error) {

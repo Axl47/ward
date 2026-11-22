@@ -1304,8 +1304,8 @@ async function reclaimAdb(id: string, ward: LiveWard): Promise<void> {
     setTimeout(() => socket.destroy(), 2000);
     log(`ward ${id}: its port ${ADB_PORT} was taken by an adb server a client started while wardd wasn't there; told it to exit`);
   } catch (error) {
-    log(`ward ${id}: its port ${ADB_PORT} is taken, and what holds it didn't answer as an adb server (${error instanceof Error ? error.message : String(error)})`);
-    return;
+    // It may be gone already, so the port is asked for again all the same.
+    log(`ward ${id}: its port ${ADB_PORT} was taken, and what held it didn't answer as an adb server (${error instanceof Error ? error.message : String(error)})`);
   }
   await new Promise((r) => setTimeout(r, 300));
   if (live.get(id) === ward) ward.broker.send({ t: "relay", port: ADB_PORT } satisfies BrokerRequest);
