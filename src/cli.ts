@@ -237,7 +237,7 @@ async function main(): Promise<void> {
       const list: DeviceList = existsSync(CONTROL_SOCKET) && (await reachable()) ? await call("GET /devices", {}) : { avds: [], devices: [] };
       if (values.json) return console.log(JSON.stringify(list, null, 2));
       if (list.devices.length === 0) return console.log("no devices");
-      for (const d of list.devices) console.log(`${d.serial}\t${d.state}\t${d.ward ?? "(Ward's base image, being built)"}`);
+      for (const d of list.devices) console.log(`${d.serial}\t${d.state}\t${d.ward}`);
       return;
     }
     case "env":

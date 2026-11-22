@@ -29,14 +29,13 @@ export type UpResult =
   | { readonly enabled: false; readonly reason: string }
   | { readonly enabled: true; readonly ward: WardInfo };
 
-/** A ward's Android device (src/device.ts), or the base image they all start from while Ward builds it. */
+/** A ward's Android device (src/device.ts). */
 export interface DeviceInfo {
   /** Its name on the host's adb server and on its ward's: `emulator-<port>`. */
   readonly serial: string;
-  /** Null for the base image being built, which nobody may use: what changed on it would be in every ward's device. */
-  readonly ward: string | null;
-  readonly worktree: string | null;
-  readonly state: "booting" | "ready" | "building";
+  readonly ward: string;
+  readonly worktree: string;
+  readonly state: "booting" | "ready";
   /** When this emulator started. A serial is used again by later devices; this tells them apart. */
   readonly startedAt: string;
 }
