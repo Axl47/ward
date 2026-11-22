@@ -2,64 +2,83 @@
 
 # Ward
 
-Gives every T3 Code worktree on gaia-arch its own network namespace, Podman and `TMPDIR`, so parallel agent threads can all run a dev server on 5173 and Postgres on 5432 without colliding, and a private headless desktop on demand, so they can each drive a GUI app without sharing your screen. [docs/DESIGN.md](docs/DESIGN.md) explains how, and [docs/PROFILE.md](docs/PROFILE.md) what it costs.
+Run several AI coding agents on one Linux machine without them colliding.
+
+Agent tools like [T3 Code](https://github.com/pingdotgg/t3code) give each agent thread its own git worktree, so their files stay apart. Everything else is still shared: two agents both start Vite on port 5173, both run Postgres on 5432 through `docker compose`, both write caches to `/tmp`, and both install their app onto the same Android emulator. An agent that opens a browser to check its work opens it on your screen.
+
+Ward gives each worktree a sandbox, called a ward, with its own:
+
+- **network**: a private `localhost`, so every agent can use 5173 and 5432 at once
+- **containers**: a private Podman, behind the usual `docker` and `docker compose` commands
+- **temp folder**: a private `TMPDIR`
+- **desktop**: a headless Wayland desktop for GUI apps, off your screen
+- **Android emulator**: started on first use, and the only device `adb` finds in that ward
+
+A ward is a set of unprivileged Linux namespaces (the kernel feature containers are built on): no root, no VM, and the worktree's files stay on disk where they are. It starts on an agent's first command and stops once the agent's thread is done. It protects trusted agents from each other's accidents; it is not a security boundary against a hostile one.
+
+## How it works
+
+```
+host                                        ward (one per worktree)
+┌─────────────────────────────┐             ┌──────────────────────────────┐
+│ T3 Code, Claude Code, Codex │─ commands ─▶│ the agent's shell commands   │
+│                             │             │ vite :5173, postgres :5432   │
+│ wardd (Ward's daemon)       │             │ own Podman, TMPDIR, desktop  │
+│   127.0.0.1:20100 ◀─────────┼──── maps ───┤ own adb server and emulator  │
+│ your browser, preview pane  │             │ internet through pasta       │
+└─────────────────────────────┘             └──────────────────────────────┘
+```
+
+The agent process itself stays on the host; only the shell commands it runs enter the ward. Inside, servers listen on their usual ports. For whatever outside needs to reach them, such as your browser or T3's preview pane, `wardd` gives each ward a block of 100 host ports and maps a port as soon as something in the ward listens on it: ward 1's first server, say Vite on `:5173`, becomes `127.0.0.1:20100`. `ward ports` prints the mapping.
+
+[docs/DESIGN.md](docs/DESIGN.md) covers the design in depth.
+
+## What it costs
+
+Measured with four copies of a project (a Vite dev server, Postgres in Docker, a test suite) running at once, in wards and directly on the host:
+
+| | Cost |
+| --- | --- |
+| Every agent command | about +10 ms (10.7 ms against 0.7 ms for `true`) |
+| Memory | about 55 MB per running ward, plus 130–200 MB for `wardd` |
+| CPU and time for the work itself | no more than on the host |
+| Host → ward through a mapped port | +0.05–0.08 ms per request, 12–22 % less throughput |
+
+The mapped port is fine for a dev server and slow for bulk transfers. The full numbers and method are in [docs/PROFILE.md](docs/PROFILE.md).
+
+## Requirements
+
+- Linux with unprivileged user namespaces, a systemd user session, and subuid/subgid ranges for your user
+- Node 26+, `podman`, `passt`, `crun`, `catatonit`, `xdg-dbus-proxy`
+- For desktops: [Umbriel](https://github.com/noctalia-dev/umbriel) (run headless), `dbus-daemon`, `at-spi2-core`, `wtype`
+- For devices: the Android SDK emulator and at least one AVD to copy
+- For T3 Code to run agent commands in wards: [Annex](https://github.com/Axl47/annex), a T3 Code fork with Ward's hook
 
 ## Setup
 
-Needs Linux with unprivileged user namespaces, Node 26+ (`wardd` reads callers' credentials through `node:ffi`), `podman`, `passt`, `crun`, `xdg-dbus-proxy` (the session bus a ward sees), `catatonit` (init of a ward's PID namespace), and subuid/subgid ranges for your user (`/etc/subuid`, `/etc/subgid`). Desktops also need `umbriel`, `dbus-daemon`, `at-spi2-core` for apps' text, and `wtype` for typing into them; with [Caliban](https://github.com/Axl47/caliban) installed they also get a sound server of their own.
-
 ```sh
 pnpm install
-bin/ward install        # systemd user units, ward on PATH, read-only T3 token
-ward enable <repo>      # opt a project in (its folder name under T3's worktrees folder)
+bin/ward install          # systemd user units, ward on PATH, read-only T3 token
+ward enable <repo>        # opt a project in
 ```
 
-For T3 to run agent commands and terminals in wards, start the Annex server with `T3CODE_WARD_COMMAND=$HOME/.local/bin/ward`. Ward serves the T3 at `~/.t3`; set `WARD_T3_HOME` for another.
+Then start Annex with `T3CODE_WARD_COMMAND=$HOME/.local/bin/ward`. Ward serves the T3 home at `~/.t3`; set `WARD_T3_HOME` for another.
 
 ## Use
 
-Inside a ward, services are at their usual `localhost` ports. From the host:
+Agents need nothing: their commands run in the worktree's ward. From the host:
 
 ```sh
-ward ls                 # wards, slots and port mappings
-ward ports              # this worktree's ward port → host port
-ward exec -- CMD        # run CMD in the current worktree's ward
-ward desktop -- CMD     # run a GUI app on a private desktop: the ward's, or the T3 thread's own
-ward device             # start this ward's own Android emulator and print its serial
-ward devices            # every ward's device
-ward stop | ward rm     # stop (keeps data) or remove a ward
-ward images pull IMAGE  # pull into the image store every ward shares
+ward ls                   # wards, slots and port mappings
+ward ports                # this worktree's ward port → host port
+ward exec -- CMD          # run CMD in the current worktree's ward
+ward desktop -- CMD       # run a GUI app on the ward's private desktop
+ward device               # start this ward's emulator and print its serial
+ward stop | ward rm       # stop (keeps data) or remove a ward
+ward images pull IMAGE    # pull an image once into a store every ward shares
 ```
 
-Wards start on the first command in a worktree. They stop once every thread on it has settled, or 30 minutes after the last command when it has no active thread. When the worktree is deleted, the ward's data goes to a trash for 7 days.
-
-### Desktops
-
-`ward desktop -- CMD` runs `CMD` in the ward on a desktop of its own: a headless Umbriel with one 1280×720 output, its own session bus and no shell. It starts on the first `ward desktop` and stops with the ward. It shares no compositor, session bus, notifications, portals or sound server with your session (apps on it play nothing, or into a sink of its own when Caliban is installed), and apps get a profile of their own there: its config folder mirrors `~/.config` with links to your files, minus browser and Electron profiles, and what an app creates stays in the ward. [Puck](https://github.com/Axl47/puck) acts on it by default for an agent in a ward; `ward desktop` alone prints its environment (`WAYLAND_DISPLAY` and the rest) for anything else that should. Its log is `desktop.log` in the ward's data folder.
-
-Where a T3 thread has no ward, the same command gives the thread a desktop of its own: the same desktop without the network namespace, so apps on it reach the thread's `localhost` ports directly. It starts with the first `ward desktop -- CMD` (plain `ward desktop` prints nothing until then, and exits 3). It stops when the thread settles or after 2 hours unused, keeping nothing, and the thread's next call starts it again, empty. Agents open things through Puck's `puck open CMD`, which runs this, waits for the window and prints it.
-
-Only the prefixed command is on that desktop: a GUI app started without it opens on your screen, and outside both a ward and a T3 thread the prefixed command fails rather than opening there. The prefixed command has no keyring or `systemctl --user`, so build, commit and push without it. A plain `ward exec` command still plays sound through your session's PipeWire, out of your speakers. X11-only apps don't run there. The rest of your home folder is shared, so an app that finds its running copy through files there still reaches the one on your screen: a Firefox with its profile in `~/.mozilla` refuses to start beside it (give it `--profile DIR`), and Zed keeps a socket in `~/.local/share/zed`.
-
-### Devices
-
-Each ward has an Android emulator of its own, and it is the only device adb finds there: `adb devices`, `./gradlew installDebug`, Expo and React Native all see one device, never another ward's, T3's shared emulators or your phone. Nothing needs setting up in the ward. The first adb command that needs a device starts it (about 5 s; about 45 s the first time ever and after an emulator or system image update, while Ward builds the image all devices start from), and `adb reverse` and `adb forward` open their ports inside the ward. T3's Device panel and device tools open it for the ward's threads and no others.
-
-A device stops after 15 minutes without use (`WARD_DEVICE_IDLE=30m` for `wardd` changes that; `ward device --keep 2h` keeps this one, for up to 4 hours), when its ward stops, and with `ward device stop`. The next use starts a fresh one: apps installed and data on the old one are gone. At most 8 run at once (`WARD_DEVICE_MAX`), each holding about 3.6 GB of memory; one more takes the place of the device unused longest, if that has been 6 minutes, and is refused otherwise.
-
-Ward devices copy the hardware and system image of one of your AVDs, which is only read: the first by name when Ward first looked (`WARD_DEVICE_TEMPLATE=name` for `wardd` picks another). For another API level, or your phone, use T3's device tools, which run outside the ward; your own AVDs are hidden in a ward, so an emulator started there can't run from them. Outside wards nothing changes: a Gradle install or `adb` on the host acts on every device listed, ward devices included, unless `ANDROID_SERIAL` names one.
-
-### Limits
-
-Inside a ward, `sudo` doesn't work, and host services are reachable only on the ports in `WARD_HOST_PORTS` (default `3773`, plus DNS) and the project's own, set with `ward enable <repo> --host-ports 39003,…`. The flag replaces the project's list, and a ward picks up a new list only when it next starts: `ward enable` names the running wards still on the old one (`ward stop` them to apply it now). A forwarded host port is taken inside the ward, so a server in the ward can't listen on it (`EADDRINUSE`). Port 53, adb's ports (5037 and 5038, which reach the ward's own device), emulator ports (5554–5585), Ward's own host ports (20100–29999) and lists over 200 ports in all are refused. In a ward, `WARD_FORWARDED_PORTS` lists what it reaches. From inside a ward, `ward` can only map that ward's ports, start its desktop, start and stop its device and list it; stopping, removing or starting wards, and anything about another ward, is for the host. `/tmp` and `XDG_RUNTIME_DIR` are the host's, shared by every ward, so keep per-worktree pid files and sockets in `TMPDIR`. Inside a ward, `ps` shows only the ward's own processes and `kill` reaches nothing else; there is no `systemctl --user` and the session bus reaches only the keyring; Ward's own state, config and checkout are read-only; and Ward's T3 token and T3's `userdata` (except `attachments`) are hidden. [DESIGN.md](docs/DESIGN.md) lists what a ward can still reach on purpose. Miranda's store (`~/.local/share/miranda`) is hidden there apart from its shell hook's folder; Miranda's MCP tools still work, its CLI doesn't.
-
-Each ward has its own Gradle home at `~/.gradle` and its own Kotlin daemon folder, so wards never wait on each other's locks or stop each other's daemons. A ward whose worktree has a Gradle build (at its root or one folder down, such as `android/`) gets a copy of your dependency caches and wrapper when it is created; other wards start with an empty home. A ward's dependencies are a snapshot from when it was created, and a dependency added later is downloaded once in each ward. Your `gradle.properties` and `init.d` are read-only in a ward and follow yours when it starts and at an explicit `ward up` (a running ward gets no change otherwise), with idle daemons stopping after 10 minutes unless your file sets `org.gradle.daemon.idletimeout`. Builds with `org.gradle.caching=true` share a build cache with the project's other wards through `wardd`, unless the project sets up a remote cache of its own; any ward of a project can write an entry the others use. It lives in `~/.local/state/ward/build-cache/<repo>`, and deleting a project's folder there clears its cache; `--no-build-cache` skips it for one build, `--offline` builds in a ward don't use it, and your host builds don't read it. It is capped at `WARD_BUILD_CACHE_MAX` (default `10G`). On an Android project a ward that has built holds about 4.5 GB in its Gradle and Kotlin daemons until they exit, about 10 minutes after its last build.
-
-Connections through a mapped port end with a reset when their ward stops or `wardd` restarts, so a transfer in flight fails rather than looking complete.
-
-## Upgrade
-
-`git pull`, then `systemctl --user restart wardd`, and `bin/ward install` again when `units/` changed. The restart resets connections open through mapped ports and cuts adb commands running in wards, which work when run again; wards and what else runs in them carry on. Running wards keep the settings they started with (their TCP table size, host ports) until they next start, and a ward started before wards had their own Gradle home keeps the shared one until it is stopped and started. Likewise a ward started before wards had devices keeps reaching the host's adb server, with every device on it, and has no device of its own until it is stopped and started. Ward devices keep running through the restart.
+[docs/OPERATIONS.md](docs/OPERATIONS.md) covers lifecycle, desktops, devices, limits, Gradle and upgrades.
 
 ## Develop
 

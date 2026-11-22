@@ -2,6 +2,8 @@
 
 Status: approved 2026-11-19 and built. Where the build departed from the draft, this file now describes what was built.
 
+Names used here: gaia-arch is the Arch Linux workstation Ward was built on, and omarchy-config the repo recording its setup; Annex is the T3 Code fork that carries Ward's hook; Puck, Caliban and Miranda are the author's own (private) tools for driving a desktop, capturing its audio and recording a screen and terminal timeline.
+
 ## Problem
 
 T3 gives each thread its own git worktree, so files don't collide. Everything else on gaia-arch is shared: the loopback port space (two Vite servers both want 5173), Docker (shared daemon, published ports, fixed `container_name`s), `/tmp`-based caches such as Metro's, and the adb server. Ward gives each worktree a private copy of those, created on demand and removed when the worktree goes away.
