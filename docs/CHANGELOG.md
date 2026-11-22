@@ -20,5 +20,6 @@ All notable changes to Ward are recorded here. The format follows [Keep a Change
 
 ### Fixed
 
+- An app installed from the host (a Gradle `installDebug` or `adb install`) while Ward builds its base image no longer ends up in every ward's device: the image is built where no adb server can see it.
 - The first adb command right after a ward started could find no device and fail once: the ward now counts as started only when its adb port is ready.
 - Transfers through a ward's mapped ports no longer stall on protocols that send small acknowledgements: such traffic could run twenty times slower through a ward than on the host.

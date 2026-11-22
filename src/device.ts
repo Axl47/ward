@@ -41,6 +41,21 @@ const BASE_UNIT = deviceUnitName("base"); // no ward's: a ward's id has a dot
  * without a port takes the lowest free one, so yours and Ward's meet last.
  */
 const PORTS = Array.from({ length: 13 }, (_, i) => 5584 - 2 * i);
+/**
+ * Console ports a base image build may take (its adb port is the next), above the
+ * range adb servers scan, so no adb server ever finds it. Each is also paired with
+ * the port the emulator is told the adb server is on (+ BASE_ADB_SERVER_OFFSET),
+ * free when the build starts, so it never announces itself to the host's.
+ */
+const BASE_PORTS = [5690, 5692, 5694];
+const BASE_ADB_SERVER_OFFSET = 100;
+/**
+ * The emulator runs an adb command of its own once Android is up, which starts an
+ * adb server on that port, in the build's unit, gone with it. This keeps that
+ * server from finding anything but the base image: no USB, no mDNS, and no scan
+ * of the ports emulators are on.
+ */
+const BASE_ADB_ENV = { ADB_USB: "0", ADB_MDNS: "0", ADB_LOCAL_TRANSPORT_MAX_PORT: "5553" };
 
 /** "90s", "15m" or "2h" in milliseconds; undefined for anything else. */
 export function parseDuration(text: string): number | undefined {
@@ -86,11 +101,10 @@ interface Device {
 const devices = new Map<string, Device>();
 /** The last start or stop of each ward's device, which the next one waits for. */
 const turns = new Map<string, Promise<unknown>>();
-/** Each ward's console port, kept from one device to its next so its serial stays the same; "base" while a base image builds. */
+/** Each ward's console port, kept from one device to its next so its serial stays the same. */
 const ports = new Map<string, number>();
 /** When each device's last use was last written down (see useDevice). */
 const noted = new Map<string, number>();
-let building: { readonly serial: string; readonly startedAt: string } | undefined;
 
 const runDir = (owner: string) => join(DEVICE_DIR, "run", owner);
 const info = ({ serial, ward, worktree, state, startedAt }: Device): DeviceInfo => ({ serial, ward, worktree, state, startedAt });
@@ -192,9 +206,11 @@ function ensureBase(): Promise<string> {
 /**
  * Build a base image: a new AVD, booted once writable with no window, and stopped
  * with SIGINT once Android is up, which makes the emulator save the `default_boot`
- * snapshot every device then starts from. While it boots it is on the host's adb
- * server like any emulator; `ward devices` lists it as `building`, so T3 keeps
- * everyone off it: what changed on it would be in every ward's device.
+ * snapshot every device then starts from. No adb server anyone uses ever sees it:
+ * it listens outside the range adb servers scan and is told the adb server is on a
+ * port of its own, so an install from the host can't land on it (what changed on
+ * it would be in every ward's device). Its boot is read from its log instead of
+ * asked over adb.
  */
 async function buildBase({ name, ini, config }: ReturnType<typeof currentBase>): Promise<string> {
   const dir = join(AVD_HOME, `${name}.avd`);
@@ -209,10 +225,12 @@ async function buildBase({ name, ini, config }: ReturnType<typeof currentBase>):
     mkdirSync(dir, { recursive: true });
     writeFileSync(join(AVD_HOME, `${name}.ini`), `avd.ini.encoding=UTF-8\npath=${dir}\n${ini}\n`);
     writeFileSync(join(dir, "config.ini"), config);
-    const port = await exclusive(() => pickPort("base"));
-    building = { serial: `emulator-${port}`, startedAt: new Date().toISOString() };
-    const pid = await startEmulator(BASE_UNIT, "Ward's base Android image, being built", name, port, tmp, logFile);
-    await booted(building.serial, name, BASE_UNIT, pid, logFile, COLD_BOOT_MS);
+    const port = await pickBasePort();
+    const pid = await startEmulator(BASE_UNIT, "Ward's base Android image, being built", name, tmp, logFile, ["-ports", `${port},${port + 1}`], {
+      ANDROID_ADB_SERVER_PORT: String(port + BASE_ADB_SERVER_OFFSET),
+      ...BASE_ADB_ENV,
+    });
+    await bootLogged(BASE_UNIT, pid, logFile, COLD_BOOT_MS);
     await sleep(SETTLE_MS);
     await systemctl("kill", "--kill-whom=main", "--signal=INT", BASE_UNIT);
     for (const deadline = Date.now() + SAVE_MS; alive(BASE_UNIT, pid); await sleep(200))
@@ -226,8 +244,6 @@ async function buildBase({ name, ini, config }: ReturnType<typeof currentBase>):
     removeBase(name);
     throw new Error(`could not build the base image for ward devices: ${message(error)}`);
   } finally {
-    building = undefined;
-    ports.delete("base");
     rmSync(tmp, { recursive: true, force: true });
   }
 }
@@ -256,8 +272,10 @@ function distrustBase(avd: string): void {
  * (the default is /tmp, which is memory), and its own, because the emulator
  * finds its radio simulator (netsimd) through the temp folder, so each gets one
  * that stops with its unit rather than sharing the one your emulators use.
+ * `flags` says which ports it listens on (`-port`, or `-ports`) and anything else
+ * that differs; `env` is added to the emulator's environment.
  */
-async function startEmulator(unit: string, description: string, avd: string, port: number, dir: string, logFile: string, flags: readonly string[] = []): Promise<number> {
+async function startEmulator(unit: string, description: string, avd: string, dir: string, logFile: string, flags: readonly string[], env: Readonly<Record<string, string>> = {}): Promise<number> {
   mkdirSync(dir, { recursive: true });
   await run("chattr", ["+C", dir]).catch(() => undefined); // overlays are rewritten in place: no copy-on-write, where the filesystem has it
   await run("systemd-run", [
@@ -276,8 +294,9 @@ async function startEmulator(unit: string, description: string, avd: string, por
     `--setenv=ANDROID_HOME=${SDK}`,
     `--setenv=ANDROID_SDK_ROOT=${SDK}`,
     `--setenv=TMPDIR=${dir}`,
+    ...Object.entries(env).map(([key, value]) => `--setenv=${key}=${value}`),
     join(SDK, "emulator/emulator"),
-    "-avd", avd, "-port", String(port), "-no-window", "-no-audio", "-no-boot-anim", "-no-metrics", "-gpu", GPU,
+    "-avd", avd, "-no-window", "-no-audio", "-no-boot-anim", "-no-metrics", "-gpu", GPU,
     ...flags,
   ]);
   return Number((await systemctl("show", "--property=MainPID", "--value", unit)).stdout.trim());
@@ -289,6 +308,20 @@ async function startEmulator(unit: string, description: string, avd: string, por
  * every wardd restart, cutting T3 off its devices.
  */
 export const startHostAdb = () => run("systemd-run", ["--user", "--scope", "--quiet", "--collect", HOST_ADB, "start-server"], { timeout: 30_000 });
+
+/**
+ * Wait until the emulator's log says Android has booted, for a base image build,
+ * which has no adb server to ask. Throws, with the end of the log, if the emulator
+ * exits first or takes longer than `timeoutMs`.
+ */
+async function bootLogged(unit: string, pid: number, logFile: string, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!/Boot completed in \d+ ms/.test(read(logFile))) {
+    if (!alive(unit, pid)) throw new Error(`the emulator exited${tail(logFile)}`);
+    if (Date.now() > deadline) throw new Error(`Android did not boot within ${timeoutMs / 1000} s${tail(logFile)}`);
+    await sleep(250);
+  }
+}
 
 /**
  * Wait until Android on `serial` has booted and answers: `sys.boot_completed`
@@ -340,7 +373,7 @@ async function pickPort(owner: string): Promise<number> {
   const candidates = [
     ...(own === undefined ? [] : [own]),
     ...PORTS.filter((port) => !held.has(port)),
-    ...PORTS.filter((port) => held.has(port) && held.get(port) !== "base" && !devices.has(held.get(port)!)),
+    ...PORTS.filter((port) => held.has(port) && !devices.has(held.get(port)!)),
   ];
   for (const port of candidates) {
     if (!(await canListen(port)) || !(await canListen(port + 1))) continue;
@@ -350,6 +383,13 @@ async function pickPort(owner: string): Promise<number> {
     return port;
   }
   throw new Error(`no emulator port is free between ${PORTS.at(-1)} and ${PORTS[0]}`);
+}
+
+/** The first console port of BASE_PORTS whose adb port and announcement port are free too. */
+async function pickBasePort(): Promise<number> {
+  for (const port of BASE_PORTS)
+    if ((await canListen(port)) && (await canListen(port + 1)) && (await canListen(port + BASE_ADB_SERVER_OFFSET))) return port;
+  throw new Error(`no emulator port is free among ${BASE_PORTS.join(", ")}`);
 }
 
 let queue: Promise<unknown> = Promise.resolve();
@@ -427,7 +467,7 @@ async function boot(id: string, worktree: string, wanted: () => boolean): Promis
   try {
     rmSync(dir, { recursive: true, force: true });
     if (!wanted()) throw stopped();
-    device.pid = await startEmulator(unit, `Ward device of ${id}`, avd, device.port, dir, logFile, ["-read-only", "-no-snapshot-save"]);
+    device.pid = await startEmulator(unit, `Ward device of ${id}`, avd, dir, logFile, ["-port", String(device.port), "-read-only", "-no-snapshot-save"]);
     await booted(device.serial, avd, unit, device.pid, logFile, BOOT_MS, wanted);
     device.state = "ready";
     writeFileSync(join(dir, "device.json"), JSON.stringify(device));
@@ -522,13 +562,9 @@ export function useDevice(id: string, until = Date.now()): void {
   }
 }
 
-/** Every serial Ward owns, for `ward devices`: each ward's device, and a base image while it builds. */
+/** Every serial Ward owns, for `ward devices`: each ward's device. */
 export function listDevices(): DeviceList {
-  const running = [...devices.keys()].flatMap((id) => deviceOf(id) ?? []).filter((d) => !d.stopping).map(info);
-  return {
-    avds: baseNames(),
-    devices: building === undefined ? running : [...running, { ...building, ward: null, worktree: null, state: "building" }],
-  };
+  return { avds: baseNames(), devices: [...devices.keys()].flatMap((id) => deviceOf(id) ?? []).filter((d) => !d.stopping).map(info) };
 }
 
 /**
