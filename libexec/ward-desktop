@@ -65,13 +65,14 @@ if [ -n "${2:-}" ]; then
 else
   dir=$WARD_RUNTIME/d$$
   mkdir -p "$WARD_RUNTIME/$1/desktop"
-  own_link=$dir
 fi
-if [ -n "$own_link" ] || [ ! -e "$dir" ]; then
+# A ward's own view of the folder lacks the link wardd made (libexec/ward-init-root).
+if [ -z "${2:-}" ] || [ ! -e "$dir" ]; then
   for old in "$WARD_RUNTIME"/d[0-9]*; do
     [ "$(readlink "$old" 2>/dev/null)" != "$1/desktop" ] || rm -f "$old"
   done
   ln -sfn "$1/desktop" "$dir"
+  own_link=$dir
 fi
 mkdir -p "$dir/services"
 # `ward desktop` treats the desktop as up while this process lives; it waits for

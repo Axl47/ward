@@ -223,6 +223,25 @@ function prepareGradle(record: WardRecord): string | undefined {
  * time, if its worktree has a Gradle build) when `gradleHome` is set, its Kotlin daemon
  * folder, and agent-device's home. Each that fails is logged and left out.
  */
+/**
+ * The ward's own adb key pair, which ward-init-root mounts over yours (~/.android/adbkey and
+ * adbkey.pub): a phone paired for wireless debugging trusts yours, and nothing trusts the
+ * ward's. Made once per boot in the ward's runtime folder, which only that ward sees. Without
+ * it the ward gets empty files over yours, and its adb has no key.
+ */
+async function prepareAdbKey(id: string): Promise<void> {
+  const key = join(wardRuntimeDir(id), "adbkey");
+  if (existsSync(key) && existsSync(`${key}.pub`)) return;
+  try {
+    mkdirSync(dirname(key), { recursive: true });
+    await run(HOST_ADB, ["keygen", key], { timeout: 30_000 });
+  } catch (error) {
+    rmSync(key, { force: true });
+    rmSync(`${key}.pub`, { force: true });
+    log(`ward ${id}: starts without an adb key of its own: ${error instanceof Error ? error.message.split("\n")[0] : String(error)}`);
+  }
+}
+
 async function prepareOwnHomes(record: WardRecord, gradleHome: string | undefined): Promise<void> {
   const rt = wardRuntimeDir(record.id);
   rmSync(join(rt, "own-homes"), { force: true });
@@ -360,6 +379,7 @@ async function up(worktree: string): Promise<UpResult> {
       writeHostPorts(record);
       prepareDeviceFolders();
       await prepareOwnHomes(record, gradleHome);
+      await prepareAdbKey(record.id);
     }
     writeEnvFile(record, gradleHome);
     if (starting) {
@@ -525,7 +545,7 @@ async function desktop(id: string, worktree?: string): Promise<Record<string, ne
 
 /**
  * A new short name for ward `id`'s desktop folder (see libexec/ward-desktop), as a
- * link in Ward's runtime folder, which the ward itself can't write. Its earlier
+ * link in Ward's runtime folder, which the ward doesn't see: it makes the same link in its own view. Its earlier
  * names go first. The number is random and above any pid, so it never meets the
  * d<pid> name a thread's desktop gives itself, and a command holding an earlier
  * desktop's name can't reach this one.
@@ -1707,11 +1727,18 @@ async function main(): Promise<void> {
   rmSync(CONTROL_SOCKET, { force: true });
   const server = createHttpServer((req, res) => void handle(req, res));
   server.listen(CONTROL_SOCKET, () => {
-    // Running wards reach the new socket through this link (paths.ts: CONTROL_DIR).
-    mkdirSync(CONTROL_DIR, { recursive: true });
-    rmSync(join(CONTROL_DIR, "wardd.sock"), { force: true });
-    linkSync(CONTROL_SOCKET, join(CONTROL_DIR, "wardd.sock"));
     log(`wardd listening on ${CONTROL_SOCKET}`);
+    // Running wards reach the new socket through this link (paths.ts: CONTROL_DIR), replaced
+    // in one step so none of them finds it missing.
+    const tmp = join(CONTROL_DIR, `wardd.sock.${process.pid}`);
+    try {
+      mkdirSync(CONTROL_DIR, { recursive: true });
+      rmSync(tmp, { force: true });
+      linkSync(CONTROL_SOCKET, tmp);
+      renameSync(tmp, join(CONTROL_DIR, "wardd.sock"));
+    } catch (error) {
+      log(`could not link the control socket into ${CONTROL_DIR}, so wards can't reach wardd: ${String(error)}`);
+    }
   });
   for (const record of wards.values()) {
     if (isReady(record.id)) attach(record);

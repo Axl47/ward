@@ -59,8 +59,8 @@ ward_enter() {
 # Activity records, for a recorder on the host (Miranda's Mneme) that profiles how
 # agents work. The recorder switches them on by keeping $WARD_RUNTIME/activity/on
 # fresh: its first word is the time it was last written, in epoch seconds, and it
-# counts for 30 s. wardd creates the folder and every ward has an empty one in its
-# place (libexec/ward-init-root), so what is written here can't be read or forged
+# counts for 30 s. wardd creates the folder and no ward sees it
+# (libexec/ward-init-root), so what is written here can't be read or forged
 # from inside a ward. Only commands of a T3 thread are recorded (a terminal of yours
 # has no T3CODE_THREAD_ID), and only by a bash that has $EPOCHREALTIME; with no
 # recorder, `ward exec` runs exactly as before.

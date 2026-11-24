@@ -51,9 +51,10 @@ st=$WARD_STATE/wards/$id
 # - The Gradle build cache wardd keeps for every project is hidden.
 # - Your AVDs (~/.android/avd) are hidden: an emulator started in a ward would run
 #   from their disks. A ward's device is Ward's own, on the host.
-# - Your adb key (~/.android/adbkey), which a phone paired for wireless debugging
-#   trusts, is covered by the ward's own ($rt/adbkey, from ward-init), which nothing
-#   trusts; its device doesn't ask for one (ro.adb.secure=0 on google_apis images).
+# - Your adb key pair (~/.android/adbkey and .pub), which a phone paired for
+#   wireless debugging trusts, is covered by the ward's own ($rt/adbkey, from wardd:
+#   src/daemon.ts prepareAdbKey), which nothing trusts, or by empty files; its device
+#   doesn't ask for a key (ro.adb.secure=0 on google_apis images).
 # - agent-device's home (~/.agent-device: its daemon's state, token and device
 #   claims) is the ward's own, like the Gradle home below; without that, an empty one.
 # - Your Gradle home and Kotlin daemon folder are the ward's own, so wards share
@@ -64,8 +65,9 @@ st=$WARD_STATE/wards/$id
 # where the host looks.
 lock_down() {
   local uid=$WARD_HOST_UID p a held=" " ancestors=() protected=() miranda=${MIRANDA_HOME:-$HOME/.local/share/miranda}
-  local avds=${ANDROID_AVD_HOME:-$HOME/.android/avd} adbkey
+  local avds=${ANDROID_AVD_HOME:-$HOME/.android/avd} adbkey adbpub
   adbkey=$(readlink -f -- "$HOME/.android/adbkey") || adbkey=
+  adbpub=$(readlink -f -- "$HOME/.android/adbkey.pub") || adbpub=
   # agent-device's home at its real path, where the ward's own (or an empty one) goes,
   # noted while Ward's runtime folder is still writable: wardd reads its daemon's ports
   # there (src/daemon.ts: agentDevicePorts), and the ward can retarget the link later.
@@ -79,7 +81,7 @@ lock_down() {
     while read -r name path; do names+=("$name"); paths+=("$path"); done <"$rt/own-homes"
   fi
   for p in "$WARD_STATE" "$WARD_CONFIG" "$WARD_RUNTIME" "$WARD_HOME" "$HOME"/.t3*/userdata "$(readlink -f -- "$WARD_T3/userdata")" "$miranda" "$(readlink -f -- "$avds")" \
-           "/run/user/$uid/systemd" "/run/user/$uid/bus" "${XDG_RUNTIME_DIR:-}/systemd" "${XDG_RUNTIME_DIR:-}/bus" "${paths[@]}" "$adh" "$adbkey"; do
+           "/run/user/$uid/systemd" "/run/user/$uid/bus" "${XDG_RUNTIME_DIR:-}/systemd" "${XDG_RUNTIME_DIR:-}/bus" "${paths[@]}" "$adh" "$adbkey" "$adbpub"; do
     [ -e "$p" ] && [ ! -L "$p" ] || continue
     p=$(readlink -f -- "$p")
     [[ " ${protected[*]} " != *" $p "* ]] || continue
@@ -126,7 +128,7 @@ lock_down() {
         hide_except "$p" "$id" control device-hosts
         rw "$rt/desktop"; rw "$rt/podman"
         for a in "$rt" "$p/control" "$p/device-hosts"; do [ ! -d "$a" ] || seal "$a"; done
-        mount -o remount,bind,rw "$p"
+        mount -o remount,bind,rw,nosuid,nodev "$p"
         ln -s control/wardd.sock "$p/wardd.sock"
         # Among what is gone: every thread's commands as `ward exec` records them (bin/ward:
         # ward_record_start). Reported to ward-init, which notes it where the ward can't write:
@@ -149,9 +151,13 @@ lock_down() {
       */userdata) hide_except "$p" attachments ;;
       */bus) if [ -S "$rt/bus" ]; then mount --bind "$rt/bus" "$p"; else mount --bind /dev/null "$p"; fi ;;
       */systemd) mount -t tmpfs -o ro,mode=0755,size=4k tmpfs "$p" ;;
-      "$adbkey")
-        { if [ -s "$rt/adbkey" ]; then mount --bind "$rt/adbkey" "$p"; else mount --bind /dev/null "$p"; fi && seal "$p"; } ||
-          { echo "ward: could not hide your adb key ($p), so the ward does not start" >&2; return 1; } ;;
+      # Both halves: adb offers the public key from adbkey.pub, and a phone shown yours would
+      # ask to trust it with your computer's name.
+      "$adbkey" | "$adbpub")
+        a=$rt/adbkey
+        [ "$p" != "$adbpub" ] || a=$rt/adbkey.pub
+        [ -s "$rt/adbkey" ] && [ -s "$rt/adbkey.pub" ] || a=/dev/null
+        { mount --bind "$a" "$p" && seal "$p"; } || { echo "ward: could not hide your adb key ($p), so the ward does not start" >&2; return 1; } ;;
     esac
   done
   # ro_over SRC DST: SRC, which wardd keeps in the ward's runtime folder, read-only over
