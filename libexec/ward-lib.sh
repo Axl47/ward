@@ -32,6 +32,17 @@ $_denv
 ENV
 }
 
+# What a command entering a ward must not carry in from the host: Claude's shell
+# hook (Annex's CLAUDE_CODE_SHELL_PREFIX) lives in a folder the ward hides, and a
+# Claude started inside the ward is already there, so it would only break.
+WARD_ENTER_UNSET="CLAUDE_CODE_SHELL_PREFIX"
+
+# Drop WARD_ENTER_UNSET from this shell, before it joins a ward (ward_enter).
+ward_enter_env() {
+  # shellcheck disable=SC2086
+  unset $WARD_ENTER_UNSET
+}
+
 # ID map for every ward's user namespace: your uid/gid stays itself (1000 → 1000),
 # root and the other ids come from your subuid/subgid range.
 ward_map_args() {
