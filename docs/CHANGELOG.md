@@ -21,6 +21,9 @@ All notable changes to Ward are recorded here. The format follows [Keep a Change
 
 ### Fixed
 
+- A ward could connect to sockets in other wards' runtime folders: drive another ward's Podman as its root, or another desktop's compositor and session bus. A ward now sees only its own folder there. Restart running wards: until then they keep that reach, also into wards started after them.
+- A ward could read your adb key, which a phone paired for wireless debugging trusts, and connect to that phone. A ward now sees empty key files and its adb has no key; its own device needs none. If you have no adb key, Ward makes one before a ward starts. Restart running wards: until then they can still read the key.
+- A ward's own Podman socket could come up private after a restart, refusing the ward's `podman` and `docker`.
 - A ward could read the token of T3's device daemon and, through it, drive any device on the host's adb server, read and write files the ward can't see, and run code on the host. A ward started now sees no token and can't reach that daemon. Restart running wards: until then they keep both.
 - A ward could reach every port on the host's loopback through its network gateway, including the host's adb server (your phone and every emulator) and T3's device daemon. Only the forwarded ports are reachable now, in wards started after this.
 - An app installed from the host (a Gradle `installDebug` or `adb install`) while Ward builds its base image no longer ends up in every ward's device: the image is built where no adb server can see it.

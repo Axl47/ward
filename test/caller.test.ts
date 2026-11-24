@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
 
@@ -28,9 +28,9 @@ function namespace(): ChildProcess {
 }
 
 /** Send one request to wardd from inside `holder`'s namespaces (or the host's): [status, body]. */
-function call(holder: ChildProcess | undefined, route: string, body: unknown = {}): [number, string] {
+function call(holder: ChildProcess | undefined, route: string, body: unknown = {}, via = socket): [number, string] {
   const [method, path] = route.split(" ");
-  const client = `const r=require("node:http").request({socketPath:${JSON.stringify(socket)},method:${JSON.stringify(method)},path:${JSON.stringify(path)}},(res)=>{let d="";res.on("data",(c)=>d+=c);res.on("end",()=>console.log(res.statusCode+" "+d))});r.end(${method === "GET" ? "" : JSON.stringify(JSON.stringify(body))})`;
+  const client = `const r=require("node:http").request({socketPath:${JSON.stringify(via)},method:${JSON.stringify(method)},path:${JSON.stringify(path)}},(res)=>{let d="";res.on("data",(c)=>d+=c);res.on("end",()=>console.log(res.statusCode+" "+d))});r.end(${method === "GET" ? "" : JSON.stringify(JSON.stringify(body))})`;
   const argv = holder === undefined ? [process.execPath, "-e", client] : ["nsenter", "-U", "-n", "-t", String(holder.pid), "--preserve-credentials", "--", process.execPath, "-e", client];
   const out = spawnSync(argv[0]!, argv.slice(1), { encoding: "utf8" }).stdout.trim();
   const space = out.indexOf(" ");
@@ -88,4 +88,11 @@ test("a ward sees only itself and can't act on another ward", { skip: !userns &&
 
 test("a caller in no ward's namespace is refused", { skip: !userns && "needs unprivileged user namespaces" }, () => {
   assert.equal(call(stranger, "GET /ls")[0], 403);
+});
+
+test("wards reach wardd through the link it keeps in control/", { skip: !userns && "needs unprivileged user namespaces" }, () => {
+  // A ward sees only control/ of the runtime folder's top (libexec/ward-init-root).
+  const link = join(root, "run/ward/control/wardd.sock");
+  assert.equal(statSync(link).ino, statSync(socket).ino);
+  assert.equal(call(a, "GET /ls", {}, link)[0], 200);
 });
