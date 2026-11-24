@@ -63,7 +63,7 @@ lock_down() {
     while read -r name path; do names+=("$name"); paths+=("$path"); done <"$rt/own-homes"
   fi
   for p in "$WARD_STATE" "$WARD_CONFIG" "$WARD_RUNTIME" "$WARD_HOME" "$HOME"/.t3*/userdata "$WARD_T3/userdata" "$miranda" "$(readlink -f -- "$avds")" \
-           "/run/user/$uid/systemd" "/run/user/$uid/bus" "${XDG_RUNTIME_DIR:-}/systemd" "${XDG_RUNTIME_DIR:-}/bus" "${paths[@]}"; do
+           "/run/user/$uid/systemd" "/run/user/$uid/bus" "${XDG_RUNTIME_DIR:-}/systemd" "${XDG_RUNTIME_DIR:-}/bus" "${paths[@]}" "$(readlink -f -- "$HOME/.agent-device")"; do
     [ -e "$p" ] && [ ! -L "$p" ] || continue
     p=$(readlink -f -- "$p")
     [[ " ${protected[*]} " != *" $p "* ]] || continue

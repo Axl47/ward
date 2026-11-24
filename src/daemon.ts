@@ -4,7 +4,7 @@
 // the Gradle build cache a project's wards share (src/gradle.ts), and gives each
 // ward an Android device of its own (src/device.ts).
 import { execFile, spawn, type ChildProcess } from "node:child_process";
-import { closeSync, existsSync, fstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, readSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, watch, writeFileSync, type FSWatcher } from "node:fs";
+import { closeSync, constants, existsSync, fstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, readSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, watch, writeFileSync, type FSWatcher } from "node:fs";
 import { createServer as createHttpServer, request as httpRequest, type ClientRequest, type IncomingMessage, type ServerResponse } from "node:http";
 import { type Server, type Socket } from "node:net";
 import { homedir, userInfo } from "node:os";
@@ -63,7 +63,10 @@ const DESKTOP_TIMEOUT_MS = 8_000;
 /** A running ward's in-memory plumbing. */
 interface LiveWard {
   readonly broker: ChildProcess;
+  /** In the ward's user and network namespaces only, so /proc/<brokerPid>/root is the host's view. */
   readonly brokerPid: number;
+  /** The ward's own process from its `pid` file, in its mount namespace: /proc/<wardPid>/root is the ward's view. */
+  readonly wardPid: number;
   /** Ward port → host-side listener. */
   readonly listeners: Map<number, Server>;
   /** Ward port → addresses to dial, from the last socket scan. */
@@ -861,6 +864,7 @@ function attach(record: WardRecord): void {
   const ward: LiveWard = {
     broker,
     brokerPid: broker.pid,
+    wardPid: pid,
     listeners: new Map(),
     listening: new Map(),
     pending: new Map(),
@@ -979,7 +983,7 @@ function scan(id: string): Promise<unknown> {
   }
   for (const port of ward.containerPorts) if (!found.has(port)) found.set(port, ["127.0.0.1"]);
   // The broker's own listeners, and the ward's adb server and agent-device daemon, which only the ward is to reach.
-  for (const port of [BUILD_CACHE_PORT, ADB_PORT, ADB_SERVER_PORT, ...ward.devicePorts, ...agentDevicePorts(id)]) found.delete(port);
+  for (const port of [BUILD_CACHE_PORT, ADB_PORT, ADB_SERVER_PORT, ...ward.devicePorts, ...agentDevicePorts(ward.wardPid)]) found.delete(port);
   ward.listening.clear();
   // Close listeners whose port went quiet, so the host sees "refused", not accept-then-reset.
   // The registry keeps the port number for when it listens again.
@@ -1300,10 +1304,15 @@ function watchDeviceHosts(): void {
   deviceHostsWatch = undefined;
   if (ino === undefined) return;
   let soon: NodeJS.Timeout | undefined;
-  const watcher = watch(DEVICE_HOSTS, () => {
-    clearTimeout(soon);
-    soon = setTimeout(refreshDeviceHosts, 100);
-  });
+  let watcher: FSWatcher;
+  try {
+    watcher = watch(DEVICE_HOSTS, () => {
+      clearTimeout(soon);
+      soon = setTimeout(refreshDeviceHosts, 100);
+    });
+  } catch (error) {
+    return log(`cannot follow T3's device configs, so wards get new ones at the next reconcile: ${String(error)}`);
+  }
   watcher.on("error", () => {
     watcher.close();
     if (deviceHostsWatch?.watcher === watcher) deviceHostsWatch = undefined;
@@ -1313,20 +1322,28 @@ function watchDeviceHosts(): void {
 
 /**
  * The ports agent-device's daemon in the ward listens on, from the daemon.json in
- * the ward's own agent-device home: only the ward reaches it, and a new one each
- * start would take another of the ward's host ports. The ward writes the file, so
- * it decides only what isn't mapped.
+ * agent-device's home as the ward sees it (its own folder, or the empty one
+ * ward-init-root falls back to): only the ward reaches it, and a new one each start
+ * would take another of the ward's host ports. The ward writes the file, so it decides
+ * only what isn't mapped, and it is opened so that a link or a FIFO can't make wardd
+ * read elsewhere or wait. The daemon listens just before it writes the file, so a scan
+ * in between still maps that port, rarely.
  */
-function agentDevicePorts(id: string): number[] {
+function agentDevicePorts(wardPid: number): number[] {
+  let fd: number | undefined;
   try {
-    const file = join(wardStateDir(id), "agent-device", "daemon.json");
-    const stat = statSync(file, { throwIfNoEntry: false });
-    if (stat === undefined || !stat.isFile() || stat.size > 64 * 1024) return [];
-    const info: unknown = JSON.parse(readFileSync(file, "utf8"));
+    fd = openSync(`/proc/${wardPid}/root${AGENT_DEVICE_HOME}/daemon.json`, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    const stat = fstatSync(fd);
+    if (!stat.isFile() || stat.size > 64 * 1024) return [];
+    const size = stat.size;
+    const buffer = Buffer.alloc(size);
+    const info: unknown = JSON.parse(buffer.subarray(0, readSync(fd, buffer, 0, size, 0)).toString("utf8"));
     if (typeof info !== "object" || info === null) return [];
-    return [("port" in info && info.port), ("httpPort" in info && info.httpPort)].filter((p): p is number => typeof p === "number");
+    return ["port" in info && info.port, "httpPort" in info && info.httpPort].filter((p): p is number => typeof p === "number");
   } catch {
     return [];
+  } finally {
+    if (fd !== undefined) closeSync(fd);
   }
 }
 
