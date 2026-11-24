@@ -21,6 +21,7 @@ All notable changes to Ward are recorded here. The format follows [Keep a Change
 
 ### Fixed
 
+- A ward could start containers as you outside the ward, through your rootless Podman's API socket (`$XDG_RUNTIME_DIR/podman/podman.sock`), and every `podman` command in a ward deleted your Podman's `pause.pid`. A ward now sees an empty folder in place of each; its own `podman` and `docker` work as before. Restart running wards: until then they keep both.
 - A ward could connect to sockets in other wards' runtime folders: drive another ward's Podman as its root, or another desktop's compositor and session bus. A ward now sees only its own folder there. Restart running wards: until then they keep that reach, also into wards started after them.
 - A ward could read your adb key, which a phone paired for wireless debugging trusts, and connect to that phone. A ward now sees empty key files and its adb has no key; its own device needs none. If you have no adb key, Ward makes one before a ward starts. Restart running wards: until then they can still read the key.
 - A ward's own Podman socket could come up private after a restart, refusing the ward's `podman` and `docker`.
