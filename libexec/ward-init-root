@@ -26,6 +26,11 @@ st=$WARD_STATE/wards/$id
 #   the ward's own state folder (TMPDIR, Podman), its desktop's folder and its
 #   Podman socket's folder: the host trusts these files (it runs the checkout,
 #   sources the env file, reads the enable markers that set the host ports).
+# - Of Ward's runtime folder the ward sees only its own folder, wardd's socket
+#   (through control/) and device-hosts: other wards' folders and thread desktops'
+#   hold sockets (Podman's, a desktop's compositor and bus) that read-only doesn't
+#   stop a connection to. The folder itself is a tmpfs of the ward's, which the
+#   host never reads, so it stays writable there: ward-desktop names its desktop in it.
 # - Of Ward's state folder the ward sees only its own folder and the shared image
 #   store (read-only): every ward's container root is the same host uid (one
 #   subuid range), so other wards' stores, the trash and thread desktops' data
@@ -46,6 +51,11 @@ st=$WARD_STATE/wards/$id
 # - The Gradle build cache wardd keeps for every project is hidden.
 # - Your AVDs (~/.android/avd) are hidden: an emulator started in a ward would run
 #   from their disks. A ward's device is Ward's own, on the host.
+# - Your adb key pair (~/.android/adbkey and .pub), which a phone paired for
+#   wireless debugging trusts, is covered by empty files, so the ward's adb has no
+#   key: none to sign with, and none to offer a phone that would ask whether to
+#   trust it. Its device asks for none (ro.adb.secure=0 on google_apis images).
+#   With no key to cover, ~/.android is an empty one of the ward's.
 # - agent-device's home (~/.agent-device: its daemon's state, token and device
 #   claims) is the ward's own, like the Gradle home below; without that, an empty one.
 # - Your Gradle home and Kotlin daemon folder are the ward's own, so wards share
@@ -56,7 +66,11 @@ st=$WARD_STATE/wards/$id
 # where the host looks.
 lock_down() {
   local uid=$WARD_HOST_UID p a held=" " ancestors=() protected=() miranda=${MIRANDA_HOME:-$HOME/.local/share/miranda}
-  local avds=${ANDROID_AVD_HOME:-$HOME/.android/avd}
+  local avds=${ANDROID_AVD_HOME:-$HOME/.android/avd} adbkey adbpub
+  adbkey=$(readlink -f -- "$HOME/.android/adbkey") || adbkey=
+  adbpub=$(readlink -f -- "$HOME/.android/adbkey.pub") || adbpub=
+  local nokey=
+  [ -f "$adbkey" ] || nokey=1
   # agent-device's home at its real path, where the ward's own (or an empty one) goes,
   # noted while Ward's runtime folder is still writable: wardd reads its daemon's ports
   # there (src/daemon.ts: agentDevicePorts), and the ward can retarget the link later.
@@ -70,7 +84,7 @@ lock_down() {
     while read -r name path; do names+=("$name"); paths+=("$path"); done <"$rt/own-homes"
   fi
   for p in "$WARD_STATE" "$WARD_CONFIG" "$WARD_RUNTIME" "$WARD_HOME" "$HOME"/.t3*/userdata "$(readlink -f -- "$WARD_T3/userdata")" "$miranda" "$(readlink -f -- "$avds")" \
-           "/run/user/$uid/systemd" "/run/user/$uid/bus" "${XDG_RUNTIME_DIR:-}/systemd" "${XDG_RUNTIME_DIR:-}/bus" "${paths[@]}" "$adh"; do
+           "/run/user/$uid/systemd" "/run/user/$uid/bus" "${XDG_RUNTIME_DIR:-}/systemd" "${XDG_RUNTIME_DIR:-}/bus" "${paths[@]}" "$adh" "$adbkey" "$adbpub"; do
     [ -e "$p" ] && [ ! -L "$p" ] || continue
     p=$(readlink -f -- "$p")
     [[ " ${protected[*]} " != *" $p "* ]] || continue
@@ -114,12 +128,15 @@ lock_down() {
     case $p in
       "$(readlink -f "$WARD_STATE")") hide_except "$p" images "wards/$id"; seal "$p/images" ;;
       "$(readlink -f "$WARD_RUNTIME")")
-        ro "$p"; rw "$rt/desktop"; rw "$rt/podman"
-        # Every thread's commands as `ward exec` records them (bin/ward: ward_record_start).
-        # Reported to ward-init, which notes it where the ward can't write: a recorder only
-        # records while every running ward has this (wardd's /ls: activityHidden).
-        if [ -d "$p/activity" ]; then mount -t tmpfs -o ro,mode=0700,size=4k tmpfs "$p/activity"; echo activity-hidden >&3; fi
-        seal "$p" ;;
+        hide_except "$p" "$id" control device-hosts
+        rw "$rt/desktop"; rw "$rt/podman"
+        for a in "$rt" "$p/control" "$p/device-hosts"; do [ ! -d "$a" ] || seal "$a"; done
+        mount -o remount,bind,rw,nosuid,nodev "$p"
+        ln -s control/wardd.sock "$p/wardd.sock"
+        # Among what is gone: every thread's commands as `ward exec` records them (bin/ward:
+        # ward_record_start). Reported to ward-init, which notes it where the ward can't write:
+        # a recorder only records while every running ward has this (wardd's /ls: activityHidden).
+        echo activity-hidden >&3 ;;
       "$(readlink -f "$WARD_CONFIG")") hide_except "$p" enabled; [ ! -d "$p/enabled" ] || seal "$p/enabled" ;;
       "$(readlink -f "$WARD_HOME")") ro "$p"; seal "$p" ;;
       "$(readlink -f "$miranda")") hide_except "$p" shell ;;
@@ -137,6 +154,8 @@ lock_down() {
       */userdata) hide_except "$p" attachments ;;
       */bus) if [ -S "$rt/bus" ]; then mount --bind "$rt/bus" "$p"; else mount --bind /dev/null "$p"; fi ;;
       */systemd) mount -t tmpfs -o ro,mode=0755,size=4k tmpfs "$p" ;;
+      "$adbkey" | "$adbpub")
+        { mount --bind /dev/null "$p" && seal "$p"; } || { echo "ward: could not hide your adb key ($p), so the ward does not start" >&2; return 1; } ;;
     esac
   done
   # ro_over SRC DST: SRC, which wardd keeps in the ward's runtime folder, read-only over
@@ -171,6 +190,17 @@ lock_down() {
     { [ -d "$adh" ] || { mkdir -p -- "$adh" && chown --reference="$HOME" -- "$adh"; }; } &&
       mount -t tmpfs -o mode=0700,size=256m tmpfs "$adh" && chown --reference="$HOME" -- "$adh"
   } || { echo "ward: could not hide your agent-device home ($adh), so the ward does not start" >&2; return 1; }
+  # With no adb key of yours to cover (no SDK, or wardd couldn't make one), the ward gets
+  # an empty ~/.android of its own in memory: a key made in place later, by you or by its
+  # own adb, would otherwise be in its view, or in your home.
+  if [ -n "$nokey" ]; then
+    a=$(readlink -f -- "$HOME/.android") || a=$HOME/.android
+    [ ! -L "$HOME/.android/adbkey" ] || [ "$(dirname -- "$adbkey")" = "$a" ] ||
+      { echo "ward: your adb key ($HOME/.android/adbkey) links to a missing file outside $a, where the ward can't hide it, so the ward does not start" >&2; return 1; }
+    { { [ -d "$a" ] || { mkdir -p -- "$a" && chown --reference="$HOME" -- "$a"; }; } &&
+      mount -t tmpfs -o mode=0755,size=64m tmpfs "$a" && chown --reference="$HOME" -- "$a"
+    } || { echo "ward: could not hide where your adb key would go ($a), so the ward does not start" >&2; return 1; }
+  fi
 }
 
 # The inner user namespace maps every id the outer one does to itself.
@@ -234,6 +264,9 @@ pasta --config-net --quiet --foreground --no-map-gw -t none -u none -U 53 "${pas
 # 3. Podman, as root of the ward, in its own mount namespace with private /run
 # and storage. Containers' published ports land in the ward's loopback.
 chown 0:0 "$rt/podman" "$st/storage" "$st/net"
+# The last run's socket outlives it, and the wait below would take it for this run's
+# and open it up, just before Podman replaces it with its own, private one.
+rm -f "$rt/podman/podman.sock"
 cat > "$st/containers.conf" <<CONF
 [containers]
 cgroups = "disabled"

@@ -5,7 +5,7 @@
 // ward an Android device of its own (src/device.ts).
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
-import { closeSync, constants, existsSync, fstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, readSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, watch, writeFileSync, type FSWatcher } from "node:fs";
+import { closeSync, constants, existsSync, fstatSync, linkSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, readSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, watch, writeFileSync, type FSWatcher } from "node:fs";
 import { createServer as createHttpServer, request as httpRequest, type ClientRequest, type IncomingMessage, type ServerResponse } from "node:http";
 import { type Server, type Socket } from "node:net";
 import { homedir, userInfo } from "node:os";
@@ -18,6 +18,7 @@ import {
   ACTIVITY_DIR,
   AGENT_DEVICE_HOME,
   BUILD_CACHE_DIR,
+  CONTROL_DIR,
   CONTROL_SOCKET,
   desktopStateDir,
   THREAD_WARDS_DIR,
@@ -217,6 +218,26 @@ function prepareGradle(record: WardRecord): string | undefined {
 }
 
 /**
+ * Your adb key, made as adb would on first use if you have none, so that a ward's adb, which
+ * would otherwise make it in your home and could keep a copy, finds one to be hidden from it
+ * (ward-init-root covers it). One at a time: wards starting together share it. Without the
+ * SDK's adb nothing is made.
+ */
+let hostAdbKey: Promise<void> | undefined;
+const ensureHostAdbKey = () => (hostAdbKey ??= makeHostAdbKey().finally(() => (hostAdbKey = undefined)));
+async function makeHostAdbKey(): Promise<void> {
+  const key = join(homedir(), ".android/adbkey");
+  if (existsSync(key) || !existsSync(HOST_ADB)) return;
+  try {
+    mkdirSync(dirname(key), { recursive: true });
+    await run(HOST_ADB, ["keygen", key], { timeout: 30_000 });
+    log(`made your adb key, ${key}, before a ward could`);
+  } catch (error) {
+    log(`could not make your adb key, ${key}: ${error instanceof Error ? error.message.split("\n")[0] : String(error)}`);
+  }
+}
+
+/**
  * When a ward starts, the folders of its own that ward-init-root mounts over yours, at
  * the same paths, listed in `own-homes`: its Gradle home (cloned from yours the first
  * time, if its worktree has a Gradle build) when `gradleHome` is set, its Kotlin daemon
@@ -359,6 +380,7 @@ async function up(worktree: string): Promise<UpResult> {
       writeHostPorts(record);
       prepareDeviceFolders();
       await prepareOwnHomes(record, gradleHome);
+      await ensureHostAdbKey();
     }
     writeEnvFile(record, gradleHome);
     if (starting) {
@@ -524,7 +546,7 @@ async function desktop(id: string, worktree?: string): Promise<Record<string, ne
 
 /**
  * A new short name for ward `id`'s desktop folder (see libexec/ward-desktop), as a
- * link in Ward's runtime folder, which the ward itself can't write. Its earlier
+ * link in Ward's runtime folder, which the ward doesn't see: it makes the same link in its own view. Its earlier
  * names go first. The number is random and above any pid, so it never meets the
  * d<pid> name a thread's desktop gives itself, and a command holding an earlier
  * desktop's name can't reach this one.
@@ -1701,12 +1723,24 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 async function main(): Promise<void> {
   mkdirSync(dirname(CONTROL_SOCKET), { recursive: true });
   await loadDevices(); // before anything asks for one
-  // Before any ward starts: a ward hides the folder only if it exists by then.
   mkdirSync(ACTIVITY_DIR, { recursive: true, mode: 0o700 });
   mkdirSync(BUILD_CACHE_DIR, { recursive: true }); // before any ward starts, so ward-init-root hides it
   rmSync(CONTROL_SOCKET, { force: true });
   const server = createHttpServer((req, res) => void handle(req, res));
-  server.listen(CONTROL_SOCKET, () => log(`wardd listening on ${CONTROL_SOCKET}`));
+  server.listen(CONTROL_SOCKET, () => {
+    log(`wardd listening on ${CONTROL_SOCKET}`);
+    // Running wards reach the new socket through this link (paths.ts: CONTROL_DIR), replaced
+    // in one step so none of them finds it missing.
+    const tmp = join(CONTROL_DIR, "wardd.sock.tmp");
+    try {
+      mkdirSync(CONTROL_DIR, { recursive: true });
+      rmSync(tmp, { force: true });
+      linkSync(CONTROL_SOCKET, tmp);
+      renameSync(tmp, join(CONTROL_DIR, "wardd.sock"));
+    } catch (error) {
+      log(`could not link the control socket into ${CONTROL_DIR}, so wards can't reach wardd: ${String(error)}`);
+    }
+  });
   for (const record of wards.values()) {
     if (isReady(record.id)) attach(record);
   }
@@ -1718,9 +1752,11 @@ async function main(): Promise<void> {
   const shutdown = () => {
     // Wards keep running; a restarted wardd re-attaches to them.
     for (const id of [...live.keys()]) detach(id);
-    try {
-      unlinkSync(CONTROL_SOCKET);
-    } catch {}
+    for (const path of [CONTROL_SOCKET, join(CONTROL_DIR, "wardd.sock")]) {
+      try {
+        unlinkSync(path);
+      } catch {}
+    }
     process.exit(0);
   };
   process.on("SIGTERM", shutdown);

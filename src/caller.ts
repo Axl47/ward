@@ -1,5 +1,5 @@
-// Who is calling wardd. The control socket sits in XDG_RUNTIME_DIR, which wards
-// share with the host, so its path admits every ward. wardd therefore asks the
+// Who is calling wardd. Every ward reaches the control socket (paths.ts:
+// CONTROL_DIR), so its path admits every ward. wardd therefore asks the
 // kernel who connected (SO_PEERCRED) and tells callers apart by network
 // namespace: the host's own, one ward's, or neither (refused).
 import { dlopen } from "node:ffi";
