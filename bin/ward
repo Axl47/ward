@@ -40,7 +40,7 @@ ward_enter() {
   echo $$ > "$(cat "$rt/cgroup")/cgroup.procs" || { echo "ward: could not join the cgroup of ward $WARD_ID" >&2; exit 1; }
   # The reconciler won't stop a ward used after its threads went idle.
   : > "$rt/last-exec"
-  set -a; . "$rt/env"; set +a; [ -z "${desktop:-}" ] || ward_desktop_env
+  set -a; . "$rt/env"; set +a; ward_enter_env; [ -z "${desktop:-}" ] || ward_desktop_env
   # Joining the mount namespace moves the command to its root, so it goes back to
   # this folder by path, inside: a directory carried in from outside would let
   # relative paths reach what the ward's namespace hides (libexec/ward-init-root).
