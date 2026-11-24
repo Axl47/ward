@@ -25,8 +25,9 @@ st=$WARD_STATE/wards/$id
 #   proxy, which passes only the keyring; the ward's own Podman is at $rt/podman.
 #   Your Podman's runtime state (libpod) is an empty folder of the ward's own, in
 #   memory: a podman command in the ward, which can't see your Podman's pause
-#   process, deleted its pause.pid. Both folders are made first if missing, so a
-#   socket started later (podman.socket) lands under the empty folder too.
+#   process, deleted its pause.pid. ward-init makes both, as you, if missing, so a
+#   socket started later (podman.socket) lands under the empty folder too; either
+#   one missing or a link stops the ward.
 # - Ward's own state, config, runtime folder and checkout are read-only, except
 #   the ward's own state folder (TMPDIR, Podman), its desktop's folder and its
 #   Podman socket's folder: the host trusts these files (it runs the checkout,
@@ -76,16 +77,15 @@ lock_down() {
   adbpub=$(readlink -f -- "$HOME/.android/adbkey.pub") || adbpub=
   local nokey=
   [ -f "$adbkey" ] || nokey=1
-  # Your Podman's socket and state folders, made now if missing, so the empty folders hiding
-  # them (below) are there before podman.socket or your first podman command fills them.
+  # Your Podman's socket and state folders (ward-init made any that were missing), each of
+  # which must be covered below.
+  local podman_dirs=()
   for p in "/run/user/$uid" "${XDG_RUNTIME_DIR:-}"; do
     [ -n "$p" ] && [ -d "$p" ] || continue
     for a in podman libpod; do
-      # Made as yours; when mkdir fails, the check below decides (the host may have made it meanwhile).
-      [ -e "$p/$a" ] || ! mkdir -m 0700 -- "$p/$a" 2>/dev/null || chown --reference="$p" -- "$p/$a" ||
-        { echo "ward: could not give you $p/$a, so the ward does not start" >&2; return 1; }
       [ -d "$p/$a" ] && [ ! -L "$p/$a" ] ||
         { echo "ward: $p/$a is missing or not a folder, so the ward can't hide your Podman's and does not start" >&2; return 1; }
+      podman_dirs+=("$(readlink -f -- "$p/$a")")
     done
   done
   # agent-device's home at its real path, where the ward's own (or an empty one) goes,
@@ -101,8 +101,7 @@ lock_down() {
     while read -r name path; do names+=("$name"); paths+=("$path"); done <"$rt/own-homes"
   fi
   for p in "$WARD_STATE" "$WARD_CONFIG" "$WARD_RUNTIME" "$WARD_HOME" "$HOME"/.t3*/userdata "$(readlink -f -- "$WARD_T3/userdata")" "$miranda" "$(readlink -f -- "$avds")" \
-           "/run/user/$uid/systemd" "/run/user/$uid/bus" "/run/user/$uid/podman" "/run/user/$uid/libpod" \
-           "${XDG_RUNTIME_DIR:-}/systemd" "${XDG_RUNTIME_DIR:-}/bus" "${XDG_RUNTIME_DIR:-}/podman" "${XDG_RUNTIME_DIR:-}/libpod" \
+           "/run/user/$uid/systemd" "/run/user/$uid/bus" "${XDG_RUNTIME_DIR:-}/systemd" "${XDG_RUNTIME_DIR:-}/bus" "${podman_dirs[@]}" \
            "${paths[@]}" "$adh" "$adbkey" "$adbpub"; do
     [ -e "$p" ] && [ ! -L "$p" ] || continue
     p=$(readlink -f -- "$p")
@@ -114,6 +113,9 @@ lock_down() {
     for a in "${ancestors[@]}"; do
       [[ $held == *" $a "* ]] || { mount --rbind "$a" "$a"; held+="$a "; }
     done
+  done
+  for p in "${podman_dirs[@]}"; do
+    [[ " ${protected[*]} " == *" $p "* ]] || { echo "ward: $p changed as the ward started, so it can't hide your Podman's and does not start" >&2; return 1; }
   done
   # hide_except DIR ENTRY...: an empty, read-only DIR showing only the ENTRY folders
   # (paths under DIR) it had, each as writable as before. An entry reached through a
