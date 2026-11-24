@@ -32,7 +32,10 @@ st=$WARD_STATE/wards/$id
 #   are kept from it by not being there.
 # - Credentials are hidden: Ward's config folder except the enable markers (so
 #   its T3 token, even one written after the ward started), and each T3 home's
-#   userdata (T3's keys and its database of every thread) except attachments.
+#   userdata (T3's keys and its database of every thread) except attachments and,
+#   read-only, what agent-device's CLI reads: the commands device_open returns
+#   (device/targets) and their configs (device/hosts), which hold the token of
+#   T3's device daemon, so a ward can drive any device that daemon reaches.
 # - Miranda's store is hidden (the user's screen and terminal timeline, Glosses,
 #   every agent's commands, and the control file that turns recording on),
 #   except its `shell` folder, where the bash hook in a ward's terminal leaves
@@ -103,7 +106,13 @@ lock_down() {
       # Your emulators (T3's shared ones among them): an emulator started in a ward would
       # run from their disks. A ward's device is Ward's own, on the host (src/device.ts).
       "$(readlink -f "$avds")") [ ! -d "$p" ] || mount -t tmpfs -o ro,mode=0755,size=4k tmpfs "$p" ;;
-      */userdata) hide_except "$p" attachments ;;
+      # T3's keys (secrets) and its databases are hidden. agent-device's CLI needs the
+      # commands device_open hands out (device/targets) and the config each names, the
+      # device daemon's address and token (device/hosts), both read-only: T3 replaces
+      # files there by renaming, so the folders are mounted, not the files.
+      */userdata)
+        hide_except "$p" attachments device/targets device/hosts
+        for a in "$p/device/targets" "$p/device/hosts"; do [ ! -d "$a" ] || seal "$a"; done ;;
       */bus) if [ -S "$rt/bus" ]; then mount --bind "$rt/bus" "$p"; else mount --bind /dev/null "$p"; fi ;;
       */systemd) mount -t tmpfs -o ro,mode=0755,size=4k tmpfs "$p" ;;
     esac
