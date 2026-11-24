@@ -35,8 +35,9 @@ st=$WARD_STATE/wards/$id
 #   userdata (T3's keys and its database of every thread) except attachments and,
 #   in the T3 home Ward serves, read-only, the commands device_open returns
 #   (device/targets). The configs they name (device/hosts) hold the address and
-#   token of T3's device daemon; the ward sees wardd's copy with neither, so the
-#   CLI runs a daemon of its own in the ward (src/daemon.ts: mirrorDeviceHosts).
+#   token of T3's device daemon; the ward sees only wardd's stub of the local
+#   host's, `{}`, so the CLI runs a daemon of its own in the ward (src/daemon.ts:
+#   prepareDeviceFolders). The served userdata is found through a link.
 # - Miranda's store is hidden (the user's screen and terminal timeline, Glosses,
 #   every agent's commands, and the control file that turns recording on),
 #   except its `shell` folder, where the bash hook in a ward's terminal leaves
@@ -62,7 +63,7 @@ lock_down() {
   if [ -f "$rt/own-homes" ]; then
     while read -r name path; do names+=("$name"); paths+=("$path"); done <"$rt/own-homes"
   fi
-  for p in "$WARD_STATE" "$WARD_CONFIG" "$WARD_RUNTIME" "$WARD_HOME" "$HOME"/.t3*/userdata "$WARD_T3/userdata" "$miranda" "$(readlink -f -- "$avds")" \
+  for p in "$WARD_STATE" "$WARD_CONFIG" "$WARD_RUNTIME" "$WARD_HOME" "$HOME"/.t3*/userdata "$(readlink -f -- "$WARD_T3/userdata")" "$miranda" "$(readlink -f -- "$avds")" \
            "/run/user/$uid/systemd" "/run/user/$uid/bus" "${XDG_RUNTIME_DIR:-}/systemd" "${XDG_RUNTIME_DIR:-}/bus" "${paths[@]}" "$(readlink -f -- "$HOME/.agent-device")"; do
     [ -e "$p" ] && [ ! -L "$p" ] || continue
     p=$(readlink -f -- "$p")

@@ -67,6 +67,8 @@ interface LiveWard {
   readonly brokerPid: number;
   /** The ward's own process from its `pid` file, in its mount namespace: /proc/<wardPid>/root is the ward's view. */
   readonly wardPid: number;
+  /** agent-device's home at its real path when the ward started, where ward-init-root mounted the ward's own. */
+  readonly agentDeviceHome: string;
   /** Ward port → host-side listener. */
   readonly listeners: Map<number, Server>;
   /** Ward port → addresses to dial, from the last socket scan. */
@@ -865,6 +867,13 @@ function attach(record: WardRecord): void {
     broker,
     brokerPid: broker.pid,
     wardPid: pid,
+    agentDeviceHome: (() => {
+      try {
+        return realpathSync(AGENT_DEVICE_HOME);
+      } catch {
+        return AGENT_DEVICE_HOME;
+      }
+    })(),
     listeners: new Map(),
     listening: new Map(),
     pending: new Map(),
@@ -983,7 +992,7 @@ function scan(id: string): Promise<unknown> {
   }
   for (const port of ward.containerPorts) if (!found.has(port)) found.set(port, ["127.0.0.1"]);
   // The broker's own listeners, and the ward's adb server and agent-device daemon, which only the ward is to reach.
-  for (const port of [BUILD_CACHE_PORT, ADB_PORT, ADB_SERVER_PORT, ...ward.devicePorts, ...agentDevicePorts(ward.wardPid)]) found.delete(port);
+  for (const port of [BUILD_CACHE_PORT, ADB_PORT, ADB_SERVER_PORT, ...ward.devicePorts, ...agentDevicePorts(ward)]) found.delete(port);
   ward.listening.clear();
   // Close listeners whose port went quiet, so the host sees "refused", not accept-then-reset.
   // The registry keeps the port number for when it listens again.
@@ -1297,15 +1306,16 @@ function prepareDeviceFolders(): void {
  * agent-device's home as the ward sees it (its own folder, or the empty one
  * ward-init-root falls back to): only the ward reaches it, and a new one each start
  * would take another of the ward's host ports. The ward writes the file, so it decides
- * only what isn't mapped, and it is read at agent-device home's real path (where
- * ward-init-root mounts it; a link would resolve against wardd's root) and opened so
- * that a link or a FIFO there can't make wardd read elsewhere or wait. The daemon listens just before it writes the file, so a scan
+ * only what isn't mapped, and it is read at agent-device home's real path from when
+ * the ward started (where ward-init-root mounted it; a link would resolve against
+ * wardd's root, and the ward can retarget ~/.agent-device) and opened so that a link
+ * or a FIFO there can't make wardd read elsewhere or wait. The daemon listens just before it writes the file, so a scan
  * in between still maps that port, rarely.
  */
-function agentDevicePorts(wardPid: number): number[] {
+function agentDevicePorts({ wardPid, agentDeviceHome }: LiveWard): number[] {
   let fd: number | undefined;
   try {
-    fd = openSync(`/proc/${wardPid}/root${realpathSync(AGENT_DEVICE_HOME)}/daemon.json`, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    fd = openSync(`/proc/${wardPid}/root${agentDeviceHome}/daemon.json`, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
     const stat = fstatSync(fd);
     if (!stat.isFile() || stat.size > 64 * 1024) return [];
     const size = stat.size;
