@@ -22,7 +22,7 @@ A device stops after 15 minutes without use (`WARD_DEVICE_IDLE=30m` for `wardd` 
 
 In a ward, the `agent-device` command `device_open` returns drives only the ward's device, through a daemon of its own there. Its session holds the device from other threads until it has been idle 10 minutes, and `device_close` doesn't end it: run the command's `close` first to hand the device over at once.
 
-Ward devices copy the hardware and system image of one of your AVDs, which is only read: the first by name when Ward first looked (`WARD_DEVICE_TEMPLATE=name` for `wardd` picks another). For another API level, or your phone, use T3's device tools, which run outside the ward; your own AVDs are hidden in a ward, so an emulator started there can't run from them. Outside wards nothing changes: a Gradle install or `adb` on the host acts on every device listed, ward devices included, unless `ANDROID_SERIAL` names one.
+Ward devices copy the hardware and system image of one of your AVDs, which is only read: the first by name when Ward first looked (`WARD_DEVICE_TEMPLATE=name` for `wardd` picks another). For another API level, or your phone, use T3's device tools from a thread without a ward (in a ward, the command `device_open` returns for them fails); your own AVDs are hidden in a ward, so an emulator started there can't run from them. Outside wards nothing changes: a Gradle install or `adb` on the host acts on every device listed, ward devices included, unless `ANDROID_SERIAL` names one.
 
 ## Limits
 

@@ -13,7 +13,7 @@ All notable changes to Ward are recorded here. The format follows [Keep a Change
 
 ### Changed
 
-- adb in a ward finds only the ward's own device. T3's shared emulators, other wards' devices and your phone no longer appear in `adb devices` there, so a Gradle install or a stray `adb -s` can't land on them. Use T3's device tools for those. Wards already running keep the old behavior until they are stopped and started.
+- adb in a ward finds only the ward's own device. T3's shared emulators, other wards' devices and your phone no longer appear in `adb devices` there, so a Gradle install or a stray `adb -s` can't land on them. Use T3's device tools for those from a thread without a ward. Wards already running keep the old behavior until they are stopped and started.
 - `adb reverse` in a ward opens its port inside the ward directly, with no host port in between.
 - Your own AVDs are hidden inside a ward, so an emulator started there can't boot or change T3's shared ones.
 - Emulator ports (5554–5585) can no longer be forwarded into wards with `--host-ports`, as adb's can't.

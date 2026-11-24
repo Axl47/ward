@@ -37,7 +37,7 @@ st=$WARD_STATE/wards/$id
 #   (device/targets). The configs they name (device/hosts) hold the address and
 #   token of T3's device daemon; the ward sees only wardd's stub of the local
 #   host's, `{}`, so the CLI runs a daemon of its own in the ward (src/daemon.ts:
-#   prepareDeviceFolders). The served userdata is found through a link.
+#   prepareDeviceFolders). The served userdata is hidden even when it is a link.
 # - Miranda's store is hidden (the user's screen and terminal timeline, Glosses,
 #   every agent's commands, and the control file that turns recording on),
 #   except its `shell` folder, where the bash hook in a ward's terminal leaves
