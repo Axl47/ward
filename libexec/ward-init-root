@@ -81,9 +81,11 @@ lock_down() {
   for p in "/run/user/$uid" "${XDG_RUNTIME_DIR:-}"; do
     [ -n "$p" ] && [ -d "$p" ] || continue
     for a in podman libpod; do
-      [ ! -L "$p/$a" ] || { echo "ward: $p/$a is a link, so the ward can't hide your Podman's and does not start" >&2; return 1; }
-      [ -e "$p/$a" ] || { mkdir -m 0700 -- "$p/$a" && chown --reference="$p" -- "$p/$a"; } ||
-        { echo "ward: could not make $p/$a to hide your Podman's, so the ward does not start" >&2; return 1; }
+      # Made as yours; when mkdir fails, the check below decides (the host may have made it meanwhile).
+      [ -e "$p/$a" ] || ! mkdir -m 0700 -- "$p/$a" 2>/dev/null || chown --reference="$p" -- "$p/$a" ||
+        { echo "ward: could not give you $p/$a, so the ward does not start" >&2; return 1; }
+      [ -d "$p/$a" ] && [ ! -L "$p/$a" ] ||
+        { echo "ward: $p/$a is missing or not a folder, so the ward can't hide your Podman's and does not start" >&2; return 1; }
     done
   done
   # agent-device's home at its real path, where the ward's own (or an empty one) goes,
@@ -173,7 +175,7 @@ lock_down() {
       */systemd | */podman) mount -t tmpfs -o ro,mode=0755,size=4k tmpfs "$p" ;;
       # Writable: the podman CLI sets its sticky bit and keeps its pause.pid there.
       */libpod)
-        { mount -t tmpfs -o mode=1700,size=1m tmpfs "$p" && chown --reference="$(dirname -- "$p")" -- "$p"; } ||
+        { mount -t tmpfs -o mode=1700,size=16m tmpfs "$p" && chown --reference="$(dirname -- "$p")" -- "$p"; } ||
           { echo "ward: could not hide your Podman's state ($p), so the ward does not start" >&2; return 1; } ;;
       "$adbkey" | "$adbpub")
         { mount --bind /dev/null "$p" && seal "$p"; } || { echo "ward: could not hide your adb key ($p), so the ward does not start" >&2; return 1; } ;;
