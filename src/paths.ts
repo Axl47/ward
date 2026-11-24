@@ -20,8 +20,15 @@ export const DEFAULT_WORKTREES_DIR = join(T3_HOME, "worktrees");
 const T3_SETTINGS = join(T3_HOME, "userdata/settings.json");
 export const CONTROL_SOCKET = join(RUNTIME_DIR, "wardd.sock");
 /**
+ * Where a ward finds wardd: of RUNTIME_DIR it sees only this folder, its own folder and
+ * DEVICE_HOSTS_STUB (libexec/ward-init-root), and its `wardd.sock` links to `wardd.sock` in
+ * here, a hard link to CONTROL_SOCKET made whenever wardd starts. A folder, because a socket
+ * file mounted into a ward would stay the one of the wardd that ran when the ward started.
+ */
+export const CONTROL_DIR = join(RUNTIME_DIR, "control");
+/**
  * Where `ward exec` leaves a record of each agent command while a recorder (Miranda) asks for
- * them (bin/ward: ward_recording). wardd creates it; every ward sees an empty folder in its place.
+ * them (bin/ward: ward_recording). wardd creates it; no ward sees it.
  */
 export const ACTIVITY_DIR = join(RUNTIME_DIR, "activity");
 export const REGISTRY_FILE = join(STATE_DIR, "registry.json");

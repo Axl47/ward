@@ -5,7 +5,7 @@
 // ward an Android device of its own (src/device.ts).
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
-import { closeSync, constants, existsSync, fstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, readSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, watch, writeFileSync, type FSWatcher } from "node:fs";
+import { closeSync, constants, existsSync, fstatSync, linkSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, readSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, watch, writeFileSync, type FSWatcher } from "node:fs";
 import { createServer as createHttpServer, request as httpRequest, type ClientRequest, type IncomingMessage, type ServerResponse } from "node:http";
 import { type Server, type Socket } from "node:net";
 import { homedir, userInfo } from "node:os";
@@ -18,6 +18,7 @@ import {
   ACTIVITY_DIR,
   AGENT_DEVICE_HOME,
   BUILD_CACHE_DIR,
+  CONTROL_DIR,
   CONTROL_SOCKET,
   desktopStateDir,
   THREAD_WARDS_DIR,
@@ -1701,12 +1702,17 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 async function main(): Promise<void> {
   mkdirSync(dirname(CONTROL_SOCKET), { recursive: true });
   await loadDevices(); // before anything asks for one
-  // Before any ward starts: a ward hides the folder only if it exists by then.
   mkdirSync(ACTIVITY_DIR, { recursive: true, mode: 0o700 });
   mkdirSync(BUILD_CACHE_DIR, { recursive: true }); // before any ward starts, so ward-init-root hides it
   rmSync(CONTROL_SOCKET, { force: true });
   const server = createHttpServer((req, res) => void handle(req, res));
-  server.listen(CONTROL_SOCKET, () => log(`wardd listening on ${CONTROL_SOCKET}`));
+  server.listen(CONTROL_SOCKET, () => {
+    // Running wards reach the new socket through this link (paths.ts: CONTROL_DIR).
+    mkdirSync(CONTROL_DIR, { recursive: true });
+    rmSync(join(CONTROL_DIR, "wardd.sock"), { force: true });
+    linkSync(CONTROL_SOCKET, join(CONTROL_DIR, "wardd.sock"));
+    log(`wardd listening on ${CONTROL_SOCKET}`);
+  });
   for (const record of wards.values()) {
     if (isReady(record.id)) attach(record);
   }

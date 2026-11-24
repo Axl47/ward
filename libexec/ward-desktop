@@ -53,7 +53,8 @@ fi
 # compositor's and every app's, so it is a short name for $rt/desktop, new at
 # every start, so a command still holding the name of an earlier desktop, this
 # ward's or another's, can't act on this one. A ward's desktop is given its name
-# (NAME, a link wardd made: Ward's runtime folder is read-only inside the ward);
+# (NAME, a link wardd made in Ward's runtime folder, which the ward sees only its own
+# folder of: libexec/ward-init-root), and makes the same link in the ward's view;
 # a thread's desktop, which runs in no ward, names itself d<this process's id>.
 # Earlier names go here or with wardd, and the last one with the ward
 # (units/ward@.service) or the thread's desktop.
@@ -62,13 +63,15 @@ own_link=
 if [ -n "${2:-}" ]; then
   dir=$WARD_RUNTIME/$2
 else
+  dir=$WARD_RUNTIME/d$$
+  mkdir -p "$WARD_RUNTIME/$1/desktop"
+  own_link=$dir
+fi
+if [ -n "$own_link" ] || [ ! -e "$dir" ]; then
   for old in "$WARD_RUNTIME"/d[0-9]*; do
     [ "$(readlink "$old" 2>/dev/null)" != "$1/desktop" ] || rm -f "$old"
   done
-  dir=$WARD_RUNTIME/d$$
-  mkdir -p "$WARD_RUNTIME/$1/desktop"
   ln -sfn "$1/desktop" "$dir"
-  own_link=$dir
 fi
 mkdir -p "$dir/services"
 # `ward desktop` treats the desktop as up while this process lives; it waits for

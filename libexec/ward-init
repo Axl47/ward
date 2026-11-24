@@ -19,6 +19,14 @@ rm -f "$rt/ready" "$rt/pid" "$rt/bus" "$rt/activity-hidden"
 # The shared image store is read-only inside the ward, and Podman must find its
 # lock files there, so an empty store is set up here first.
 [ -e "$WARD_STATE/images/overlay-layers" ] || "$WARD_LIBEXEC/ward-images" images -q >/dev/null
+# A ward sees wardd's socket only through the link wardd makes in control/ when it
+# starts (src/paths.ts: CONTROL_DIR); made here too, for a wardd started before that.
+[ ! -S "$WARD_RUNTIME/wardd.sock" ] || { mkdir -p "$WARD_RUNTIME/control" && ln -f "$WARD_RUNTIME/wardd.sock" "$WARD_RUNTIME/control/wardd.sock"; } ||
+  echo "ward: warning: could not link wardd's socket into $WARD_RUNTIME/control; the ward can't reach wardd" >&2
+# The ward's adb key, which ward-init-root shows in place of yours: nothing trusts it,
+# while your phone trusts yours. Made once per boot, in a folder only this ward sees.
+[ -s "$rt/adbkey" ] || (umask 077 && openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$rt/adbkey" 2>/dev/null) ||
+  { rm -f "$rt/adbkey"; echo "ward: warning: could not make the ward an adb key (is openssl installed?); its adb has none" >&2; }
 # The desktop's folder is bind-mounted into the ward, so it is made once here and
 # only emptied while the ward runs (src/daemon.ts: desktop).
 rm -rf "$rt/desktop"
