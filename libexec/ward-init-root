@@ -55,6 +55,7 @@ st=$WARD_STATE/wards/$id
 #   wireless debugging trusts, is covered by empty files, so the ward's adb has no
 #   key: none to sign with, and none to offer a phone that would ask whether to
 #   trust it. Its device asks for none (ro.adb.secure=0 on google_apis images).
+#   With no key to cover, ~/.android is an empty one of the ward's.
 # - agent-device's home (~/.agent-device: its daemon's state, token and device
 #   claims) is the ward's own, like the Gradle home below; without that, an empty one.
 # - Your Gradle home and Kotlin daemon folder are the ward's own, so wards share
@@ -68,6 +69,8 @@ lock_down() {
   local avds=${ANDROID_AVD_HOME:-$HOME/.android/avd} adbkey adbpub
   adbkey=$(readlink -f -- "$HOME/.android/adbkey") || adbkey=
   adbpub=$(readlink -f -- "$HOME/.android/adbkey.pub") || adbpub=
+  local nokey=
+  [ -f "$adbkey" ] || nokey=1
   # agent-device's home at its real path, where the ward's own (or an empty one) goes,
   # noted while Ward's runtime folder is still writable: wardd reads its daemon's ports
   # there (src/daemon.ts: agentDevicePorts), and the ward can retarget the link later.
@@ -187,6 +190,15 @@ lock_down() {
     { [ -d "$adh" ] || { mkdir -p -- "$adh" && chown --reference="$HOME" -- "$adh"; }; } &&
       mount -t tmpfs -o mode=0700,size=256m tmpfs "$adh" && chown --reference="$HOME" -- "$adh"
   } || { echo "ward: could not hide your agent-device home ($adh), so the ward does not start" >&2; return 1; }
+  # With no adb key of yours to cover (no SDK, or wardd couldn't make one), the ward gets
+  # an empty ~/.android of its own in memory: a key made in place later, by you or by its
+  # own adb, would otherwise be in its view, or in your home.
+  if [ -n "$nokey" ]; then
+    a=$(readlink -f -- "$HOME/.android") || a=$HOME/.android
+    { { [ -d "$a" ] || { mkdir -p -- "$a" && chown --reference="$HOME" -- "$a"; }; } &&
+      mount -t tmpfs -o mode=0755,size=64m tmpfs "$a" && chown --reference="$HOME" -- "$a"
+    } || { echo "ward: could not hide where your adb key would go ($a), so the ward does not start" >&2; return 1; }
+  fi
 }
 
 # The inner user namespace maps every id the outer one does to itself.
