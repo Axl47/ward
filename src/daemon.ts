@@ -223,25 +223,6 @@ function prepareGradle(record: WardRecord): string | undefined {
  * time, if its worktree has a Gradle build) when `gradleHome` is set, its Kotlin daemon
  * folder, and agent-device's home. Each that fails is logged and left out.
  */
-/**
- * The ward's own adb key pair, which ward-init-root mounts over yours (~/.android/adbkey and
- * adbkey.pub): a phone paired for wireless debugging trusts yours, and nothing trusts the
- * ward's. Made once per boot in the ward's runtime folder, which only that ward sees. Without
- * it the ward gets empty files over yours, and its adb has no key.
- */
-async function prepareAdbKey(id: string): Promise<void> {
-  const key = join(wardRuntimeDir(id), "adbkey");
-  if (existsSync(key) && existsSync(`${key}.pub`)) return;
-  try {
-    mkdirSync(dirname(key), { recursive: true });
-    await run(HOST_ADB, ["keygen", key], { timeout: 30_000 });
-  } catch (error) {
-    rmSync(key, { force: true });
-    rmSync(`${key}.pub`, { force: true });
-    log(`ward ${id}: starts without an adb key of its own: ${error instanceof Error ? error.message.split("\n")[0] : String(error)}`);
-  }
-}
-
 async function prepareOwnHomes(record: WardRecord, gradleHome: string | undefined): Promise<void> {
   const rt = wardRuntimeDir(record.id);
   rmSync(join(rt, "own-homes"), { force: true });
@@ -379,7 +360,7 @@ async function up(worktree: string): Promise<UpResult> {
       writeHostPorts(record);
       prepareDeviceFolders();
       await prepareOwnHomes(record, gradleHome);
-      await prepareAdbKey(record.id);
+      await ensureHostAdbKey();
     }
     writeEnvFile(record, gradleHome);
     if (starting) {
@@ -491,6 +472,23 @@ function logTail(file: string): string {
     return end.toString("utf8").split("\n").filter(Boolean).slice(-15).join("\n");
   } finally {
     closeSync(fd);
+  }
+}
+
+/**
+ * Your adb key, made as adb would on first use if you have none, so that a ward's adb, which
+ * would otherwise make it in your home and could keep a copy, finds one to be hidden from it
+ * (ward-init-root covers it). Without the SDK's adb nothing is made.
+ */
+async function ensureHostAdbKey(): Promise<void> {
+  const key = join(homedir(), ".android/adbkey");
+  if (existsSync(key) || !existsSync(HOST_ADB)) return;
+  try {
+    mkdirSync(dirname(key), { recursive: true });
+    await run(HOST_ADB, ["keygen", key], { timeout: 30_000 });
+    log(`made your adb key, ${key}, before a ward could`);
+  } catch (error) {
+    log(`could not make your adb key, ${key}: ${error instanceof Error ? error.message.split("\n")[0] : String(error)}`);
   }
 }
 

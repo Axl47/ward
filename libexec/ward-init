@@ -20,8 +20,10 @@ rm -f "$rt/ready" "$rt/pid" "$rt/bus" "$rt/activity-hidden"
 # lock files there, so an empty store is set up here first.
 [ -e "$WARD_STATE/images/overlay-layers" ] || "$WARD_LIBEXEC/ward-images" images -q >/dev/null
 # A ward sees wardd's socket only through the link wardd makes in control/ when it
-# starts (src/paths.ts: CONTROL_DIR); made here too, for a wardd started before that.
-[ ! -S "$WARD_RUNTIME/wardd.sock" ] || { mkdir -p "$WARD_RUNTIME/control" && ln -f "$WARD_RUNTIME/wardd.sock" "$WARD_RUNTIME/control/wardd.sock"; } ||
+# starts (src/paths.ts: CONTROL_DIR). Made here too for a wardd started before that;
+# this goes once wardd has restarted since.
+[ ! -S "$WARD_RUNTIME/wardd.sock" ] || [ "$WARD_RUNTIME/control/wardd.sock" -ef "$WARD_RUNTIME/wardd.sock" ] ||
+  { mkdir -p "$WARD_RUNTIME/control" && ln -f "$WARD_RUNTIME/wardd.sock" "$WARD_RUNTIME/control/wardd.sock"; } ||
   echo "ward: warning: could not link wardd's socket into $WARD_RUNTIME/control; the ward can't reach wardd" >&2
 # The desktop's folder is bind-mounted into the ward, so it is made once here and
 # only emptied while the ward runs (src/daemon.ts: desktop).
