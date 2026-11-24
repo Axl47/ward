@@ -4,7 +4,8 @@
 // the Gradle build cache a project's wards share (src/gradle.ts), and gives each
 // ward an Android device of its own (src/device.ts).
 import { execFile, spawn, type ChildProcess } from "node:child_process";
-import { closeSync, constants, existsSync, fstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, readSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, watch, writeFileSync, type FSWatcher } from "node:fs";
+import { createHash } from "node:crypto";
+import { closeSync, constants, existsSync, fstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, readSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, watch, writeFileSync, type FSWatcher } from "node:fs";
 import { createServer as createHttpServer, request as httpRequest, type ClientRequest, type IncomingMessage, type ServerResponse } from "node:http";
 import { type Server, type Socket } from "node:net";
 import { homedir, userInfo } from "node:os";
@@ -21,7 +22,7 @@ import {
   desktopStateDir,
   THREAD_WARDS_DIR,
   desktopUnitName,
-  DEVICE_HOSTS_MIRROR,
+  DEVICE_HOSTS_STUB,
   GRADLE_SOURCE_HOME,
   KOTLIN_DAEMON_DIR,
   HOST_PORTS,
@@ -41,7 +42,6 @@ import {
   wardTrashDir,
 } from "./paths.ts";
 import { consolePort, HOST_ADB, listDevices, loadDevices, reconcileDevices, releaseDevice, startDevice, startHostAdb, stopDevice, useDevice } from "./device.ts";
-import { mirrorDeviceHosts } from "./device-hosts.ts";
 import { acceptBuildCache, BUILD_CACHE_PORT, hasGradleBuild, ownFolder, projectStore, realFolder, sweepSoon, writeGradleSettings } from "./gradle.ts";
 import { wardHostPorts } from "./hostports.ts";
 import { listeningPorts } from "./procnet.ts";
@@ -348,7 +348,7 @@ async function up(worktree: string): Promise<UpResult> {
     const gradleHome = prepareGradle(record);
     if (starting) {
       writeHostPorts(record);
-      refreshDeviceHosts(); // ward-init-root mounts it, so it must be there before the ward starts
+      prepareDeviceFolders();
       await prepareOwnHomes(record, gradleHome);
     }
     writeEnvFile(record, gradleHome);
@@ -1272,52 +1272,24 @@ function forward(id: string, wardPort: number, client: Socket): void {
 // ── agent-device's config ────────────────────────────────────────────────────
 
 /**
- * The agent-device command T3's `device_open` returns names a config in
- * <T3 home>/userdata/device/hosts: the address and token of T3's device daemon,
- * which runs on the host as you. A ward sees DEVICE_HOSTS_MIRROR there instead
- * (src/device-hosts.ts), mounted by ward-init-root; if it can't be made, the ward
- * sees no configs at all.
+ * Before a ward starts, what ward-init-root shows of T3's device folders. The command
+ * T3's `device_open` returns lives in <T3 home>/userdata/device/targets, made here if
+ * T3 hasn't yet, since one missing at the start stays missing in the ward. It names a
+ * config in device/hosts, which holds the address and token of T3's device daemon; the
+ * ward sees DEVICE_HOSTS_STUB there instead: only the local host's file, holding `{}`, so
+ * the CLI starts a daemon of its own in the ward (docs/DESIGN.md: Devices), and a command
+ * for a remote host finds no config. A failure is logged; the ward then shows neither.
  */
-const DEVICE_HOSTS = join(T3_HOME, "userdata/device/hosts");
-/** The watch on DEVICE_HOSTS, and the folder (inode) it watches: T3 may replace the folder. */
-let deviceHostsWatch: { readonly watcher: FSWatcher; readonly ino: number } | undefined;
-
-function refreshDeviceHosts(): void {
+function prepareDeviceFolders(): void {
   try {
-    mirrorDeviceHosts(DEVICE_HOSTS, DEVICE_HOSTS_MIRROR);
+    mkdirSync(join(T3_HOME, "userdata/device/targets"), { recursive: true });
+    mkdirSync(DEVICE_HOSTS_STUB, { recursive: true });
+    // Annex names a host's config by its id's hash (AgentDeviceTarget.ts: agentDeviceConfigPath).
+    const local = `${createHash("sha256").update("local").digest("hex").slice(0, 24)}.json`;
+    if (!existsSync(join(DEVICE_HOSTS_STUB, local))) writeFileSync(join(DEVICE_HOSTS_STUB, local), "{}\n");
   } catch (error) {
-    log(`could not update wards' copy of T3's device configs: ${String(error)}`);
+    log(`could not prepare T3's device folders for wards: ${String(error)}`);
   }
-}
-
-/** Mirror the configs and follow them; on every reconcile, so a folder made or replaced since is watched. */
-function watchDeviceHosts(): void {
-  refreshDeviceHosts();
-  let ino: number | undefined;
-  try {
-    ino = statSync(DEVICE_HOSTS).ino;
-  } catch {
-    ino = undefined;
-  }
-  if (deviceHostsWatch !== undefined && deviceHostsWatch.ino === ino) return;
-  deviceHostsWatch?.watcher.close();
-  deviceHostsWatch = undefined;
-  if (ino === undefined) return;
-  let soon: NodeJS.Timeout | undefined;
-  let watcher: FSWatcher;
-  try {
-    watcher = watch(DEVICE_HOSTS, () => {
-      clearTimeout(soon);
-      soon = setTimeout(refreshDeviceHosts, 100);
-    });
-  } catch (error) {
-    return log(`cannot follow T3's device configs, so wards get new ones at the next reconcile: ${String(error)}`);
-  }
-  watcher.on("error", () => {
-    watcher.close();
-    if (deviceHostsWatch?.watcher === watcher) deviceHostsWatch = undefined;
-  });
-  deviceHostsWatch = { watcher, ino };
 }
 
 /**
@@ -1325,14 +1297,15 @@ function watchDeviceHosts(): void {
  * agent-device's home as the ward sees it (its own folder, or the empty one
  * ward-init-root falls back to): only the ward reaches it, and a new one each start
  * would take another of the ward's host ports. The ward writes the file, so it decides
- * only what isn't mapped, and it is opened so that a link or a FIFO can't make wardd
- * read elsewhere or wait. The daemon listens just before it writes the file, so a scan
+ * only what isn't mapped, and it is read at agent-device home's real path (where
+ * ward-init-root mounts it; a link would resolve against wardd's root) and opened so
+ * that a link or a FIFO there can't make wardd read elsewhere or wait. The daemon listens just before it writes the file, so a scan
  * in between still maps that port, rarely.
  */
 function agentDevicePorts(wardPid: number): number[] {
   let fd: number | undefined;
   try {
-    fd = openSync(`/proc/${wardPid}/root${AGENT_DEVICE_HOME}/daemon.json`, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    fd = openSync(`/proc/${wardPid}/root${realpathSync(AGENT_DEVICE_HOME)}/daemon.json`, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
     const stat = fstatSync(fd);
     if (!stat.isFile() || stat.size > 64 * 1024) return [];
     const size = stat.size;
@@ -1517,7 +1490,6 @@ function dropDevice(id: string): void {
  * shouldStop).
  */
 async function reconcile(): Promise<string[]> {
-  watchDeviceHosts();
   const actions: string[] = [];
   let threads: Map<string, ThreadState[]> | undefined;
   let allThreads: readonly ShellThread[] | undefined;
@@ -1612,8 +1584,7 @@ const handlers: Handlers = {
   },
   "POST /desktop": (body) => ("thread" in body ? threadDesktop(body.thread, body.cwd) : desktop(body.id, body.worktree).finally(watchWorktreeParents)),
   "POST /gc": async () => ({ actions: await runReconcile() }),
-  // T3 asks for the ward's device before handing out the command that reads its config.
-  "POST /device": ({ id, worktree, keepMs }) => (refreshDeviceHosts(), device(id, worktree, keepMs).finally(watchWorktreeParents)),
+  "POST /device": ({ id, worktree, keepMs }) => device(id, worktree, keepMs).finally(watchWorktreeParents),
   "POST /device/stop": async ({ id, worktree }) => {
     const record = requireRecord(id, worktree);
     const stopped = await stopDevice(record.id);

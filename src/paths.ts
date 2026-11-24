@@ -95,8 +95,8 @@ export const KOTLIN_DAEMON_DIR = join(env.XDG_DATA_HOME || join(home, ".local/sh
  * its own daemon and never meets another's.
  */
 export const AGENT_DEVICE_HOME = join(home, ".agent-device");
-/** What a ward sees as T3's agent-device configs (src/daemon.ts: mirrorDeviceHosts; ward-init-root mounts it). */
-export const DEVICE_HOSTS_MIRROR = join(RUNTIME_DIR, "device-hosts");
+/** What a ward sees as T3's agent-device configs (src/daemon.ts: prepareDeviceFolders; ward-init-root mounts it). */
+export const DEVICE_HOSTS_STUB = join(RUNTIME_DIR, "device-hosts");
 /** The build cache wardd serves to wards: one folder per project, of entries named by key. */
 export const BUILD_CACHE_DIR = join(STATE_DIR, "build-cache");
 

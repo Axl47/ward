@@ -123,7 +123,7 @@ lock_down() {
       # agent-device's CLI needs the commands device_open hands out (device/targets) and
       # the config each names (device/hosts), both read-only: T3 replaces files there
       # by renaming, so the folders are mounted, not the files. T3's configs hold its
-      # device daemon's address and token; the ward gets wardd's copies, each `{}`.
+      # device daemon's address and token; the ward gets wardd's stub of the local host's, `{}`.
       "$(readlink -f -- "$WARD_T3/userdata")")
         hide_except "$p" attachments device/targets "device/hosts=$WARD_RUNTIME/device-hosts"
         for a in "$p/device/targets" "$p/device/hosts"; do [ ! -d "$a" ] || seal "$a"; done ;;
@@ -147,11 +147,13 @@ lock_down() {
   # The ward's own folders over yours, at the same paths, so paths under them are the
   # same in every ward and on the host; then your Gradle settings over its home, as
   # wardd last wrote them. A failure here is a warning: the ward starts without them.
-  local i f
+  local i f adh adh_own=
+  adh=$(readlink -f -- "$HOME/.agent-device")
   for i in "${!names[@]}"; do
     name=${names[$i]} path=${paths[$i]}
     [ -d "$st/$name" ] && [ ! -L "$st/$name" ] && [ -d "$path" ] && [ ! -L "$path" ] || continue
     if ! mount --bind "$st/$name" "$path"; then echo "ward: warning: could not mount the ward's own $name over $path" >&2; continue; fi
+    [ "$name:$path" != "agent-device:$adh" ] || adh_own=1
     [ "$name" = gradle ] || continue
     for f in gradle.properties init.d; do
       [ ! -e "$rt/gradle/$f" ] || ro_over "$rt/gradle/$f" "$path/$f" || echo "ward: warning: could not mount your $f over the ward's Gradle home" >&2
@@ -159,11 +161,10 @@ lock_down() {
   done
   # Yours holds a host daemon's state and token, so failing to show the ward's own is
   # not a warning: the ward gets an empty one instead, gone when it stops.
-  local adh
-  adh=$(readlink -f -- "$HOME/.agent-device")
-  { [ -d "$adh" ] || { mkdir -p -- "$adh" && chown --reference="$HOME" -- "$adh"; }; } &&
-    { mountpoint -q -- "$adh" || { mount -t tmpfs -o mode=0700,size=256m tmpfs "$adh" && chown --reference="$HOME" -- "$adh"; }; } ||
-    { echo "ward: could not hide your agent-device home ($adh), so the ward does not start" >&2; return 1; }
+  [ -n "$adh_own" ] || {
+    { [ -d "$adh" ] || { mkdir -p -- "$adh" && chown --reference="$HOME" -- "$adh"; }; } &&
+      mount -t tmpfs -o mode=0700,size=256m tmpfs "$adh" && chown --reference="$HOME" -- "$adh"
+  } || { echo "ward: could not hide your agent-device home ($adh), so the ward does not start" >&2; return 1; }
 }
 
 # The inner user namespace maps every id the outer one does to itself.
