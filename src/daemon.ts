@@ -41,6 +41,7 @@ import {
   wardTrashDir,
 } from "./paths.ts";
 import { consolePort, HOST_ADB, listDevices, loadDevices, reconcileDevices, releaseDevice, startDevice, startHostAdb, stopDevice, useDevice } from "./device.ts";
+import { mirrorDeviceHosts } from "./device-hosts.ts";
 import { acceptBuildCache, BUILD_CACHE_PORT, hasGradleBuild, ownFolder, projectStore, realFolder, sweepSoon, writeGradleSettings } from "./gradle.ts";
 import { wardHostPorts } from "./hostports.ts";
 import { listeningPorts } from "./procnet.ts";
@@ -230,12 +231,12 @@ async function prepareOwnHomes(record: WardRecord, gradleHome: string | undefine
   } catch (error) {
     return log(`ward ${record.id}: starts without folders of its own over yours: ${String(error)}`);
   }
-  // NAME, the folder of yours it goes over, and what to clone it from.
+  // NAME, the folder of yours it goes over (a thunk, since realFolder can throw), and what to clone it from.
   const homes: (readonly [string, () => string, string | undefined])[] = [
+    ...(gradleHome === undefined ? [] : [["gradle", () => gradleHome, hasGradleBuild(record.worktree) ? gradleHome : undefined] as const]),
     ["kotlin-daemon", () => realFolder(KOTLIN_DAEMON_DIR), undefined],
     ["agent-device", () => realFolder(AGENT_DEVICE_HOME), undefined],
   ];
-  if (gradleHome !== undefined) homes.unshift(["gradle", () => gradleHome, hasGradleBuild(record.worktree) ? gradleHome : undefined]);
   let lines = "";
   for (const [name, path, clone] of homes) {
     try {
@@ -279,10 +280,17 @@ function writeEnvFile(record: WardRecord, gradleHome: string | undefined): void 
     // on the ward's loopback only: USB devices are the host server's, and two servers fight over one.
     ADB_USB: "0",
     ADB_MDNS: "0",
-    // agent-device runs its own daemon in the ward, which T3's close on device_close doesn't
-    // reach (it goes to T3's daemon), so a session nobody closes would hold the ward's device
-    // from other threads' sessions: one idle this long lets go of it.
-    AGENT_DEVICE_SESSION_IDLE_TIMEOUT_MS: String(30 * 60_000),
+    // agent-device runs its own daemon in the ward, from the ward's own home (ward-init-root),
+    // named here so nothing inherited points it elsewhere and `replay`/`test` use the same
+    // daemon as the session they run in, not a throwaway one.
+    AGENT_DEVICE_HOME,
+    AGENT_DEVICE_STATE_DIR: AGENT_DEVICE_HOME,
+    AGENT_DEVICE_CLAIMS_DIR: join(AGENT_DEVICE_HOME, "device-claims"),
+    // T3's close on device_close goes to T3's daemon, not the ward's, so a session nobody
+    // closes would hold the ward's device from other threads' sessions (a delegated child
+    // shares its parent's ward): one idle this long lets go of it. Sessions with a recording,
+    // log, trace or lease running never expire.
+    AGENT_DEVICE_SESSION_IDLE_TIMEOUT_MS: String(10 * 60_000),
   };
   if (process.env.GRADLE_USER_HOME && gradleHome !== undefined) vars.GRADLE_USER_HOME = gradleHome;
   const sdk = process.env.ANDROID_HOME;
@@ -337,7 +345,7 @@ async function up(worktree: string): Promise<UpResult> {
     const gradleHome = prepareGradle(record);
     if (starting) {
       writeHostPorts(record);
-      mirrorDeviceHosts(); // ward-init-root mounts it, so it must be there before the ward starts
+      refreshDeviceHosts(); // ward-init-root mounts it, so it must be there before the ward starts
       await prepareOwnHomes(record, gradleHome);
     }
     writeEnvFile(record, gradleHome);
@@ -970,8 +978,8 @@ function scan(id: string): Promise<unknown> {
     }
   }
   for (const port of ward.containerPorts) if (!found.has(port)) found.set(port, ["127.0.0.1"]);
-  // The broker's own listeners, and the ward's adb server, which only the ward is to reach.
-  for (const port of [BUILD_CACHE_PORT, ADB_PORT, ADB_SERVER_PORT, ...ward.devicePorts]) found.delete(port);
+  // The broker's own listeners, and the ward's adb server and agent-device daemon, which only the ward is to reach.
+  for (const port of [BUILD_CACHE_PORT, ADB_PORT, ADB_SERVER_PORT, ...ward.devicePorts, ...agentDevicePorts(id)]) found.delete(port);
   ward.listening.clear();
   // Close listeners whose port went quiet, so the host sees "refused", not accept-then-reset.
   // The registry keeps the port number for when it listens again.
@@ -1262,36 +1270,64 @@ function forward(id: string, wardPort: number, client: Socket): void {
 /**
  * The agent-device command T3's `device_open` returns names a config in
  * <T3 home>/userdata/device/hosts: the address and token of T3's device daemon,
- * which runs on the host as you. A ward sees DEVICE_HOSTS_MIRROR there instead, the
- * same file names each holding `{}`, so the CLI starts a daemon of its own inside
- * the ward (docs/DESIGN.md: Devices). The contents never change, so a file is
- * written once and removed when T3's is.
+ * which runs on the host as you. A ward sees DEVICE_HOSTS_MIRROR there instead
+ * (src/device-hosts.ts), mounted by ward-init-root; if it can't be made, the ward
+ * sees no configs at all.
  */
 const DEVICE_HOSTS = join(T3_HOME, "userdata/device/hosts");
-let deviceHostsWatcher: FSWatcher | undefined;
+/** The watch on DEVICE_HOSTS, and the folder (inode) it watches: T3 may replace the folder. */
+let deviceHostsWatch: { readonly watcher: FSWatcher; readonly ino: number } | undefined;
 
-function mirrorDeviceHosts(): void {
-  let names: string[];
+function refreshDeviceHosts(): void {
   try {
-    names = readdirSync(DEVICE_HOSTS).filter((name) => name.endsWith(".json") && !name.startsWith("."));
-  } catch {
-    names = []; // no device host yet
+    mirrorDeviceHosts(DEVICE_HOSTS, DEVICE_HOSTS_MIRROR);
+  } catch (error) {
+    log(`could not update wards' copy of T3's device configs: ${String(error)}`);
   }
-  mkdirSync(DEVICE_HOSTS_MIRROR, { recursive: true });
-  for (const name of readdirSync(DEVICE_HOSTS_MIRROR)) if (!names.includes(name)) rmSync(join(DEVICE_HOSTS_MIRROR, name), { force: true });
-  for (const name of names) if (!existsSync(join(DEVICE_HOSTS_MIRROR, name))) writeFileSync(join(DEVICE_HOSTS_MIRROR, name), "{}\n");
 }
 
-/** Mirror the configs and follow them; called on every reconcile, so a folder that appears later is watched too. */
+/** Mirror the configs and follow them; on every reconcile, so a folder made or replaced since is watched. */
 function watchDeviceHosts(): void {
-  mirrorDeviceHosts();
-  if (deviceHostsWatcher !== undefined || !existsSync(DEVICE_HOSTS)) return;
+  refreshDeviceHosts();
+  let ino: number | undefined;
+  try {
+    ino = statSync(DEVICE_HOSTS).ino;
+  } catch {
+    ino = undefined;
+  }
+  if (deviceHostsWatch !== undefined && deviceHostsWatch.ino === ino) return;
+  deviceHostsWatch?.watcher.close();
+  deviceHostsWatch = undefined;
+  if (ino === undefined) return;
   let soon: NodeJS.Timeout | undefined;
-  deviceHostsWatcher = watch(DEVICE_HOSTS, () => {
+  const watcher = watch(DEVICE_HOSTS, () => {
     clearTimeout(soon);
-    soon = setTimeout(mirrorDeviceHosts, 100);
+    soon = setTimeout(refreshDeviceHosts, 100);
   });
-  deviceHostsWatcher.on("error", () => (deviceHostsWatcher?.close(), (deviceHostsWatcher = undefined)));
+  watcher.on("error", () => {
+    watcher.close();
+    if (deviceHostsWatch?.watcher === watcher) deviceHostsWatch = undefined;
+  });
+  deviceHostsWatch = { watcher, ino };
+}
+
+/**
+ * The ports agent-device's daemon in the ward listens on, from the daemon.json in
+ * the ward's own agent-device home: only the ward reaches it, and a new one each
+ * start would take another of the ward's host ports. The ward writes the file, so
+ * it decides only what isn't mapped.
+ */
+function agentDevicePorts(id: string): number[] {
+  try {
+    const file = join(wardStateDir(id), "agent-device", "daemon.json");
+    const stat = statSync(file, { throwIfNoEntry: false });
+    if (stat === undefined || !stat.isFile() || stat.size > 64 * 1024) return [];
+    const info: unknown = JSON.parse(readFileSync(file, "utf8"));
+    if (typeof info !== "object" || info === null) return [];
+    return [("port" in info && info.port), ("httpPort" in info && info.httpPort)].filter((p): p is number => typeof p === "number");
+  } catch {
+    return [];
+  }
 }
 
 // ── Devices ──────────────────────────────────────────────────────────────────
@@ -1559,7 +1595,8 @@ const handlers: Handlers = {
   },
   "POST /desktop": (body) => ("thread" in body ? threadDesktop(body.thread, body.cwd) : desktop(body.id, body.worktree).finally(watchWorktreeParents)),
   "POST /gc": async () => ({ actions: await runReconcile() }),
-  "POST /device": ({ id, worktree, keepMs }) => device(id, worktree, keepMs).finally(watchWorktreeParents),
+  // T3 asks for the ward's device before handing out the command that reads its config.
+  "POST /device": ({ id, worktree, keepMs }) => (refreshDeviceHosts(), device(id, worktree, keepMs).finally(watchWorktreeParents)),
   "POST /device/stop": async ({ id, worktree }) => {
     const record = requireRecord(id, worktree);
     const stopped = await stopDevice(record.id);
