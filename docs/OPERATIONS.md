@@ -29,7 +29,7 @@ Ward devices copy the hardware and system image of one of your AVDs, which is on
 - From inside a ward, `ward` can only map that ward's ports, start its desktop, start and stop its device and list it; stopping, removing or starting wards, and anything about another ward, is for the host.
 - `/tmp` and `XDG_RUNTIME_DIR` are the host's, shared by every ward, so keep per-worktree pid files and sockets in `TMPDIR`.
 - `ps` shows only the ward's own processes and `kill` reaches nothing else; there is no `systemctl --user`, and the session bus reaches only the keyring.
-- Ward's own state, config and checkout are read-only; Ward's T3 token and T3's `userdata` (except `attachments`, and read-only the `device/targets` and `device/hosts` that T3's `agent-device` CLI reads, which hold its daemon's token) are hidden. A screen-timeline recorder's store (`~/.local/share/miranda`) is hidden too, apart from its shell hook's folder. [DESIGN.md](DESIGN.md) lists what a ward can still reach on purpose.
+- Ward's own state, config and checkout are read-only; Ward's T3 token and T3's `userdata` (except `attachments`, and read-only the `device/targets` and `device/hosts` that T3's `agent-device` CLI reads, which hold its daemon's token: see DESIGN.md's Risks) are hidden. A screen-timeline recorder's store (`~/.local/share/miranda`) is hidden too, apart from its shell hook's folder. [DESIGN.md](DESIGN.md) lists what a ward can still reach on purpose.
 - Connections through a mapped port end with a reset when their ward stops or `wardd` restarts, so a transfer in flight fails rather than looking complete.
 
 ## Gradle
