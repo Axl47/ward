@@ -33,10 +33,11 @@ st=$WARD_STATE/wards/$id
 # - Credentials are hidden: Ward's config folder except the enable markers (so
 #   its T3 token, even one written after the ward started), and each T3 home's
 #   userdata (T3's keys and its database of every thread) except attachments and,
-#   in the T3 home Ward serves, read-only, what agent-device's CLI reads: the
-#   commands device_open returns (device/targets) and their configs (device/hosts),
-#   which hold the token of T3's device daemon (docs/DESIGN.md, Risks: what that
-#   token lets a ward do).
+#   in the T3 home Ward serves, read-only, the commands device_open returns
+#   (device/targets). The configs they name (device/hosts) hold the address and
+#   token of T3's device daemon; the ward sees only wardd's stub of the local
+#   host's, `{}`, so the CLI runs a daemon of its own in the ward (src/daemon.ts:
+#   prepareDeviceFolders). The served userdata is hidden even when it is a link.
 # - Miranda's store is hidden (the user's screen and terminal timeline, Glosses,
 #   every agent's commands, and the control file that turns recording on),
 #   except its `shell` folder, where the bash hook in a ward's terminal leaves
@@ -45,6 +46,8 @@ st=$WARD_STATE/wards/$id
 # - The Gradle build cache wardd keeps for every project is hidden.
 # - Your AVDs (~/.android/avd) are hidden: an emulator started in a ward would run
 #   from their disks. A ward's device is Ward's own, on the host.
+# - agent-device's home (~/.agent-device: its daemon's state, token and device
+#   claims) is the ward's own, like the Gradle home below; without that, an empty one.
 # - Your Gradle home and Kotlin daemon folder are the ward's own, so wards share
 #   no Gradle locks or daemons; your gradle.properties and init.d are read-only
 #   over its home.
@@ -54,14 +57,20 @@ st=$WARD_STATE/wards/$id
 lock_down() {
   local uid=$WARD_HOST_UID p a held=" " ancestors=() protected=() miranda=${MIRANDA_HOME:-$HOME/.local/share/miranda}
   local avds=${ANDROID_AVD_HOME:-$HOME/.android/avd}
+  # agent-device's home at its real path, where the ward's own (or an empty one) goes,
+  # noted while Ward's runtime folder is still writable: wardd reads its daemon's ports
+  # there (src/daemon.ts: agentDevicePorts), and the ward can retarget the link later.
+  local adh adh_own=
+  adh=$(readlink -f -- "$HOME/.agent-device")
+  printf '%s\n' "$adh" >"$rt/agent-device-home"
   # Each line of own-homes is NAME PATH: the ward's own $st/NAME goes over PATH, a real
-  # path of yours (wardd wrote it before the ward started: src/daemon.ts prepareGradle).
+  # path of yours (wardd wrote it before the ward started: src/daemon.ts prepareOwnHomes).
   local name path names=() paths=()
   if [ -f "$rt/own-homes" ]; then
     while read -r name path; do names+=("$name"); paths+=("$path"); done <"$rt/own-homes"
   fi
-  for p in "$WARD_STATE" "$WARD_CONFIG" "$WARD_RUNTIME" "$WARD_HOME" "$HOME"/.t3*/userdata "$WARD_T3/userdata" "$miranda" "$(readlink -f -- "$avds")" \
-           "/run/user/$uid/systemd" "/run/user/$uid/bus" "${XDG_RUNTIME_DIR:-}/systemd" "${XDG_RUNTIME_DIR:-}/bus" "${paths[@]}"; do
+  for p in "$WARD_STATE" "$WARD_CONFIG" "$WARD_RUNTIME" "$WARD_HOME" "$HOME"/.t3*/userdata "$(readlink -f -- "$WARD_T3/userdata")" "$miranda" "$(readlink -f -- "$avds")" \
+           "/run/user/$uid/systemd" "/run/user/$uid/bus" "${XDG_RUNTIME_DIR:-}/systemd" "${XDG_RUNTIME_DIR:-}/bus" "${paths[@]}" "$adh"; do
     [ -e "$p" ] && [ ! -L "$p" ] || continue
     p=$(readlink -f -- "$p")
     [[ " ${protected[*]} " != *" $p "* ]] || continue
@@ -76,18 +85,24 @@ lock_down() {
   # hide_except DIR ENTRY...: an empty, read-only DIR showing only the ENTRY folders
   # (paths under DIR) it had, each as writable as before. An entry reached through a
   # link is left out: a ward can make a T3 home of its own (~/.t3-x) whose links the
-  # mount would follow to a folder hidden elsewhere.
+  # mount would follow to a folder hidden elsewhere. An ENTRY=SOURCE shows the folder
+  # SOURCE, one of wardd's, at ENTRY instead.
   hide_except() {
-    local dir=$1 e owner sub part
+    local dir=$1 e src owner sub part
     shift
     exec 9<"$dir"
     owner=$(stat -c %u:%g "$dir")
     mount -t tmpfs -o mode=0755,size=64k tmpfs "$dir"
     chown "$owner" "$dir"
     for e in "$@"; do
-      sub=
-      for part in ${e//\// }; do sub=${sub:+$sub/}$part; [ ! -L "/proc/self/fd/9/$sub" ] || continue 2; done
-      if [ -d "/proc/self/fd/9/$e" ]; then mkdir -p "$dir/$e"; mount --no-canonicalize --bind "/proc/self/fd/9/$e" "$dir/$e"; fi
+      if [[ $e == *=* ]]; then
+        src=${e#*=} e=${e%%=*}
+      else
+        sub=
+        for part in ${e//\// }; do sub=${sub:+$sub/}$part; [ ! -L "/proc/self/fd/9/$sub" ] || continue 2; done
+        src=/proc/self/fd/9/$e
+      fi
+      if [ -d "$src" ]; then mkdir -p "$dir/$e"; mount --no-canonicalize --bind "$src" "$dir/$e"; fi
     done
     exec 9<&-
     seal "$dir"
@@ -111,13 +126,13 @@ lock_down() {
       # Your emulators (T3's shared ones among them): an emulator started in a ward would
       # run from their disks. A ward's device is Ward's own, on the host (src/device.ts).
       "$(readlink -f "$avds")") [ ! -d "$p" ] || mount -t tmpfs -o ro,mode=0755,size=4k tmpfs "$p" ;;
-      # T3's keys (secrets) and its databases are hidden. In the T3 home whose device
-      # daemon wardd relays (src/daemon.ts), agent-device's CLI needs the commands
-      # device_open hands out (device/targets) and the config each names, the daemon's
-      # address and token (device/hosts), both read-only: T3 replaces files there by
-      # renaming, so the folders are mounted, not the files.
+      # T3's keys (secrets) and its databases are hidden. In the T3 home Ward serves,
+      # agent-device's CLI needs the commands device_open hands out (device/targets) and
+      # the config each names (device/hosts), both read-only: T3 replaces files there
+      # by renaming, so the folders are mounted, not the files. T3's configs hold its
+      # device daemon's address and token; the ward gets wardd's stub of the local host's, `{}`.
       "$(readlink -f -- "$WARD_T3/userdata")")
-        hide_except "$p" attachments device/targets device/hosts
+        hide_except "$p" attachments device/targets "device/hosts=$WARD_RUNTIME/device-hosts"
         for a in "$p/device/targets" "$p/device/hosts"; do [ ! -d "$a" ] || seal "$a"; done ;;
       */userdata) hide_except "$p" attachments ;;
       */bus) if [ -S "$rt/bus" ]; then mount --bind "$rt/bus" "$p"; else mount --bind /dev/null "$p"; fi ;;
@@ -144,11 +159,18 @@ lock_down() {
     name=${names[$i]} path=${paths[$i]}
     [ -d "$st/$name" ] && [ ! -L "$st/$name" ] && [ -d "$path" ] && [ ! -L "$path" ] || continue
     if ! mount --bind "$st/$name" "$path"; then echo "ward: warning: could not mount the ward's own $name over $path" >&2; continue; fi
+    [ "$name:$path" != "agent-device:$adh" ] || adh_own=1
     [ "$name" = gradle ] || continue
     for f in gradle.properties init.d; do
       [ ! -e "$rt/gradle/$f" ] || ro_over "$rt/gradle/$f" "$path/$f" || echo "ward: warning: could not mount your $f over the ward's Gradle home" >&2
     done
   done
+  # Yours holds a host daemon's state and token, so failing to show the ward's own is
+  # not a warning: the ward gets an empty one instead, gone when it stops.
+  [ -n "$adh_own" ] || {
+    { [ -d "$adh" ] || { mkdir -p -- "$adh" && chown --reference="$HOME" -- "$adh"; }; } &&
+      mount -t tmpfs -o mode=0700,size=256m tmpfs "$adh" && chown --reference="$HOME" -- "$adh"
+  } || { echo "ward: could not hide your agent-device home ($adh), so the ward does not start" >&2; return 1; }
 }
 
 # The inner user namespace maps every id the outer one does to itself.
@@ -194,7 +216,9 @@ done
 # ward's ports never appear on the host under their own numbers. Outbound, the
 # host ports wardd wrote to $rt/host-ports (WARD_HOST_PORTS plus the project's
 # own) and DNS (the host's stub resolver at 127.0.0.53, which /etc/resolv.conf
-# names) reach the host's loopback.
+# names) reach the host's loopback, and nothing else does: --no-map-gw stops pasta
+# from making the gateway address the host's loopback, every port of it (T3's
+# device daemon, the host's adb server and so your phone).
 host_ports=$(cat "$rt/host-ports" 2>/dev/null || echo "$WARD_HOST_PORTS")
 # Deduplicated, since pasta refuses a port forwarded twice (the file may be edited by hand).
 pasta_t=(-T 53)
@@ -204,7 +228,7 @@ for p in ${host_ports//,/ }; do
   seen+="$p "
   pasta_t+=(-T "$p")
 done
-pasta --config-net --quiet --foreground -t none -u none -U 53 "${pasta_t[@]}" \
+pasta --config-net --quiet --foreground --no-map-gw -t none -u none -U 53 "${pasta_t[@]}" \
   --netns "/proc/$ns/ns/net" --runas 0:0 &
 
 # 3. Podman, as root of the ward, in its own mount namespace with private /run

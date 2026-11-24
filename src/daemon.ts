@@ -4,7 +4,8 @@
 // the Gradle build cache a project's wards share (src/gradle.ts), and gives each
 // ward an Android device of its own (src/device.ts).
 import { execFile, spawn, type ChildProcess } from "node:child_process";
-import { closeSync, existsSync, fstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, readSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, watch, writeFileSync, type FSWatcher } from "node:fs";
+import { createHash } from "node:crypto";
+import { closeSync, constants, existsSync, fstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, readSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, watch, writeFileSync, type FSWatcher } from "node:fs";
 import { createServer as createHttpServer, request as httpRequest, type ClientRequest, type IncomingMessage, type ServerResponse } from "node:http";
 import { type Server, type Socket } from "node:net";
 import { homedir, userInfo } from "node:os";
@@ -15,11 +16,13 @@ import type { BrokerReply, BrokerRequest, DeviceInfo, DeviceResult, PortInfo, Ro
 import { identify, type Caller } from "./caller.ts";
 import {
   ACTIVITY_DIR,
+  AGENT_DEVICE_HOME,
   BUILD_CACHE_DIR,
   CONTROL_SOCKET,
   desktopStateDir,
   THREAD_WARDS_DIR,
   desktopUnitName,
+  DEVICE_HOSTS_STUB,
   GRADLE_SOURCE_HOME,
   KOTLIN_DAEMON_DIR,
   HOST_PORTS,
@@ -60,7 +63,12 @@ const DESKTOP_TIMEOUT_MS = 8_000;
 /** A running ward's in-memory plumbing. */
 interface LiveWard {
   readonly broker: ChildProcess;
+  /** In the ward's user and network namespaces only, so /proc/<brokerPid>/root is the host's view. */
   readonly brokerPid: number;
+  /** The ward's own process from its `pid` file, in its mount namespace: /proc/<wardPid>/root is the ward's view. */
+  readonly wardPid: number;
+  /** agent-device's home at its real path, as ward-init-root noted it when the ward started and mounted the ward's own there. */
+  readonly agentDeviceHome: string;
   /** Ward port → host-side listener. */
   readonly listeners: Map<number, Server>;
   /** Ward port → addresses to dial, from the last socket scan. */
@@ -85,8 +93,6 @@ interface LiveWard {
   nextReq: number;
   /** Host ports pasta forwards into the ward; they listen inside it but aren't the ward's own. */
   readonly hostPorts: ReadonlySet<number>;
-  /** The host port the broker relays (T3's device daemon), listening inside the ward but not the ward's own. */
-  relayPort: number | undefined;
   /** The console and adb ports of the ward's device, which the broker relays while it runs: also not the ward's own. */
   devicePorts: readonly number[];
   /** The ward's adb server, while it is being started. */
@@ -196,38 +202,67 @@ function writeHostPorts(record: WardRecord): void {
 
 /**
  * Gradle for a ward (src/gradle.ts), on every `up`: your settings, which ward-init-root
- * mounts over its home. When it starts: its own Gradle home (cloned from yours the
- * first time, if its worktree has a Gradle build) and Kotlin daemon folder, listed
- * with the paths of yours they go over in `own-homes`, which ward-init-root reads.
- * A failure is logged and the ward starts without them. Resolves to the real path of
- * your Gradle home, or undefined after a failure.
+ * mounts over its home. Resolves to the real path of your Gradle home, or undefined
+ * after a failure, which is logged.
  */
-async function prepareGradle(record: WardRecord, starting: boolean): Promise<string | undefined> {
-  const rt = wardRuntimeDir(record.id);
+function prepareGradle(record: WardRecord): string | undefined {
   try {
     const source = realFolder(GRADLE_SOURCE_HOME);
-    writeGradleSettings(join(rt, "gradle"), source);
-    if (!starting) return source;
-    rmSync(join(rt, "own-homes"), { force: true });
-    // The ward owns its state folder: write there only while none of its processes can run.
-    // A failed unit can have processes left, so its cgroup must be empty or gone as well.
+    writeGradleSettings(join(wardRuntimeDir(record.id), "gradle"), source);
+    return source;
+  } catch (error) {
+    log(`ward ${record.id}: could not prepare Gradle, so it goes on without your Gradle settings: ${String(error)}`);
+    return undefined;
+  }
+}
+
+/**
+ * When a ward starts, the folders of its own that ward-init-root mounts over yours, at
+ * the same paths, listed in `own-homes`: its Gradle home (cloned from yours the first
+ * time, if its worktree has a Gradle build) when `gradleHome` is set, its Kotlin daemon
+ * folder, and agent-device's home. Each that fails is logged and left out.
+ */
+async function prepareOwnHomes(record: WardRecord, gradleHome: string | undefined): Promise<void> {
+  const rt = wardRuntimeDir(record.id);
+  rmSync(join(rt, "own-homes"), { force: true });
+  // The ward owns its state folder: write there only while none of its processes can run.
+  // A failed unit can have processes left, so its cgroup must be empty or gone as well.
+  try {
     const { stdout } = await systemctl("show", "--property=ActiveState,ControlGroup", unitName(record.id));
     const unit = Object.fromEntries(stdout.split("\n").map((line) => line.split(/=(.*)/s)));
     if (unit.ActiveState !== "inactive" && unit.ActiveState !== "failed") throw new Error(`its unit is ${unit.ActiveState}`);
     const procs = join("/sys/fs/cgroup", unit.ControlGroup ?? "", "cgroup.procs");
     if (unit.ControlGroup && existsSync(procs) && readFileSync(procs, "utf8").trim() !== "") throw new Error("its unit still has processes");
-    const kotlin = realFolder(KOTLIN_DAEMON_DIR);
-    // own-homes is NAME PATH lines that ward-init-root reads word by word.
-    if ([source, kotlin].some((path) => /\n|^\s|\s$/.test(path))) throw new Error("a path starts or ends with a space, or has a line break");
-    const failure = await ownFolder(join(wardStateDir(record.id), "gradle"), hasGradleBuild(record.worktree) ? source : undefined);
-    if (failure !== undefined) log(`ward ${record.id}: ${failure}`);
-    await ownFolder(join(wardStateDir(record.id), "kotlin-daemon"));
-    writeFileSync(join(rt, "own-homes"), `gradle ${source}\nkotlin-daemon ${kotlin}\n`);
-    return source;
   } catch (error) {
-    log(`ward ${record.id}: could not prepare Gradle, so it ${starting ? "starts" : "goes on"} without its own Gradle home: ${String(error)}`);
-    return undefined;
+    return log(`ward ${record.id}: starts without folders of its own over yours: ${String(error)}`);
   }
+  // agent-device's state is its daemon's, which stopped with the ward: a device claim left
+  // there would hold the ward's device from the next daemon (DEVICE_IN_USE), so it starts empty.
+  try {
+    rmSync(join(wardStateDir(record.id), "agent-device"), { recursive: true, force: true });
+  } catch (error) {
+    log(`ward ${record.id}: could not empty its agent-device home: ${String(error)}`);
+  }
+  // NAME, the folder of yours it goes over (a thunk, since realFolder can throw), and what to clone it from.
+  const homes: (readonly [string, () => string, string | undefined])[] = [
+    ...(gradleHome === undefined ? [] : [["gradle", () => gradleHome, hasGradleBuild(record.worktree) ? gradleHome : undefined] as const]),
+    ["kotlin-daemon", () => realFolder(KOTLIN_DAEMON_DIR), undefined],
+    ["agent-device", () => realFolder(AGENT_DEVICE_HOME), undefined],
+  ];
+  let lines = "";
+  for (const [name, path, clone] of homes) {
+    try {
+      const target = path();
+      // own-homes is NAME PATH lines that ward-init-root reads word by word.
+      if (/\n|^\s|\s$/.test(target)) throw new Error(`${target} starts or ends with a space, or has a line break`);
+      const failure = await ownFolder(join(wardStateDir(record.id), name), clone);
+      if (failure !== undefined) log(`ward ${record.id}: ${failure}`);
+      lines += `${name} ${target}\n`;
+    } catch (error) {
+      log(`ward ${record.id}: it starts without its own ${name} folder: ${String(error)}`);
+    }
+  }
+  writeFileSync(join(rt, "own-homes"), lines);
 }
 
 /**
@@ -257,6 +292,17 @@ function writeEnvFile(record: WardRecord, gradleHome: string | undefined): void 
     // on the ward's loopback only: USB devices are the host server's, and two servers fight over one.
     ADB_USB: "0",
     ADB_MDNS: "0",
+    // agent-device runs its own daemon in the ward, from the ward's own home (ward-init-root),
+    // named here so nothing inherited points it elsewhere and `replay`/`test` use the same
+    // daemon as the session they run in, not a throwaway one.
+    AGENT_DEVICE_HOME,
+    AGENT_DEVICE_STATE_DIR: AGENT_DEVICE_HOME,
+    AGENT_DEVICE_CLAIMS_DIR: join(AGENT_DEVICE_HOME, "device-claims"),
+    // T3's close on device_close goes to T3's daemon, not the ward's, so a session nobody
+    // closes would hold the ward's device from other threads' sessions (a delegated child
+    // shares its parent's ward): one idle this long lets go of it. Sessions with a recording,
+    // log, trace or lease running never expire.
+    AGENT_DEVICE_SESSION_IDLE_TIMEOUT_MS: String(10 * 60_000),
   };
   if (process.env.GRADLE_USER_HOME && gradleHome !== undefined) vars.GRADLE_USER_HOME = gradleHome;
   const sdk = process.env.ANDROID_HOME;
@@ -308,8 +354,13 @@ async function up(worktree: string): Promise<UpResult> {
       log(`ward ${record.id} got slot ${record.slot}`);
     }
     const starting = !isReady(record.id);
-    if (starting) writeHostPorts(record);
-    writeEnvFile(record, await prepareGradle(record, starting));
+    const gradleHome = prepareGradle(record);
+    if (starting) {
+      writeHostPorts(record);
+      prepareDeviceFolders();
+      await prepareOwnHomes(record, gradleHome);
+    }
+    writeEnvFile(record, gradleHome);
     if (starting) {
       await systemctl("start", unitName(record.id));
       await waitReady(record.id);
@@ -822,6 +873,14 @@ function attach(record: WardRecord): void {
   const ward: LiveWard = {
     broker,
     brokerPid: broker.pid,
+    wardPid: pid,
+    agentDeviceHome: (() => {
+      try {
+        return readFileSync(join(wardRuntimeDir(record.id), "agent-device-home"), "utf8").trim();
+      } catch {
+        return AGENT_DEVICE_HOME; // a ward started before ward-init-root noted it
+      }
+    })(),
     listeners: new Map(),
     listening: new Map(),
     pending: new Map(),
@@ -836,7 +895,6 @@ function attach(record: WardRecord): void {
     connections: new Set(),
     nextReq: 1,
     hostPorts: new Set([53, ...readHostPorts(record.id)]),
-    relayPort: undefined,
     devicePorts: [],
     adbServer: undefined,
     adbReclaimedAt: 0,
@@ -848,7 +906,6 @@ function attach(record: WardRecord): void {
       if (ward.scanTimer !== undefined) return;
       ward.scanTimer = setInterval(() => void scan(record.id), 1000);
       watchContainers(record.id, ward);
-      relayDeviceDaemon(ward);
       broker.send({ t: "relay", port: BUILD_CACHE_PORT } satisfies BrokerRequest);
       if (hasOwnAdb(ward)) broker.send({ t: "relay", port: ADB_PORT } satisfies BrokerRequest);
       else adbRelayed();
@@ -874,7 +931,6 @@ function attach(record: WardRecord): void {
         return void acceptAdb(upstream, { device: () => wardDevice(record.id), server: () => wardAdb(record.id, ward) });
       }
       if (ward.devicePorts.includes(reply.port)) return relayToDevice(record.id, ward, reply.port, upstream);
-      if (reply.port === ward.relayPort) return relayToHost(upstream, reply.port, (s) => track(ward, s));
       return void upstream.destroy(); // a port that was relayed when it connected, and is no longer
     }
     const callback = ward.pending.get(reply.req);
@@ -938,12 +994,12 @@ function scan(id: string): Promise<unknown> {
       return Promise.resolve(); // broker gone; its exit handler detaches the ward
     }
     for (const [port, hosts] of listeningPorts(text)) {
-      if (!ward.hostPorts.has(port) && port !== ward.relayPort) found.set(port, [...new Set([...(found.get(port) ?? []), ...hosts])]);
+      if (!ward.hostPorts.has(port)) found.set(port, [...new Set([...(found.get(port) ?? []), ...hosts])]);
     }
   }
   for (const port of ward.containerPorts) if (!found.has(port)) found.set(port, ["127.0.0.1"]);
-  // The broker's own listeners, and the ward's adb server, which only the ward is to reach.
-  for (const port of [BUILD_CACHE_PORT, ADB_PORT, ADB_SERVER_PORT, ...ward.devicePorts]) found.delete(port);
+  // The broker's own listeners, and the ward's adb server and agent-device daemon, which only the ward is to reach.
+  for (const port of [BUILD_CACHE_PORT, ADB_PORT, ADB_SERVER_PORT, ...ward.devicePorts, ...agentDevicePorts(ward)]) found.delete(port);
   ward.listening.clear();
   // Close listeners whose port went quiet, so the host sees "refused", not accept-then-reset.
   // The registry keeps the port number for when it listens again.
@@ -1229,51 +1285,56 @@ function forward(id: string, wardPort: number, client: Socket): void {
   );
 }
 
-// ── T3's device daemon ───────────────────────────────────────────────────────
+// ── agent-device's config ────────────────────────────────────────────────────
 
 /**
- * T3's device daemon (agent-device) listens on a new random port each time it
- * starts, and its CLI dials 127.0.0.1 at the port daemon.json names. pasta's
- * forwards are fixed when a ward starts, so the broker relays that port instead,
- * moved whenever daemon.json changes.
+ * Before a ward starts, what ward-init-root shows of T3's device folders. The command
+ * T3's `device_open` returns lives in <T3 home>/userdata/device/targets, made here if
+ * T3 hasn't yet, since one missing at the start stays missing in the ward. It names a
+ * config in device/hosts, which holds the address and token of T3's device daemon; the
+ * ward sees DEVICE_HOSTS_STUB there instead: only the local host's file, holding `{}`, so
+ * the CLI starts a daemon of its own in the ward (docs/DESIGN.md: Devices), and a command
+ * for a remote host finds no config. A failure is logged; the ward then shows neither.
  */
-const DEVICE_DAEMON_FILE = join(T3_HOME, "userdata/device/agent-device/daemon.json");
-let devicePort = readDevicePort();
-let deviceWatcher: FSWatcher | undefined;
-
-function readDevicePort(): number | undefined {
+function prepareDeviceFolders(): void {
   try {
-    const { httpPort } = JSON.parse(readFileSync(DEVICE_DAEMON_FILE, "utf8")) as { httpPort?: unknown };
-    return typeof httpPort === "number" && Number.isInteger(httpPort) && httpPort > 0 && httpPort < 65536 ? httpPort : undefined;
-  } catch {
-    return undefined; // no daemon yet, or T3 is mid-write; the watcher reads it again
+    mkdirSync(join(T3_HOME, "userdata/device/targets"), { recursive: true });
+    mkdirSync(DEVICE_HOSTS_STUB, { recursive: true });
+    // Annex names a host's config by its id's hash (AgentDeviceTarget.ts: agentDeviceConfigPath).
+    const local = `${createHash("sha256").update("local").digest("hex").slice(0, 24)}.json`;
+    if (!existsSync(join(DEVICE_HOSTS_STUB, local))) writeFileSync(join(DEVICE_HOSTS_STUB, local), "{}\n");
+  } catch (error) {
+    log(`could not prepare T3's device folders for wards: ${String(error)}`);
   }
 }
 
-/** Point a ward's relay at the device daemon's current port; ports pasta already forwards need none. */
-function relayDeviceDaemon(ward: LiveWard): void {
-  const port = devicePort !== undefined && devicePort !== BUILD_CACHE_PORT && !ward.hostPorts.has(devicePort) ? devicePort : undefined;
-  if (ward.scanTimer === undefined || ward.relayPort === port) return;
-  if (ward.relayPort !== undefined) ward.broker.send({ t: "unrelay", port: ward.relayPort } satisfies BrokerRequest);
-  ward.relayPort = port;
-  if (port !== undefined) ward.broker.send({ t: "relay", port } satisfies BrokerRequest);
-}
-
-/** Follow daemon.json; called on every reconcile, so a folder that appears later is watched too. */
-function watchDeviceDaemon(): void {
-  const refresh = () => {
-    devicePort = readDevicePort();
-    for (const ward of live.values()) relayDeviceDaemon(ward);
-  };
-  refresh();
-  if (deviceWatcher !== undefined || !existsSync(dirname(DEVICE_DAEMON_FILE))) return;
-  let soon: NodeJS.Timeout | undefined;
-  deviceWatcher = watch(dirname(DEVICE_DAEMON_FILE), (_event, name) => {
-    if (name !== basename(DEVICE_DAEMON_FILE)) return;
-    clearTimeout(soon);
-    soon = setTimeout(refresh, 100);
-  });
-  deviceWatcher.on("error", () => (deviceWatcher?.close(), (deviceWatcher = undefined)));
+/**
+ * The ports agent-device's daemon in the ward listens on, from the daemon.json in
+ * agent-device's home as the ward sees it (its own folder, or the empty one
+ * ward-init-root falls back to): only the ward reaches it, and a new one each start
+ * would take another of the ward's host ports. The ward writes the file, so it decides
+ * only what isn't mapped, and it is read at the real path ward-init-root noted when the
+ * ward started (a link would resolve against wardd's root, and the ward can retarget
+ * ~/.agent-device) and opened so that a link or a FIFO there can't make wardd read
+ * elsewhere or wait. The daemon listens just before it writes the file, so a scan
+ * in between still maps that port, rarely.
+ */
+function agentDevicePorts({ wardPid, agentDeviceHome }: LiveWard): number[] {
+  let fd: number | undefined;
+  try {
+    fd = openSync(`/proc/${wardPid}/root${agentDeviceHome}/daemon.json`, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    const stat = fstatSync(fd);
+    if (!stat.isFile() || stat.size > 64 * 1024) return [];
+    const size = stat.size;
+    const buffer = Buffer.alloc(size);
+    const info: unknown = JSON.parse(buffer.subarray(0, readSync(fd, buffer, 0, size, 0)).toString("utf8"));
+    if (typeof info !== "object" || info === null) return [];
+    return ["port" in info && info.port, "httpPort" in info && info.httpPort].filter((p): p is number => typeof p === "number");
+  } catch {
+    return [];
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
 }
 
 // ── Devices ──────────────────────────────────────────────────────────────────
@@ -1446,7 +1507,6 @@ function dropDevice(id: string): void {
  * shouldStop).
  */
 async function reconcile(): Promise<string[]> {
-  watchDeviceDaemon();
   const actions: string[] = [];
   let threads: Map<string, ThreadState[]> | undefined;
   let allThreads: readonly ShellThread[] | undefined;

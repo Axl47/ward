@@ -89,6 +89,14 @@ export function projectHostPorts(repo: string): number[] {
 export const GRADLE_SOURCE_HOME = env.GRADLE_USER_HOME ?? join(home, ".gradle");
 /** Where Kotlin daemons leave their run files; each ward gets its own folder mounted over it. */
 export const KOTLIN_DAEMON_DIR = join(env.XDG_DATA_HOME || join(home, ".local/share"), "kotlin/daemon");
+/**
+ * agent-device's home: its default state folder (the daemon's address and token, sessions)
+ * and device claims. Each ward gets its own folder mounted over it, so the CLI there runs
+ * its own daemon and never meets another's.
+ */
+export const AGENT_DEVICE_HOME = join(home, ".agent-device");
+/** What a ward sees as T3's agent-device configs (src/daemon.ts: prepareDeviceFolders; ward-init-root mounts it). */
+export const DEVICE_HOSTS_STUB = join(RUNTIME_DIR, "device-hosts");
 /** The build cache wardd serves to wards: one folder per project, of entries named by key. */
 export const BUILD_CACHE_DIR = join(STATE_DIR, "build-cache");
 

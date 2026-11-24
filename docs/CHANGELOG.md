@@ -13,13 +13,16 @@ All notable changes to Ward are recorded here. The format follows [Keep a Change
 
 ### Changed
 
-- adb in a ward finds only the ward's own device. T3's shared emulators, other wards' devices and your phone no longer appear in `adb devices` there, so a Gradle install or a stray `adb -s` can't land on them. Use T3's device tools for those. Wards already running keep the old behavior until they are stopped and started.
+- adb in a ward finds only the ward's own device. T3's shared emulators, other wards' devices and your phone no longer appear in `adb devices` there, so a Gradle install or a stray `adb -s` can't land on them. Use T3's device tools for those from a thread without a ward. Wards already running keep the old behavior until they are stopped and started.
 - `adb reverse` in a ward opens its port inside the ward directly, with no host port in between.
 - Your own AVDs are hidden inside a ward, so an emulator started there can't boot or change T3's shared ones.
 - Emulator ports (5554–5585) can no longer be forwarded into wards with `--host-ports`, as adb's can't.
+- T3's `agent-device` command runs a daemon of its own inside the ward instead of using T3's daemon on the host. It reaches only the ward's device, and Maestro `runScript`, `--out` and app paths act inside the ward. A command `device_open` returns for any other device (a shared emulator, your phone, a remote device host) no longer works in a ward. An agent-device session left open lets go of the ward's device after 10 minutes idle. Wards already running lose agent-device until they are stopped and started.
 
 ### Fixed
 
+- A ward could read the token of T3's device daemon and, through it, drive any device on the host's adb server, read and write files the ward can't see, and run code on the host. A ward started now sees no token and can't reach that daemon. Restart running wards: until then they keep both.
+- A ward could reach every port on the host's loopback through its network gateway, including the host's adb server (your phone and every emulator) and T3's device daemon. Only the forwarded ports are reachable now, in wards started after this.
 - An app installed from the host (a Gradle `installDebug` or `adb install`) while Ward builds its base image no longer ends up in every ward's device: the image is built where no adb server can see it.
 - The first adb command right after a ward started could find no device and fail once: the ward now counts as started only when its adb port is ready.
 - Transfers through a ward's mapped ports no longer stall on protocols that send small acknowledgements: such traffic could run twenty times slower through a ward than on the host.
