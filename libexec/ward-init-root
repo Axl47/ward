@@ -77,15 +77,15 @@ lock_down() {
   adbpub=$(readlink -f -- "$HOME/.android/adbkey.pub") || adbpub=
   local nokey=
   [ -f "$adbkey" ] || nokey=1
-  # Your Podman's socket and state folders (ward-init made any that were missing), each of
-  # which must be covered below.
-  local podman_dirs=()
+  # Your Podman's socket and state folders (ward-init made any that were missing), each
+  # covered after the rest below, whatever else claims it.
+  local podman_dirs=() real
   for p in "/run/user/$uid" "${XDG_RUNTIME_DIR:-}"; do
     [ -n "$p" ] && [ -d "$p" ] || continue
     for a in podman libpod; do
-      [ -d "$p/$a" ] && [ ! -L "$p/$a" ] ||
+      [ -d "$p/$a" ] && [ ! -L "$p/$a" ] && real=$(readlink -f -- "$p/$a") ||
         { echo "ward: $p/$a is missing or not a folder, so the ward can't hide your Podman's and does not start" >&2; return 1; }
-      podman_dirs+=("$(readlink -f -- "$p/$a")")
+      [[ " ${podman_dirs[*]} " == *" $real "* ]] || podman_dirs+=("$real")
     done
   done
   # agent-device's home at its real path, where the ward's own (or an empty one) goes,
@@ -113,9 +113,6 @@ lock_down() {
     for a in "${ancestors[@]}"; do
       [[ $held == *" $a "* ]] || { mount --rbind "$a" "$a"; held+="$a "; }
     done
-  done
-  for p in "${podman_dirs[@]}"; do
-    [[ " ${protected[*]} " == *" $p "* ]] || { echo "ward: $p changed as the ward started, so it can't hide your Podman's and does not start" >&2; return 1; }
   done
   # hide_except DIR ENTRY...: an empty, read-only DIR showing only the ENTRY folders
   # (paths under DIR) it had, each as writable as before. An entry reached through a
@@ -174,14 +171,18 @@ lock_down() {
         for a in "$p/device/targets" "$p/device/hosts"; do [ ! -d "$a" ] || seal "$a"; done ;;
       */userdata) hide_except "$p" attachments ;;
       */bus) if [ -S "$rt/bus" ]; then mount --bind "$rt/bus" "$p"; else mount --bind /dev/null "$p"; fi ;;
-      */systemd | */podman) mount -t tmpfs -o ro,mode=0755,size=4k tmpfs "$p" ;;
-      # Writable: the podman CLI sets its sticky bit and keeps its pause.pid there.
-      */libpod)
-        { mount -t tmpfs -o mode=1700,size=16m tmpfs "$p" && chown --reference="$(dirname -- "$p")" -- "$p"; } ||
-          { echo "ward: could not hide your Podman's state ($p), so the ward does not start" >&2; return 1; } ;;
+      */systemd) mount -t tmpfs -o ro,mode=0755,size=4k tmpfs "$p" ;;
       "$adbkey" | "$adbpub")
         { mount --bind /dev/null "$p" && seal "$p"; } || { echo "ward: could not hide your adb key ($p), so the ward does not start" >&2; return 1; } ;;
     esac
+  done
+  # Your Podman's socket folder is empty and read-only; its state folder is the ward's own,
+  # writable, since the podman CLI sets its sticky bit and keeps its pause.pid there.
+  for p in "${podman_dirs[@]}"; do
+    [ -d "$p" ] && [ ! -L "$p" ] && case $p in
+      */podman) mount -t tmpfs -o ro,mode=0755,size=4k tmpfs "$p" ;;
+      *) mount -t tmpfs -o mode=1700,size=16m tmpfs "$p" && chown --reference="$(dirname -- "$p")" -- "$p" ;;
+    esac || { echo "ward: could not hide your Podman's $p, so the ward does not start" >&2; return 1; }
   done
   # ro_over SRC DST: SRC, which wardd keeps in the ward's runtime folder, read-only over
   # DST in the ward's own home, made first as SRC's kind; a link or another kind there
