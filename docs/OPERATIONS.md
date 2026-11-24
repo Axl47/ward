@@ -20,6 +20,8 @@ Each ward has an Android emulator of its own, and it is the only device adb find
 
 A device stops after 15 minutes without use (`WARD_DEVICE_IDLE=30m` for `wardd` changes that; `ward device --keep 2h` keeps this one, for up to 4 hours), when its ward stops, and with `ward device stop`. The next use starts a fresh one: apps installed and data on the old one are gone. At most 8 run at once (`WARD_DEVICE_MAX`), each holding about 3.6 GB of memory; one more takes the place of the device unused longest, if that has been 6 minutes, and is refused otherwise. `ward devices` lists every ward's device.
 
+In a ward, the `agent-device` command `device_open` returns drives only the ward's device, through a daemon of its own there. Its session holds the device from other threads until it has been idle 10 minutes, and `device_close` doesn't end it: run the command's `close` first to hand the device over at once.
+
 Ward devices copy the hardware and system image of one of your AVDs, which is only read: the first by name when Ward first looked (`WARD_DEVICE_TEMPLATE=name` for `wardd` picks another). For another API level, or your phone, use T3's device tools, which run outside the ward; your own AVDs are hidden in a ward, so an emulator started there can't run from them. Outside wards nothing changes: a Gradle install or `adb` on the host acts on every device listed, ward devices included, unless `ANDROID_SERIAL` names one.
 
 ## Limits

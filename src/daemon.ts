@@ -5,7 +5,7 @@
 // ward an Android device of its own (src/device.ts).
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
-import { closeSync, constants, existsSync, fstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, readSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, watch, writeFileSync, type FSWatcher } from "node:fs";
+import { closeSync, constants, existsSync, fstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, readSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, watch, writeFileSync, type FSWatcher } from "node:fs";
 import { createServer as createHttpServer, request as httpRequest, type ClientRequest, type IncomingMessage, type ServerResponse } from "node:http";
 import { type Server, type Socket } from "node:net";
 import { homedir, userInfo } from "node:os";
@@ -67,7 +67,7 @@ interface LiveWard {
   readonly brokerPid: number;
   /** The ward's own process from its `pid` file, in its mount namespace: /proc/<wardPid>/root is the ward's view. */
   readonly wardPid: number;
-  /** agent-device's home at its real path when the ward started, where ward-init-root mounted the ward's own. */
+  /** agent-device's home at its real path, as ward-init-root noted it when the ward started and mounted the ward's own there. */
   readonly agentDeviceHome: string;
   /** Ward port → host-side listener. */
   readonly listeners: Map<number, Server>;
@@ -235,6 +235,13 @@ async function prepareOwnHomes(record: WardRecord, gradleHome: string | undefine
     if (unit.ControlGroup && existsSync(procs) && readFileSync(procs, "utf8").trim() !== "") throw new Error("its unit still has processes");
   } catch (error) {
     return log(`ward ${record.id}: starts without folders of its own over yours: ${String(error)}`);
+  }
+  // agent-device's state is its daemon's, which stopped with the ward: a device claim left
+  // there would hold the ward's device from the next daemon (DEVICE_IN_USE), so it starts empty.
+  try {
+    rmSync(join(wardStateDir(record.id), "agent-device"), { recursive: true, force: true });
+  } catch (error) {
+    log(`ward ${record.id}: could not empty its agent-device home: ${String(error)}`);
   }
   // NAME, the folder of yours it goes over (a thunk, since realFolder can throw), and what to clone it from.
   const homes: (readonly [string, () => string, string | undefined])[] = [
@@ -869,9 +876,9 @@ function attach(record: WardRecord): void {
     wardPid: pid,
     agentDeviceHome: (() => {
       try {
-        return realpathSync(AGENT_DEVICE_HOME);
+        return readFileSync(join(wardRuntimeDir(record.id), "agent-device-home"), "utf8").trim();
       } catch {
-        return AGENT_DEVICE_HOME;
+        return AGENT_DEVICE_HOME; // a ward started before ward-init-root noted it
       }
     })(),
     listeners: new Map(),
@@ -1306,10 +1313,10 @@ function prepareDeviceFolders(): void {
  * agent-device's home as the ward sees it (its own folder, or the empty one
  * ward-init-root falls back to): only the ward reaches it, and a new one each start
  * would take another of the ward's host ports. The ward writes the file, so it decides
- * only what isn't mapped, and it is read at agent-device home's real path from when
- * the ward started (where ward-init-root mounted it; a link would resolve against
- * wardd's root, and the ward can retarget ~/.agent-device) and opened so that a link
- * or a FIFO there can't make wardd read elsewhere or wait. The daemon listens just before it writes the file, so a scan
+ * only what isn't mapped, and it is read at the real path ward-init-root noted when the
+ * ward started (a link would resolve against wardd's root, and the ward can retarget
+ * ~/.agent-device) and opened so that a link or a FIFO there can't make wardd read
+ * elsewhere or wait. The daemon listens just before it writes the file, so a scan
  * in between still maps that port, rarely.
  */
 function agentDevicePorts({ wardPid, agentDeviceHome }: LiveWard): number[] {

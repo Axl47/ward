@@ -57,6 +57,12 @@ st=$WARD_STATE/wards/$id
 lock_down() {
   local uid=$WARD_HOST_UID p a held=" " ancestors=() protected=() miranda=${MIRANDA_HOME:-$HOME/.local/share/miranda}
   local avds=${ANDROID_AVD_HOME:-$HOME/.android/avd}
+  # agent-device's home at its real path, where the ward's own (or an empty one) goes,
+  # noted while Ward's runtime folder is still writable: wardd reads its daemon's ports
+  # there (src/daemon.ts: agentDevicePorts), and the ward can retarget the link later.
+  local adh adh_own=
+  adh=$(readlink -f -- "$HOME/.agent-device")
+  printf '%s\n' "$adh" >"$rt/agent-device-home"
   # Each line of own-homes is NAME PATH: the ward's own $st/NAME goes over PATH, a real
   # path of yours (wardd wrote it before the ward started: src/daemon.ts prepareOwnHomes).
   local name path names=() paths=()
@@ -64,7 +70,7 @@ lock_down() {
     while read -r name path; do names+=("$name"); paths+=("$path"); done <"$rt/own-homes"
   fi
   for p in "$WARD_STATE" "$WARD_CONFIG" "$WARD_RUNTIME" "$WARD_HOME" "$HOME"/.t3*/userdata "$(readlink -f -- "$WARD_T3/userdata")" "$miranda" "$(readlink -f -- "$avds")" \
-           "/run/user/$uid/systemd" "/run/user/$uid/bus" "${XDG_RUNTIME_DIR:-}/systemd" "${XDG_RUNTIME_DIR:-}/bus" "${paths[@]}" "$(readlink -f -- "$HOME/.agent-device")"; do
+           "/run/user/$uid/systemd" "/run/user/$uid/bus" "${XDG_RUNTIME_DIR:-}/systemd" "${XDG_RUNTIME_DIR:-}/bus" "${paths[@]}" "$adh"; do
     [ -e "$p" ] && [ ! -L "$p" ] || continue
     p=$(readlink -f -- "$p")
     [[ " ${protected[*]} " != *" $p "* ]] || continue
@@ -148,8 +154,7 @@ lock_down() {
   # The ward's own folders over yours, at the same paths, so paths under them are the
   # same in every ward and on the host; then your Gradle settings over its home, as
   # wardd last wrote them. A failure here is a warning: the ward starts without them.
-  local i f adh adh_own=
-  adh=$(readlink -f -- "$HOME/.agent-device")
+  local i f
   for i in "${!names[@]}"; do
     name=${names[$i]} path=${paths[$i]}
     [ -d "$st/$name" ] && [ ! -L "$st/$name" ] && [ -d "$path" ] && [ ! -L "$path" ] || continue
