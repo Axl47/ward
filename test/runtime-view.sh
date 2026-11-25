@@ -7,6 +7,7 @@
 # ward's copy shows at a step.
 set -euo pipefail
 . "$1/ward-runtime.sh"
+WARD_HOME=$1/..
 mount -t tmpfs tmpfs /run
 WARD_HOST_UID=4242 U=/run/user/4242
 export XDG_RUNTIME_DIR=$U/w/x
@@ -33,10 +34,16 @@ echo "start $(ask "see $U")"
 echo "inner $(ask "see $XDG_RUNTIME_DIR; ls $WARD_RUNTIME")"
 echo "content $(ask "cat $U/wayland-0")"
 # wayland-3, a hard link, puck.lock, a folder, and keyring, off the list, stay out.
-echo late >"$R/wayland-2"; ln "$R/keyring" "$R/wayland-3"; mkdir "$R/caliban" "$R/puck.lock"
+echo late >"$R/wayland-2"; echo late >"$R/wayland-5"; ln "$R/keyring" "$R/wayland-3"; mkdir "$R/caliban" "$R/puck.lock"
 sync_runtime
 echo "late $(ask "see $U")"
 echo "remount $(ask "mount -o remount,bind,rw $U/wayland-2 2>/dev/null && echo rw || echo refused")"
+# The ward puts a link to the view where wayland-5 was; taking wayland-5 away must not
+# unmount the view.
+ask "umount $U/wayland-5 && rm $U/wayland-5 && ln -s $U $U/wayland-5"
+rm "$R/wayland-5"
+sync_runtime
+echo "view $(mountpoint -q "$U" && echo kept || echo lost)"
 # wayland-3 replaced by a file of its own is shown; wayland-2 replaced by a folder goes.
 rm "$R/wayland-0" "$R/wayland-2"; mkdir "$R/wayland-2"; echo new >"$R/wayland-0"; echo n >"$R/n"; mv "$R/n" "$R/wayland-3"
 sync_runtime

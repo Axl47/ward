@@ -55,7 +55,7 @@ The mapped port is fine for a dev server and slow for bulk transfers. The full n
 ## Requirements
 
 - Linux 5.14+ with unprivileged user namespaces, a systemd user session, and subuid/subgid ranges for your user
-- Node 26+, util-linux 2.39+, `podman`, `passt`, `crun`, `catatonit`, `xdg-dbus-proxy`
+- Node 26+, util-linux 2.39+ (with `fd-based-mount`), `podman`, `passt`, `crun`, `catatonit`, `xdg-dbus-proxy`
 - For desktops: [Umbriel](https://github.com/noctalia-dev/umbriel) (run headless), `dbus-daemon`, `at-spi2-core`, `wtype`
 - For devices: the Android SDK emulator and at least one AVD to copy
 - For T3 Code to run agent commands in wards: [Annex](https://github.com/Axl47/annex), a T3 Code fork with Ward's hook

@@ -64,6 +64,7 @@ runtime_view() {
     return 1
   }
   mount_api_check || return
+  command -v "${WARD_NODE:-node}" >/dev/null || { echo "ward: node not found (set WARD_NODE)" >&2; return 1; }
   for d in "/run/user/$WARD_HOST_UID" "$x"; do
     [ -n "$d" ] && [ -d "$d" ] || continue
     d=$(readlink -f -- "$d")
@@ -95,17 +96,19 @@ runtime_view() {
 }
 
 # mount_api_check: whether mount here makes a bind read-only before attaching it, as
-# sync_runtime needs: util-linux 2.39+ on Linux 5.14+, below which libmount falls back
-# to a bind and then a remount, whatever LIBMOUNT_FORCE_MOUNT2 says.
+# sync_runtime needs: util-linux 2.39+ built with the kernel's newer mount API
+# (fd-based-mount), on Linux 5.14+, below which libmount falls back to a bind and then
+# a remount, whatever LIBMOUNT_FORCE_MOUNT2 says.
 mount_api_check() {
-  local k u
+  local k u v
   IFS=. read -r k u _ </proc/sys/kernel/osrelease
-  if (( k > 5 || (k == 5 && ${u%%[!0-9]*} >= 14) )) &&
-    [[ $(mount --version) =~ util-linux\ ([0-9]+)\.([0-9]+) ]] &&
+  v=$(mount --version)
+  if (( k > 5 || (k == 5 && ${u%%[!0-9]*} >= 14) )) && [[ $v == *fd-based-mount* ]] &&
+    [[ $v =~ util-linux\ ([0-9]+)\.([0-9]+) ]] &&
     (( BASH_REMATCH[1] > 2 || (BASH_REMATCH[1] == 2 && BASH_REMATCH[2] >= 39) )); then
     return 0
   fi
-  echo "ward: wards need Linux 5.14+ and util-linux 2.39+ ($(uname -r), $(mount --version | head -1)), or what they see of your runtime folder could be writable" >&2
+  echo "ward: wards need Linux 5.14+ and util-linux 2.39+ with fd-based-mount ($(uname -r); $v), or what they see of your runtime folder could be writable" >&2
   return 1
 }
 
@@ -122,9 +125,9 @@ listed() {
 # replaced, and takes one away when it is gone. An entry the ward made first is left
 # to it. The view is the ward's to write, so whatever the ward puts at a name before
 # the watcher's placeholder or mount can only change that ward's view, or land out of
-# its sight: placeholders are made by mkdir and mkfifo, which neither open nor follow
-# what is there, and the mount doesn't follow a link at its target's last component.
-# Only the watcher mounts in this namespace, so what it unmounts is its own.
+# its sight: placeholders are made by mkdir, or mktemp and ln, which neither open nor
+# follow what is there, the mount doesn't follow a link at its target's last
+# component, and unshow's unmount doesn't follow one either.
 sync_runtime() {
   local i src dst e n v h
   for i in "${!view_dirs[@]}"; do
@@ -148,8 +151,7 @@ sync_runtime() {
       # Its identity before the mount, so a refusal holds only for this file.
       h=$(stat -c '%h %d:%i' -- "$e" 2>/dev/null) || continue
       [ -d "$e" ] || [ "${h%% *}" = 1 ] || { refused[$v]=${h#* }; continue; }
-      # A FIFO is as good a placeholder as any file: a bind of one non-folder over another.
-      if [ -d "$e" ]; then mkdir -- "$v"; else mkfifo -m 0600 -- "$v"; fi || continue
+      if [ -d "$e" ]; then mkdir -- "$v"; else placeholder "$v"; fi || continue
       # Read-only as it is made: libmount's newer mount API (mount_api_check; forced
       # here so it never falls back to mount(2) by choice) sets it on the new mount
       # before attaching it, where a bind and then a remount would leave the ward's
@@ -168,16 +170,27 @@ sync_runtime() {
   return 0
 }
 
+# placeholder PATH: makes PATH an empty file, as long as nothing is there yet (a link
+# would be followed by `: >`, and a FIFO opened, which hangs).
+placeholder() {
+  local t
+  t=$(mktemp -p "${1%/*}" .ward-XXXXXX) || return
+  ln -- "$t" "$1"
+  set -- $? "$t"
+  rm -f -- "$2"
+  return "$1"
+}
+
 # unshow PATH: takes away what sync_runtime shows at PATH (lazily, should a process be
 # in it), then its placeholder, never recursively: it covered a folder of yours.
 # Removing the placeholder is what takes the entry from the ward's copy, which the
 # kernel locked and so skips when propagating the unmount. A PATH no longer mounted
 # (its placeholder removed in the ward, and maybe something of the ward's there
-# since) is simply forgotten.
+# since, a link even) is simply forgotten.
 unshow() {
-  if umount -l -- "$1" 2>/dev/null; then
+  if "${WARD_NODE:-node}" --disable-warning=ExperimentalWarning "$WARD_HOME/src/detach.ts" "$1" 2>/dev/null; then
     rm -f -- "$1" 2>/dev/null || rmdir -- "$1" 2>/dev/null || :
-  elif mountpoint -q -- "$1"; then
+  elif [ ! -L "$1" ] && mountpoint -q -- "$1"; then
     return 1
   fi
   unset 'shown[$1]'

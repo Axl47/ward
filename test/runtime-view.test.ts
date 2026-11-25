@@ -24,9 +24,11 @@ test("a ward's view shows listed entries read-only and follows yours", { skip: !
     "t",
     "content old",
     // caliban is shared writable; wayland-3 (a hard link), puck.lock (a folder) and keyring stay out.
-    "late bus:ro caliban:rw pulse:ro w: wayland-0:ro wayland-2:ro ",
+    "late bus:ro caliban:rw pulse:ro w: wayland-0:ro wayland-2:ro wayland-5:ro ",
     "remount refused",
-    "after bus:ro caliban:rw pulse:ro w: wayland-0:ro wayland-3:ro ",
+    "view kept",
+    // wayland-5 is the ward's own link now.
+    "after bus:ro caliban:rw pulse:ro w: wayland-0:ro wayland-3:ro wayland-5: ",
     "content new",
   ]);
 });
