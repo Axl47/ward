@@ -7,6 +7,7 @@
 # the namespace holder's is translated to the host's.
 set -euo pipefail
 . "$(dirname -- "$(readlink -f -- "$0")")/ward-lib.sh"
+. "$(dirname -- "$(readlink -f -- "$0")")/ward-runtime.sh"
 id=$1
 rt=$WARD_RUNTIME/$id
 st=$WARD_STATE/wards/$id
@@ -32,8 +33,10 @@ mkdir "$rt/desktop"
 # The locks wards share with you (ward_runtime_shared): made here, as you, if missing,
 # so the ward shows yours rather than making its own that nobody else takes.
 uid=$(id -u)
+# ward-init-root, as root of a user namespace, would take /run/user/0 for it.
+export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$uid}
 ward_runtime_shared "$uid"
-for p in "/run/user/$uid" "${XDG_RUNTIME_DIR:-}"; do
+for p in "/run/user/$uid" "$XDG_RUNTIME_DIR"; do
   [ -n "$p" ] && [ -d "$p" ] || continue
   for a in $_shared; do
     [ ! -e "$p/${a%/}" ] && [ ! -L "$p/${a%/}" ] || continue

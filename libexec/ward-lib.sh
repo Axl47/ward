@@ -37,36 +37,6 @@ ENV
 # Claude started inside the ward is already there, so it would only break.
 WARD_ENTER_UNSET="CLAUDE_CODE_SHELL_PREFIX"
 
-# ward_runtime_shared UID: sets _shared to the entries of your runtime folder (UID:
-# yours) that wards share writable with the host and each other, folders ending in /.
-# ward-init makes them first if missing, since a ward that made its own would take
-# locks nobody else sees: pnpm's for the store every ward shares (pnpm 12), Caliban's
-# for its model jobs, and the lock every Puck acting on the live session takes.
-ward_runtime_shared() {
-  _shared="pnpm-dir-locks-$1/ pnpm-metadata-mutation-locks-$1/ pnpm-store-operation-locks-$1/ pnpm-verify-deps-install-locks-$1/ caliban/ puck.lock"
-}
-
-# ward_runtime_entry NAME UID: whether a ward sees NAME, an entry of your runtime
-# folder, setting _rwe to how: ro (read-only) or rw (shared, ward_runtime_shared).
-# Everything else there is absent from a ward, which has a runtime folder of its own
-# (libexec/ward-init-root: runtime_view): Claude Code's cc-socks, gpg-agent, the
-# keyring's own sockets, Podman's and systemd's, Ariel's, the shell's IPC.
-# Read-only: your live session (wayland-N, umbriel-wayland-N.sock), for GUI apps run
-# in a ward, Miranda's worktrees and PUCK_DESKTOP=live (docs/DESIGN.md, Risks), and
-# sound played through it (pipewire-0, pulse).
-ward_runtime_entry() {
-  _rwe=ro
-  case $1 in
-    pipewire-0 | pulse) return 0 ;;
-    wayland-[0-9]*) case ${1#wayland-} in *[!0-9]*) return 1 ;; esac; return 0 ;;
-    umbriel-wayland-[0-9]*.sock) _n=${1#umbriel-wayland-}; case ${_n%.sock} in *[!0-9]*) return 1 ;; esac; return 0 ;;
-  esac
-  _rwe=rw
-  ward_runtime_shared "$2"
-  case " $_shared " in *" $1 "* | *" $1/ "*) return 0 ;; esac
-  return 1
-}
-
 # Drop WARD_ENTER_UNSET from this shell, before it joins a ward (ward_enter).
 ward_enter_env() {
   # shellcheck disable=SC2086

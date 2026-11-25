@@ -1,19 +1,23 @@
 #!/bin/bash
 # Run by test/runtime-view.test.ts as root of a user namespace (unshare -Urm):
-# runtime-view.sh LIBEXEC DIR. DIR/real stands in for your runtime folder, DIR/view
-# for the ward's; a namespace copied from it one user namespace further in, as the
-# ward's is, reports what it sees. Each line: what the ward's copy shows at a step.
+# runtime-view.sh LIBEXEC. A memory folder over /run stands in for yours, with
+# XDG_RUNTIME_DIR two levels inside /run/user/<uid>, as a second Ward's is; then
+# runtime_view makes the ward's view, and a namespace copied from it one user
+# namespace further in, as the ward's is, reports what it sees. Each line: what the
+# ward's copy shows at a step.
 set -euo pipefail
-. "$1/ward-lib.sh"
 . "$1/ward-runtime.sh"
-WARD_HOST_UID=1000 R=$2/real V=$2/view
-mkdir -p "$R/cc-socks" "$R/pulse" "$V"
-echo old >"$R/wayland-0"; echo s >"$R/cc-socks/1.sock"; echo k >"$R/keyring"
-mount -t tmpfs tmpfs "$V"
-mount --make-shared "$V"
-exec {fd}<"$R"
-view_dirs=("$V") view_fds=("$fd")
-sync_runtime
+mount -t tmpfs tmpfs /run
+WARD_HOST_UID=4242 U=/run/user/4242
+export XDG_RUNTIME_DIR=$U/w/x
+WARD_RUNTIME=$XDG_RUNTIME_DIR/ward rt=$XDG_RUNTIME_DIR/ward/t
+mkdir -p "$U/cc-socks" "$U/pulse" "$rt"
+echo old >"$U/wayland-0"; echo s >"$U/cc-socks/1.sock"; echo k >"$U/keyring"
+python3 -c 'import socket, sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])' "$rt/bus"
+ln -s "$XDG_RUNTIME_DIR" /run/x
+echo "link $( (XDG_RUNTIME_DIR=/run/x runtime_view "$rt") 2>/dev/null && echo shown || echo refused)"
+runtime_view "$rt"
+R=/proc/self/fd/${view_fds[0]} # yours, under the view
 
 # The ward's copy: each line read is run there, then __end__ marks its output's end.
 coproc WARD { exec unshare -U -r -m --propagation unchanged bash -c 'while IFS= read -r c; do eval "$c"; echo __end__; done' 2>&1; }
@@ -22,16 +26,19 @@ ask() {
   echo "$1" >&"${WARD[1]}"
   while IFS= read -r l <&"${WARD[0]}" && [ "$l" != __end__ ]; do echo "$l"; done
 }
-# see: each entry of the view with its mount's first option (ro or rw).
-ask "see() { for f in $V/*; do printf '%s:%s ' \"\${f##*/}\" \"\$(awk -v m=\"\$f\" '\$5 == m { o = \$6 } END { print substr(o, 1, 2) }' /proc/self/mountinfo)\"; done; echo; }"
+# see DIR: each entry of DIR with its mount's first option (ro or rw, none if not one).
+ask "see() { for f in \$1/*; do printf '%s:%s ' \"\${f##*/}\" \"\$(awk -v m=\"\$f\" '\$5 == m { o = \$6 } END { print substr(o, 1, 2) }' /proc/self/mountinfo)\"; done; echo; }"
 
-echo "start $(ask see)"
-echo "content $(ask "cat $V/wayland-0")"
-echo late >"$R/wayland-2"; ln "$R/keyring" "$R/wayland-3"; mkdir "$R/caliban"
+echo "start $(ask "see $U")"
+echo "inner $(ask "see $XDG_RUNTIME_DIR; ls $WARD_RUNTIME")"
+echo "content $(ask "cat $U/wayland-0")"
+# wayland-3, a hard link, puck.lock, a folder, and keyring, off the list, stay out.
+echo late >"$R/wayland-2"; ln "$R/keyring" "$R/wayland-3"; mkdir "$R/caliban" "$R/puck.lock"
 sync_runtime
-echo "late $(ask see)"
-echo "remount $(ask "mount -o remount,bind,rw $V/wayland-2 2>/dev/null && echo rw || echo refused")"
-rm "$R/wayland-0" "$R/wayland-2"; echo new >"$R/wayland-0"
+echo "late $(ask "see $U")"
+echo "remount $(ask "mount -o remount,bind,rw $U/wayland-2 2>/dev/null && echo rw || echo refused")"
+# wayland-3 replaced by a file of its own is shown.
+rm "$R/wayland-0" "$R/wayland-2"; echo new >"$R/wayland-0"; echo n >"$R/n"; mv "$R/n" "$R/wayland-3"
 sync_runtime
-echo "after $(ask see)"
-echo "content $(ask "cat $V/wayland-0")"
+echo "after $(ask "see $U")"
+echo "content $(ask "cat $U/wayland-0")"

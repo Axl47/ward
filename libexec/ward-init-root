@@ -22,8 +22,8 @@ st=$WARD_STATE/wards/$id
 # can unmount or remount them. In it:
 # - Your runtime folder (/run/user/<uid>, and XDG_RUNTIME_DIR if it is another) is
 #   one of the ward's own, in memory, showing of yours only what ward_runtime_entry
-#   lists (runtime_view), Ward's folder, and as `bus` ward-init's proxy, which passes
-#   only the keyring. So your systemd user manager, raw session bus and Podman API
+#   lists, Ward's folder, and as `bus` ward-init's proxy, which passes only the
+#   keyring (libexec/ward-runtime.sh). So your systemd user manager, raw session bus and Podman API
 #   socket are gone (`systemd-run --user`, or a container started through your
 #   Podman, would run outside the ward's namespaces and cgroup and outlive it), and
 #   so is every other socket there that reaches something of yours: Claude Code's
@@ -73,39 +73,6 @@ st=$WARD_STATE/wards/$id
 # becomes a mount point too, or a ward could move it aside and put a forged copy
 # where the host looks.
 
-# runtime_view: each runtime folder becomes a memory folder of the ward's own, shared
-# (mount propagation), so the watcher's mounts here (libexec/ward-runtime.sh) reach the
-# ward's namespace. In it: the entries ward_runtime_entry lists, Ward's own folder
-# (lock_down narrows it further) and the ward's bus proxy as `bus`.
-runtime_view() {
-  local d i fd ward_parent
-  for d in "/run/user/$WARD_HOST_UID" "${XDG_RUNTIME_DIR:-}"; do
-    [ -n "$d" ] && [ -d "$d" ] || continue
-    d=$(readlink -f -- "$d")
-    [[ " ${view_dirs[*]} " == *" $d "* ]] || view_dirs+=("$d")
-  done
-  [ "${#view_dirs[@]}" -lt 2 ] || [ "${#view_dirs[0]}" -le "${#view_dirs[1]}" ] || view_dirs=("${view_dirs[1]}" "${view_dirs[0]}")
-  ward_parent=$(dirname -- "$(readlink -f -- "$WARD_RUNTIME")")
-  # Called where `set -e` doesn't apply, so each step that must work says so.
-  for i in "${!view_dirs[@]}"; do exec {fd}<"${view_dirs[$i]}" || return; view_fds[i]=$fd; done
-  for i in "${!view_dirs[@]}"; do
-    d=${view_dirs[$i]} fd=${view_fds[$i]}
-    # An inner one (a second Ward's XDG_RUNTIME_DIR) is gone from the outer's view.
-    { [ -d "$d" ] || mkdir -- "$d"; } &&
-      mount -t tmpfs -o mode=0700,size=10%,nosuid,nodev tmpfs "$d" &&
-      chown --reference="/proc/self/fd/$fd" -- "$d" &&
-      mount --make-shared "$d" || return
-    if [ "$d" = "$ward_parent" ]; then
-      mkdir -- "$d/ward" && mount --no-canonicalize --bind "/proc/self/fd/$fd/ward" "$d/ward" || return
-    fi
-  done
-  sync_runtime
-  [ -S "$rt/bus" ] || return 0
-  for d in "${view_dirs[@]}"; do
-    : >"$d/bus" && mount --bind "$rt/bus" "$d/bus" || echo "ward: warning: could not show the session bus proxy at $d/bus; the ward has no session bus" >&2
-  done
-}
-
 lock_down() {
   local p a held=" " ancestors=() protected=() miranda=${MIRANDA_HOME:-$HOME/.local/share/miranda}
   local avds=${ANDROID_AVD_HOME:-$HOME/.android/avd} adbkey adbpub
@@ -113,7 +80,7 @@ lock_down() {
   adbpub=$(readlink -f -- "$HOME/.android/adbkey.pub") || adbpub=
   local nokey=
   [ -f "$adbkey" ] || nokey=1
-  runtime_view || { echo "ward: could not give the ward a runtime folder of its own, so it does not start" >&2; return 1; }
+  runtime_view "$rt" || { echo "ward: could not give the ward a runtime folder of its own, so it does not start" >&2; return 1; }
   # The runtime folders are mount points already, which a ward can't move aside.
   for p in "${view_dirs[@]}"; do held+="$p "; done
   # agent-device's home at its real path, where the ward's own (or an empty one) goes,
