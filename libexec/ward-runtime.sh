@@ -41,7 +41,7 @@ ward_runtime_entry() {
 
 # The ward's runtime folders, outer first, and for each an fd on yours, which only
 # the watcher keeps: its processes are outside the ward's PID namespace.
-view_dirs=() view_fds=()
+view_dirs=() view_fds=() ward_node=
 declare -A shown=()   # each entry sync_runtime shows: its path in the view → yours
 declare -A refused=() # listed entries it won't show (a hard link, a failed mount) → their device:inode
 
@@ -64,7 +64,13 @@ runtime_view() {
     return 1
   }
   mount_api_check || return
-  command -v "${WARD_NODE:-node}" >/dev/null || { echo "ward: node not found (set WARD_NODE)" >&2; return 1; }
+  # The node unshow runs, which must load node:ffi (Node 26+): src/detach.ts exits 2
+  # on no arguments once it has.
+  ward_node=$(command -v "${WARD_NODE:-node}") &&
+    { "$ward_node" --disable-warning=ExperimentalWarning "$WARD_HOME/src/detach.ts" 2>/dev/null; [ $? = 2 ]; } || {
+    echo "ward: ${WARD_NODE:-node} is not Node 26+ (run \`ward install\` again, which sets WARD_NODE in the ward@ unit)" >&2
+    return 1
+  }
   for d in "/run/user/$WARD_HOST_UID" "$x"; do
     [ -n "$d" ] && [ -d "$d" ] || continue
     d=$(readlink -f -- "$d")
@@ -175,7 +181,7 @@ sync_runtime() {
 placeholder() {
   local t
   t=$(mktemp -p "${1%/*}" .ward-XXXXXX) || return
-  ln -- "$t" "$1"
+  ln -T -- "$t" "$1"
   set -- $? "$t"
   rm -f -- "$2"
   return "$1"
@@ -183,12 +189,13 @@ placeholder() {
 
 # unshow PATH: takes away what sync_runtime shows at PATH (lazily, should a process be
 # in it), then its placeholder, never recursively: it covered a folder of yours.
-# Removing the placeholder is what takes the entry from the ward's copy, which the
-# kernel locked and so skips when propagating the unmount. A PATH no longer mounted
+# The unmount reaches the ward's copy of an entry shown later; one shown as the ward
+# started the kernel locked there, so it skips it, and removing the placeholder is
+# what takes it away. A PATH no longer mounted
 # (its placeholder removed in the ward, and maybe something of the ward's there
 # since, a link even) is simply forgotten.
 unshow() {
-  if "${WARD_NODE:-node}" --disable-warning=ExperimentalWarning "$WARD_HOME/src/detach.ts" "$1" 2>/dev/null; then
+  if "$ward_node" --disable-warning=ExperimentalWarning "$WARD_HOME/src/detach.ts" "$1" 2>/dev/null; then
     rm -f -- "$1" 2>/dev/null || rmdir -- "$1" 2>/dev/null || :
   elif [ ! -L "$1" ] && mountpoint -q -- "$1"; then
     return 1
@@ -202,6 +209,8 @@ unshow() {
 watch_runtime() {
   local tick
   set +eu
+  # Never a program from your home, which wards can write.
+  PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
   trap 'echo "ward: warning: the runtime folder watcher stopped; sockets of yours made or replaced from now on stay out of the ward" >&2' EXIT
   trap 'trap - EXIT; exit 0' TERM # the ward stopping
   exec {tick}<> <(:)
