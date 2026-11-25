@@ -37,6 +37,25 @@ ENV
 # Claude started inside the ward is already there, so it would only break.
 WARD_ENTER_UNSET="CLAUDE_CODE_SHELL_PREFIX"
 
+# ward_runtime_entry NAME: whether a ward sees NAME, an entry of your runtime folder,
+# setting _rwe to how: ro (read-only) or rw (shared with the host and every ward).
+# Everything else there is absent from a ward, which has a runtime folder of its own
+# (libexec/ward-init-root: runtime_view): Claude Code's cc-socks, gpg-agent, the
+# keyring's own sockets, Podman's and systemd's, Ariel's, the shell's IPC.
+# - wayland-N, umbriel-wayland-N.sock: your live session, for GUI apps run in a ward,
+#   Miranda's worktrees and PUCK_DESKTOP=live (docs/DESIGN.md, Risks).
+# - pipewire-0, pulse: sound, played through your session.
+# - pnpm-*: pnpm's locks for its store, which every ward shares.
+# - puck.lock: the lock every Puck acting on the live session takes.
+ward_runtime_entry() {
+  case $1 in
+    wayland-*.lock) return 1 ;;
+    wayland-[0-9]* | umbriel-wayland-[0-9]*.sock | pipewire-0 | pulse) _rwe=ro ;;
+    pnpm-* | puck.lock) _rwe=rw ;;
+    *) return 1 ;;
+  esac
+}
+
 # Drop WARD_ENTER_UNSET from this shell, before it joins a ward (ward_enter).
 ward_enter_env() {
   # shellcheck disable=SC2086
