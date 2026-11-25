@@ -19,9 +19,15 @@ st=$WARD_STATE/wards/$id
 # namespace inherits from one owned by a more privileged user namespace are
 # locked, so not even the ward's root (Podman's, which any ward command can drive)
 # can unmount or remount them. In it:
-# - Your systemd user manager and raw session bus are gone: `systemd-run --user`
-#   would start a process outside the ward's namespaces and cgroup that outlives
-#   it. The bus is ward-init's proxy, which passes only the keyring.
+# - Your systemd user manager, raw session bus and Podman API socket are gone:
+#   `systemd-run --user`, or a container started through your Podman, would run
+#   outside the ward's namespaces and cgroup and outlive it. The bus is ward-init's
+#   proxy, which passes only the keyring; the ward's own Podman is at $rt/podman.
+#   Your Podman's runtime state (libpod) is an empty folder of the ward's own, in
+#   memory: a podman command in the ward, which can't see your Podman's pause
+#   process, deleted its pause.pid. ward-init makes both, as you, if missing, so a
+#   socket started later (podman.socket) lands under the empty folder too; either
+#   one missing or a link stops the ward.
 # - Ward's own state, config, runtime folder and checkout are read-only, except
 #   the ward's own state folder (TMPDIR, Podman), its desktop's folder and its
 #   Podman socket's folder: the host trusts these files (it runs the checkout,
@@ -71,6 +77,17 @@ lock_down() {
   adbpub=$(readlink -f -- "$HOME/.android/adbkey.pub") || adbpub=
   local nokey=
   [ -f "$adbkey" ] || nokey=1
+  # Your Podman's socket and state folders (ward-init made any that were missing), each
+  # covered after the rest below, whatever else claims it.
+  local podman_dirs=() real
+  for p in "/run/user/$uid" "${XDG_RUNTIME_DIR:-}"; do
+    [ -n "$p" ] && [ -d "$p" ] || continue
+    for a in podman libpod; do
+      [ -d "$p/$a" ] && [ ! -L "$p/$a" ] && real=$(readlink -f -- "$p/$a") ||
+        { echo "ward: $p/$a is missing or not a folder, so the ward can't hide your Podman's and does not start" >&2; return 1; }
+      [[ " ${podman_dirs[*]} " == *" $real "* ]] || podman_dirs+=("$real")
+    done
+  done
   # agent-device's home at its real path, where the ward's own (or an empty one) goes,
   # noted while Ward's runtime folder is still writable: wardd reads its daemon's ports
   # there (src/daemon.ts: agentDevicePorts), and the ward can retarget the link later.
@@ -84,7 +101,8 @@ lock_down() {
     while read -r name path; do names+=("$name"); paths+=("$path"); done <"$rt/own-homes"
   fi
   for p in "$WARD_STATE" "$WARD_CONFIG" "$WARD_RUNTIME" "$WARD_HOME" "$HOME"/.t3*/userdata "$(readlink -f -- "$WARD_T3/userdata")" "$miranda" "$(readlink -f -- "$avds")" \
-           "/run/user/$uid/systemd" "/run/user/$uid/bus" "${XDG_RUNTIME_DIR:-}/systemd" "${XDG_RUNTIME_DIR:-}/bus" "${paths[@]}" "$adh" "$adbkey" "$adbpub"; do
+           "/run/user/$uid/systemd" "/run/user/$uid/bus" "${XDG_RUNTIME_DIR:-}/systemd" "${XDG_RUNTIME_DIR:-}/bus" "${podman_dirs[@]}" \
+           "${paths[@]}" "$adh" "$adbkey" "$adbpub"; do
     [ -e "$p" ] && [ ! -L "$p" ] || continue
     p=$(readlink -f -- "$p")
     [[ " ${protected[*]} " != *" $p "* ]] || continue
@@ -157,6 +175,14 @@ lock_down() {
       "$adbkey" | "$adbpub")
         { mount --bind /dev/null "$p" && seal "$p"; } || { echo "ward: could not hide your adb key ($p), so the ward does not start" >&2; return 1; } ;;
     esac
+  done
+  # Your Podman's socket folder is empty and read-only; its state folder is the ward's own,
+  # writable, since the podman CLI sets its sticky bit and keeps its pause.pid there.
+  for p in "${podman_dirs[@]}"; do
+    [ -d "$p" ] && [ ! -L "$p" ] && case $p in
+      */podman) mount -t tmpfs -o ro,mode=0755,size=4k tmpfs "$p" ;;
+      *) mount -t tmpfs -o mode=1700,size=16m tmpfs "$p" && chown --reference="$(dirname -- "$p")" -- "$p" ;;
+    esac || { echo "ward: could not hide your Podman's $p, so the ward does not start" >&2; return 1; }
   done
   # ro_over SRC DST: SRC, which wardd keeps in the ward's runtime folder, read-only over
   # DST in the ward's own home, made first as SRC's kind; a link or another kind there
