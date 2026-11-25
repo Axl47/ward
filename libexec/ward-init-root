@@ -8,6 +8,7 @@
 set -euo pipefail
 [ -n "${WARD_TRACE:-}" ] && set -x
 . "$(dirname -- "$(readlink -f -- "$0")")/ward-lib.sh"
+. "$(dirname -- "$(readlink -f -- "$0")")/ward-runtime.sh"
 nested=
 [ "$1" != --inner ] || { nested=1; shift; }
 id=$1
@@ -72,15 +73,10 @@ st=$WARD_STATE/wards/$id
 # becomes a mount point too, or a ward could move it aside and put a forged copy
 # where the host looks.
 
-# The ward's runtime folders, outer first, and for each an fd on yours, which only
-# the watcher keeps: its processes are outside the ward's PID namespace.
-view_dirs=() view_fds=()
-declare -A shown=() # each entry runtime_view shows: its path in the view → yours
-
 # runtime_view: each runtime folder becomes a memory folder of the ward's own, shared
-# (mount propagation), so the watcher's mounts here reach the ward's namespace, where
-# they are locked like the rest. In it: the entries ward_runtime_entry lists, Ward's
-# own folder (lock_down narrows it further) and the ward's bus proxy as `bus`.
+# (mount propagation), so the watcher's mounts here (libexec/ward-runtime.sh) reach the
+# ward's namespace. In it: the entries ward_runtime_entry lists, Ward's own folder
+# (lock_down narrows it further) and the ward's bus proxy as `bus`.
 runtime_view() {
   local d i fd ward_parent
   for d in "/run/user/$WARD_HOST_UID" "${XDG_RUNTIME_DIR:-}"; do
@@ -107,68 +103,6 @@ runtime_view() {
   [ -S "$rt/bus" ] || return 0
   for d in "${view_dirs[@]}"; do
     : >"$d/bus" && mount --bind "$rt/bus" "$d/bus" || echo "ward: warning: could not show the session bus proxy at $d/bus; the ward has no session bus" >&2
-  done
-}
-
-# sync_runtime: shows each listed entry of your runtime folders in the ward's, once
-# it is there and is neither a link nor a hard link (which could be one an older
-# ward made to a socket off the list); shows the new one when one is replaced, and
-# takes one away when it is gone. An entry the ward made first is left to it.
-# Placeholders are made with noclobber (O_EXCL), so a link the ward puts at the name
-# is never followed; a link swapped in before the mount moves only the mount, within
-# the ward's runtime folder or out of the ward's sight.
-sync_runtime() {
-  local - i src dst e n v
-  set -C
-  for i in "${!view_dirs[@]}"; do
-    src=/proc/self/fd/${view_fds[$i]} dst=${view_dirs[$i]}
-    for e in "$src"/*; do
-      n=${e##*/}
-      ward_runtime_entry "$n" "$WARD_HOST_UID" && [ ! -L "$e" ] && [ -e "$e" ] || continue
-      v=$dst/$n
-      if [ -n "${shown[$v]:-}" ]; then
-        [ ! "$v" -ef "$e" ] || continue
-        unshow "$v" || continue
-        [ ! -e "$v" ] || continue
-      elif [ -e "$v" ] || [ -L "$v" ]; then
-        continue
-      fi
-      [ -d "$e" ] || [ "$(stat -c %h -- "$e")" = 1 ] || continue
-      if [ -d "$e" ]; then mkdir -- "$v"; else : >"$v"; fi || continue
-      # Read-only as it is made: a remount after would not reach the ward's copy.
-      mount --no-canonicalize --bind -o "$_rwe" "$e" "$v" || { rm -f -- "$v" 2>/dev/null || rmdir -- "$v"; continue; }
-      shown[$v]=$e
-    done
-  done
-  for v in "${!shown[@]}"; do
-    e=${shown[$v]}
-    [ -e "$e" ] && [ ! -L "$e" ] && continue
-    unshow "$v"
-  done
-  return 0
-}
-
-# unshow PATH: takes away what sync_runtime shows at PATH (lazily, should a process be
-# in it), then its placeholder, never recursively: it covered a folder of yours.
-# Removing the placeholder is what takes the entry from the ward's copy, which the
-# kernel locked and so skips when propagating the unmount.
-unshow() {
-  umount -l -- "$1" || return
-  unset 'shown[$1]'
-  rm -f -- "$1" 2>/dev/null || rmdir -- "$1" 2>/dev/null || :
-}
-
-# watch_runtime: runs sync_runtime every second for as long as the ward runs (the
-# unit's stop kills it), with no process started unless something changed.
-watch_runtime() {
-  local tick
-  set +eu
-  trap 'echo "ward: warning: the runtime folder watcher stopped; sockets of yours made or replaced from now on stay out of the ward" >&2' EXIT
-  trap 'trap - EXIT; exit 0' TERM # the ward stopping
-  exec {tick}<> <(:)
-  while :; do
-    read -rt 1 -u "$tick"
-    sync_runtime 2>/dev/null
   done
 }
 
