@@ -10,12 +10,18 @@ test("ward_runtime_entry lists what a ward sees of your runtime folder", () => {
     "wayland-0": "ro",
     "wayland-1": "ro",
     "wayland-0.lock": "absent",
+    "wayland-1x": "absent",
     "umbriel-wayland-0.sock": "ro",
+    "umbriel-wayland-0x.sock": "absent",
     "pipewire-0": "ro",
     "pipewire-0-manager": "absent",
     pulse: "ro",
     "pnpm-store-operation-locks-1000": "rw",
+    "pnpm-store-operation-locks-1001": "absent",
+    "pnpm-other": "absent",
+    caliban: "rw",
     "puck.lock": "rw",
+    "puck-follows-mouse": "absent",
     "cc-socks": "absent",
     gnupg: "absent",
     keyring: "absent",
@@ -31,7 +37,7 @@ test("ward_runtime_entry lists what a ward sees of your runtime folder", () => {
     ward: "absent",
   };
   const lib = join(import.meta.dirname, "../libexec/ward-lib.sh");
-  const script = `. "${lib}"; for n in "$@"; do if ward_runtime_entry "$n"; then echo "$n $_rwe"; else echo "$n absent"; fi; done`;
+  const script = `. "${lib}"; for n in "$@"; do if ward_runtime_entry "$n" 1000; then echo "$n $_rwe"; else echo "$n absent"; fi; done`;
   const out = spawnSync("sh", ["-c", script, "sh", ...Object.keys(expected)], {
     encoding: "utf8",
     env: { PATH: "/usr/bin:/bin", HOME: "/nonexistent" },

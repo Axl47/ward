@@ -114,13 +114,17 @@ runtime_view() {
 # it is there and is neither a link nor a hard link (which could be one an older
 # ward made to a socket off the list); shows the new one when one is replaced, and
 # takes one away when it is gone. An entry the ward made first is left to it.
+# Placeholders are made with noclobber (O_EXCL), so a link the ward puts at the name
+# is never followed; a link swapped in before the mount moves only the mount, within
+# the ward's runtime folder or out of the ward's sight.
 sync_runtime() {
-  local i src dst e n v
+  local - i src dst e n v
+  set -C
   for i in "${!view_dirs[@]}"; do
     src=/proc/self/fd/${view_fds[$i]} dst=${view_dirs[$i]}
     for e in "$src"/*; do
       n=${e##*/}
-      ward_runtime_entry "$n" && [ ! -L "$e" ] && [ -e "$e" ] || continue
+      ward_runtime_entry "$n" "$WARD_HOST_UID" && [ ! -L "$e" ] && [ -e "$e" ] || continue
       v=$dst/$n
       if [ -n "${shown[$v]:-}" ]; then
         [ ! "$v" -ef "$e" ] || continue
@@ -131,9 +135,9 @@ sync_runtime() {
       fi
       [ -d "$e" ] || [ "$(stat -c %h -- "$e")" = 1 ] || continue
       if [ -d "$e" ]; then mkdir -- "$v"; else : >"$v"; fi || continue
-      mount --no-canonicalize --bind "$e" "$v" || { rm -f -- "$v" 2>/dev/null || rmdir -- "$v"; continue; }
+      # Read-only as it is made: a remount after would not reach the ward's copy.
+      mount --no-canonicalize --bind -o "$_rwe" "$e" "$v" || { rm -f -- "$v" 2>/dev/null || rmdir -- "$v"; continue; }
       shown[$v]=$e
-      [ "$_rwe" = rw ] || mount -o remount,bind,ro -- "$v" || unshow "$v"
     done
   done
   for v in "${!shown[@]}"; do
@@ -146,6 +150,8 @@ sync_runtime() {
 
 # unshow PATH: takes away what sync_runtime shows at PATH (lazily, should a process be
 # in it), then its placeholder, never recursively: it covered a folder of yours.
+# Removing the placeholder is what takes the entry from the ward's copy, which the
+# kernel locked and so skips when propagating the unmount.
 unshow() {
   umount -l -- "$1" || return
   unset 'shown[$1]'
@@ -156,7 +162,9 @@ unshow() {
 # unit's stop kills it), with no process started unless something changed.
 watch_runtime() {
   local tick
-  set +e
+  set +eu
+  trap 'echo "ward: warning: the runtime folder watcher stopped; sockets of yours made or replaced from now on stay out of the ward" >&2' EXIT
+  trap 'trap - EXIT; exit 0' TERM # the ward stopping
   exec {tick}<> <(:)
   while :; do
     read -rt 1 -u "$tick"

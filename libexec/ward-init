@@ -29,14 +29,18 @@ rm -f "$rt/ready" "$rt/pid" "$rt/bus" "$rt/activity-hidden"
 # only emptied while the ward runs (src/daemon.ts: desktop).
 rm -rf "$rt/desktop"
 mkdir "$rt/desktop"
-# pnpm's locks for the store every ward shares (ward_runtime_entry): made here, as you,
-# if missing, so the ward shows yours rather than making locks of its own that nobody
-# else takes. ward-init-root's watcher shows any made later, unless the ward made one first.
+# The locks wards share with you (ward_runtime_shared): made here, as you, if missing,
+# so the ward shows yours rather than making its own that nobody else takes.
 uid=$(id -u)
+ward_runtime_shared "$uid"
 for p in "/run/user/$uid" "${XDG_RUNTIME_DIR:-}"; do
   [ -n "$p" ] && [ -d "$p" ] || continue
-  for a in dir metadata-mutation store-operation verify-deps-install; do
-    [ -e "$p/pnpm-$a-locks-$uid" ] || mkdir -m 0700 -- "$p/pnpm-$a-locks-$uid" 2>/dev/null || :
+  for a in $_shared; do
+    [ ! -e "$p/${a%/}" ] && [ ! -L "$p/${a%/}" ] || continue
+    case $a in
+      */) mkdir -m 0700 -- "$p/${a%/}" ;;
+      *) (set -C; : >"$p/$a") ;;
+    esac 2>/dev/null || :
   done
 done
 echo "/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup)" > "$rt/cgroup"
