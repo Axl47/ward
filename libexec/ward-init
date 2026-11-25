@@ -7,6 +7,7 @@
 # the namespace holder's is translated to the host's.
 set -euo pipefail
 . "$(dirname -- "$(readlink -f -- "$0")")/ward-lib.sh"
+. "$(dirname -- "$(readlink -f -- "$0")")/ward-runtime.sh"
 id=$1
 rt=$WARD_RUNTIME/$id
 st=$WARD_STATE/wards/$id
@@ -29,11 +30,21 @@ rm -f "$rt/ready" "$rt/pid" "$rt/bus" "$rt/activity-hidden"
 # only emptied while the ward runs (src/daemon.ts: desktop).
 rm -rf "$rt/desktop"
 mkdir "$rt/desktop"
-# Your Podman's socket and state folders, which ward-init-root covers: made here, as
-# you, if missing, so a socket started later (podman.socket) lands under the cover.
-for p in "/run/user/$(id -u)" "${XDG_RUNTIME_DIR:-}"; do
+# The locks wards share with you (ward_runtime_shared): made here, as you, if missing,
+# so the ward shows yours rather than making its own that nobody else takes.
+uid=$(id -u)
+# ward-init-root, as root of a user namespace, would take /run/user/0 for it.
+export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$uid}
+ward_runtime_shared "$uid"
+for p in "/run/user/$uid" "$XDG_RUNTIME_DIR"; do
   [ -n "$p" ] && [ -d "$p" ] || continue
-  for a in podman libpod; do [ -e "$p/$a" ] || [ -L "$p/$a" ] || mkdir -m 0700 -- "$p/$a" 2>/dev/null || :; done
+  for a in $_shared; do
+    [ ! -e "$p/${a%/}" ] && [ ! -L "$p/${a%/}" ] || continue
+    case $a in
+      */) mkdir -m 0700 -- "$p/${a%/}" ;;
+      *) (set -C; : >"$p/$a") ;;
+    esac 2>/dev/null || :
+  done
 done
 echo "/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup)" > "$rt/cgroup"
 
@@ -65,7 +76,7 @@ host_pid() {
 }
 
 # shellcheck disable=SC2046 # word splitting of the map flags is intended
-WARD_HOST_UID=$(id -u) unshare $(ward_map_args) --mount --setuid 0 --setgid 0 -- "$WARD_LIBEXEC/ward-init-root" "$id" 3>&1 >&2 |
+WARD_HOST_UID=$uid unshare $(ward_map_args) --mount --setuid 0 --setgid 0 -- "$WARD_LIBEXEC/ward-init-root" "$id" 3>&1 >&2 |
   while read -r line; do
     case $line in
       pid=*) host_pid "${line#pid=}" > "$rt/pid" ;;

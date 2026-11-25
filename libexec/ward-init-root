@@ -8,6 +8,7 @@
 set -euo pipefail
 [ -n "${WARD_TRACE:-}" ] && set -x
 . "$(dirname -- "$(readlink -f -- "$0")")/ward-lib.sh"
+. "$(dirname -- "$(readlink -f -- "$0")")/ward-runtime.sh"
 nested=
 [ "$1" != --inner ] || { nested=1; shift; }
 id=$1
@@ -19,15 +20,16 @@ st=$WARD_STATE/wards/$id
 # namespace inherits from one owned by a more privileged user namespace are
 # locked, so not even the ward's root (Podman's, which any ward command can drive)
 # can unmount or remount them. In it:
-# - Your systemd user manager, raw session bus and Podman API socket are gone:
-#   `systemd-run --user`, or a container started through your Podman, would run
-#   outside the ward's namespaces and cgroup and outlive it. The bus is ward-init's
-#   proxy, which passes only the keyring; the ward's own Podman is at $rt/podman.
-#   Your Podman's runtime state (libpod) is an empty folder of the ward's own, in
-#   memory: a podman command in the ward, which can't see your Podman's pause
-#   process, deleted its pause.pid. ward-init makes both, as you, if missing, so a
-#   socket started later (podman.socket) lands under the empty folder too; either
-#   one missing or a link stops the ward.
+# - Your runtime folder (/run/user/<uid>, and XDG_RUNTIME_DIR if it is another) is
+#   one of the ward's own, in memory, showing of yours only what ward_runtime_entry
+#   lists, Ward's folder, and as `bus` ward-init's proxy, which passes only the
+#   keyring (libexec/ward-runtime.sh). So your systemd user manager, raw session bus and Podman API
+#   socket are gone (`systemd-run --user`, or a container started through your
+#   Podman, would run outside the ward's namespaces and cgroup and outlive it), and
+#   so is every other socket there that reaches something of yours: Claude Code's
+#   sessions, gpg-agent, the keyring and PKCS#11 directly, Ariel, the shell's IPC.
+#   What programs in the ward write there (registry logins, Podman's state) stays
+#   in the ward. A watcher outside the ward keeps what it shows in step with yours.
 # - Ward's own state, config, runtime folder and checkout are read-only, except
 #   the ward's own state folder (TMPDIR, Podman), its desktop's folder and its
 #   Podman socket's folder: the host trusts these files (it runs the checkout,
@@ -70,24 +72,17 @@ st=$WARD_STATE/wards/$id
 # Every folder above one of these that you could rename (whose parent is yours)
 # becomes a mount point too, or a ward could move it aside and put a forged copy
 # where the host looks.
+
 lock_down() {
-  local uid=$WARD_HOST_UID p a held=" " ancestors=() protected=() miranda=${MIRANDA_HOME:-$HOME/.local/share/miranda}
+  local p a held=" " ancestors=() protected=() miranda=${MIRANDA_HOME:-$HOME/.local/share/miranda}
   local avds=${ANDROID_AVD_HOME:-$HOME/.android/avd} adbkey adbpub
   adbkey=$(readlink -f -- "$HOME/.android/adbkey") || adbkey=
   adbpub=$(readlink -f -- "$HOME/.android/adbkey.pub") || adbpub=
   local nokey=
   [ -f "$adbkey" ] || nokey=1
-  # Your Podman's socket and state folders (ward-init made any that were missing), each
-  # covered after the rest below, whatever else claims it.
-  local podman_dirs=() real
-  for p in "/run/user/$uid" "${XDG_RUNTIME_DIR:-}"; do
-    [ -n "$p" ] && [ -d "$p" ] || continue
-    for a in podman libpod; do
-      [ -d "$p/$a" ] && [ ! -L "$p/$a" ] && real=$(readlink -f -- "$p/$a") ||
-        { echo "ward: $p/$a is missing or not a folder, so the ward can't hide your Podman's and does not start" >&2; return 1; }
-      [[ " ${podman_dirs[*]} " == *" $real "* ]] || podman_dirs+=("$real")
-    done
-  done
+  runtime_view "$rt" || { echo "ward: could not give the ward a runtime folder of its own, so it does not start" >&2; return 1; }
+  # The runtime folders are mount points already, which a ward can't move aside.
+  for p in "${view_dirs[@]}"; do held+="$p "; done
   # agent-device's home at its real path, where the ward's own (or an empty one) goes,
   # noted while Ward's runtime folder is still writable: wardd reads its daemon's ports
   # there (src/daemon.ts: agentDevicePorts), and the ward can retarget the link later.
@@ -101,7 +96,6 @@ lock_down() {
     while read -r name path; do names+=("$name"); paths+=("$path"); done <"$rt/own-homes"
   fi
   for p in "$WARD_STATE" "$WARD_CONFIG" "$WARD_RUNTIME" "$WARD_HOME" "$HOME"/.t3*/userdata "$(readlink -f -- "$WARD_T3/userdata")" "$miranda" "$(readlink -f -- "$avds")" \
-           "/run/user/$uid/systemd" "/run/user/$uid/bus" "${XDG_RUNTIME_DIR:-}/systemd" "${XDG_RUNTIME_DIR:-}/bus" "${podman_dirs[@]}" \
            "${paths[@]}" "$adh" "$adbkey" "$adbpub"; do
     [ -e "$p" ] && [ ! -L "$p" ] || continue
     p=$(readlink -f -- "$p")
@@ -170,19 +164,9 @@ lock_down() {
         hide_except "$p" attachments device/targets "device/hosts=$WARD_RUNTIME/device-hosts"
         for a in "$p/device/targets" "$p/device/hosts"; do [ ! -d "$a" ] || seal "$a"; done ;;
       */userdata) hide_except "$p" attachments ;;
-      */bus) if [ -S "$rt/bus" ]; then mount --bind "$rt/bus" "$p"; else mount --bind /dev/null "$p"; fi ;;
-      */systemd) mount -t tmpfs -o ro,mode=0755,size=4k tmpfs "$p" ;;
       "$adbkey" | "$adbpub")
         { mount --bind /dev/null "$p" && seal "$p"; } || { echo "ward: could not hide your adb key ($p), so the ward does not start" >&2; return 1; } ;;
     esac
-  done
-  # Your Podman's socket folder is empty and read-only; its state folder is the ward's own,
-  # writable, since the podman CLI sets its sticky bit and keeps its pause.pid there.
-  for p in "${podman_dirs[@]}"; do
-    [ -d "$p" ] && [ ! -L "$p" ] && case $p in
-      */podman) mount -t tmpfs -o ro,mode=0755,size=4k tmpfs "$p" ;;
-      *) mount -t tmpfs -o mode=1700,size=16m tmpfs "$p" && chown --reference="$(dirname -- "$p")" -- "$p" ;;
-    esac || { echo "ward: could not hide your Podman's $p, so the ward does not start" >&2; return 1; }
   done
   # ro_over SRC DST: SRC, which wardd keeps in the ward's runtime folder, read-only over
   # DST in the ward's own home, made first as SRC's kind; a link or another kind there
@@ -238,13 +222,19 @@ nested_map_args() {
 
 if [ -z "$nested" ]; then
   lock_down
+  # The watcher keeps the fds on your runtime folders; nothing in the ward may (a
+  # container's root could follow one through /proc), and it doesn't hold ward-init's pipe.
+  watch_runtime 3>&- &
+  for fd in "${view_fds[@]}"; do exec {fd}<&-; done
   # The ward's PID namespace, with its /proc mounted here so it is locked like the
   # rest: a ward sees and signals only its own processes. catatonit is its init
   # (pid 1 ignores signals it has no handler for, and must reap orphans); when it
   # exits, the kernel kills everything left in the namespace.
   # shellcheck disable=SC2046 # word splitting of the map flags is intended
-  exec unshare --pid --fork --mount-proc -- catatonit -- \
-    unshare --user --mount $(nested_map_args) --setuid 0 --setgid 0 -- "$0" --inner "$id"
+  # Propagation is left as lock_down set it (private, but for the runtime folders),
+  # so the watcher's mounts reach the ward's namespace.
+  exec unshare --pid --fork --mount-proc --propagation unchanged -- catatonit -- \
+    unshare --user --mount --propagation unchanged $(nested_map_args) --setuid 0 --setgid 0 -- "$0" --inner "$id"
 fi
 
 # 1. Network namespace, held open by a sleep whose pid is the ward's join point.
