@@ -37,8 +37,8 @@ echo late >"$R/wayland-2"; ln "$R/keyring" "$R/wayland-3"; mkdir "$R/caliban" "$
 sync_runtime
 echo "late $(ask "see $U")"
 echo "remount $(ask "mount -o remount,bind,rw $U/wayland-2 2>/dev/null && echo rw || echo refused")"
-# wayland-3 replaced by a file of its own is shown.
-rm "$R/wayland-0" "$R/wayland-2"; echo new >"$R/wayland-0"; echo n >"$R/n"; mv "$R/n" "$R/wayland-3"
+# wayland-3 replaced by a file of its own is shown; wayland-2 replaced by a folder goes.
+rm "$R/wayland-0" "$R/wayland-2"; mkdir "$R/wayland-2"; echo new >"$R/wayland-0"; echo n >"$R/n"; mv "$R/n" "$R/wayland-3"
 sync_runtime
 echo "after $(ask "see $U")"
 echo "content $(ask "cat $U/wayland-0")"

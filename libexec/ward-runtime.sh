@@ -58,12 +58,17 @@ runtime_view() {
     echo "ward: XDG_RUNTIME_DIR ($x) is not the folder's own path (a link, or . or .. in it); set it to that" >&2
     return 1
   fi
+  # Missing, it would appear unfiltered in the ward once you log in.
+  [ -d "/run/user/$WARD_HOST_UID" ] || {
+    echo "ward: /run/user/$WARD_HOST_UID is missing; wards need your systemd user session" >&2
+    return 1
+  }
+  mount_api_check || return
   for d in "/run/user/$WARD_HOST_UID" "$x"; do
     [ -n "$d" ] && [ -d "$d" ] || continue
     d=$(readlink -f -- "$d")
     [[ " ${view_dirs[*]} " == *" $d "* ]] || view_dirs+=("$d")
   done
-  [ "${#view_dirs[@]}" -gt 0 ] || return 1
   [ "${#view_dirs[@]}" -lt 2 ] || [ "${#view_dirs[0]}" -le "${#view_dirs[1]}" ] || view_dirs=("${view_dirs[1]}" "${view_dirs[0]}")
   ward_parent=$(dirname -- "$(readlink -f -- "$WARD_RUNTIME")")
   # Called where `set -e` doesn't apply, so each step that must work says so.
@@ -89,23 +94,44 @@ runtime_view() {
   done
 }
 
+# mount_api_check: whether mount here makes a bind read-only before attaching it, as
+# sync_runtime needs: util-linux 2.39+ on Linux 5.14+, below which libmount falls back
+# to a bind and then a remount, whatever LIBMOUNT_FORCE_MOUNT2 says.
+mount_api_check() {
+  local k u
+  IFS=. read -r k u _ </proc/sys/kernel/osrelease
+  if (( k > 5 || (k == 5 && ${u%%[!0-9]*} >= 14) )) &&
+    [[ $(mount --version) =~ util-linux\ ([0-9]+)\.([0-9]+) ]] &&
+    (( BASH_REMATCH[1] > 2 || (BASH_REMATCH[1] == 2 && BASH_REMATCH[2] >= 39) )); then
+    return 0
+  fi
+  echo "ward: wards need Linux 5.14+ and util-linux 2.39+ ($(uname -r), $(mount --version | head -1)), or what they see of your runtime folder could be writable" >&2
+  return 1
+}
+
+# listed ENTRY: whether ENTRY, a path to an entry of your runtime folder, is one to
+# show: listed (ward_runtime_entry, setting _rwe), there, of the kind listed, and not a link.
+listed() {
+  ward_runtime_entry "${1##*/}" "$WARD_HOST_UID" && [ ! -L "$1" ] || return
+  case $_rwe in */) [ -d "$1" ] ;; *) [ -e "$1" ] && [ ! -d "$1" ] ;; esac
+}
+
 # sync_runtime: shows each listed entry of your runtime folders in the ward's, once
 # it is there, of the kind listed, and neither a link nor a hard link (which could be
 # one an older ward made to a socket off the list); shows the new one when one is
 # replaced, and takes one away when it is gone. An entry the ward made first is left
 # to it. The view is the ward's to write, so whatever the ward puts at a name before
-# the watcher's placeholder or mount (noclobber refuses a link to a missing file, not
-# one to a FIFO, which would hang the watcher) can only change that ward's view, or
-# land out of its sight.
+# the watcher's placeholder or mount can only change that ward's view, or land out of
+# its sight: placeholders are made by mkdir and mkfifo, which neither open nor follow
+# what is there, and the mount doesn't follow a link at its target's last component.
+# Only the watcher mounts in this namespace, so what it unmounts is its own.
 sync_runtime() {
-  local - i src dst e n v h
-  set -C
+  local i src dst e n v h
   for i in "${!view_dirs[@]}"; do
     src=/proc/self/fd/${view_fds[$i]} dst=${view_dirs[$i]}
     for e in "$src"/*; do
       n=${e##*/}
-      ward_runtime_entry "$n" "$WARD_HOST_UID" && [ ! -L "$e" ] && [ -e "$e" ] || continue
-      case $_rwe in */) [ -d "$e" ] ;; *) [ ! -d "$e" ] ;; esac || continue
+      listed "$e" || continue
       v=$dst/$n
       # A refused entry is tried again once it is another file (replaced, say by rename).
       if [ -n "${refused[$v]:-}" ]; then
@@ -119,17 +145,17 @@ sync_runtime() {
       elif [ -e "$v" ] || [ -L "$v" ]; then
         continue
       fi
-      if [ ! -d "$e" ]; then
-        h=$(stat -c '%h %d:%i' -- "$e" 2>/dev/null) || continue
-        [ "${h%% *}" = 1 ] || { refused[$v]=${h#* }; continue; }
-      fi
-      if [ -d "$e" ]; then mkdir -- "$v"; else : >"$v"; fi || continue
-      # Read-only as it is made: libmount's newer mount API (Linux 5.12+, forced here
-      # so it never falls back to mount(2) by choice) sets it on the new mount before
-      # attaching it, where a bind and then a remount would leave the ward's copy
-      # writable, the remount not propagating.
+      # Its identity before the mount, so a refusal holds only for this file.
+      h=$(stat -c '%h %d:%i' -- "$e" 2>/dev/null) || continue
+      [ -d "$e" ] || [ "${h%% *}" = 1 ] || { refused[$v]=${h#* }; continue; }
+      # A FIFO is as good a placeholder as any file: a bind of one non-folder over another.
+      if [ -d "$e" ]; then mkdir -- "$v"; else mkfifo -m 0600 -- "$v"; fi || continue
+      # Read-only as it is made: libmount's newer mount API (mount_api_check; forced
+      # here so it never falls back to mount(2) by choice) sets it on the new mount
+      # before attaching it, where a bind and then a remount would leave the ward's
+      # copy writable, the remount not propagating.
       LIBMOUNT_FORCE_MOUNT2=never mount --no-canonicalize --bind -o "${_rwe%/}" "$e" "$v" || {
-        h=$(stat -c %d:%i -- "$e" 2>/dev/null) && refused[$v]=$h
+        refused[$v]=${h#* }
         rm -f -- "$v" 2>/dev/null || rmdir -- "$v"
         continue
       }
@@ -137,8 +163,7 @@ sync_runtime() {
     done
   done
   for v in "${!shown[@]}"; do
-    e=${shown[$v]}
-    [ -e "$e" ] && [ ! -L "$e" ] || unshow "$v"
+    listed "${shown[$v]}" || unshow "$v"
   done
   return 0
 }
